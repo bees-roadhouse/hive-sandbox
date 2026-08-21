@@ -25,6 +25,7 @@ db_user="hive_sandbox"
 db_password="hive_sandbox"
 dev_db="hive_sandbox"
 test_db="hive_sandbox_test"
+ext_schema="extensions"
 port=55432
 
 log() { echo "$@" >&2; }
@@ -83,6 +84,21 @@ if [ "$(psql_q "$dev_db" "select 1 from pg_database where datname = '$test_db'")
   log "==> creating $test_db"
   psql_q "$dev_db" "create database $test_db owner $db_user" >/dev/null
 fi
+
+# Extensions live in their own schema so `public` stays empty and a test's
+# private schema is genuinely the only thing on its search path. This is the one
+# step that needs rights the migration role does not have, which is why it is
+# provisioning rather than migration one.
+for db in "$dev_db" "$test_db"; do
+  log "==> ensuring extensions schema in $db"
+  psql_q "$db" "create schema if not exists $ext_schema" >/dev/null
+  psql_q "$db" "create extension if not exists vector schema $ext_schema" >/dev/null
+  installed=$(psql_q "$db" "select 1 from pg_extension e join pg_namespace n on n.oid = e.extnamespace where e.extname = 'vector' and n.nspname = '$ext_schema'")
+  if [ "$installed" != "1" ]; then
+    log "vector is not installed in $ext_schema on $db"
+    exit 1
+  fi
+done
 
 test_url="postgres://${db_user}:${db_password}@127.0.0.1:${port}/${test_db}?sslmode=disable"
 dev_url="postgres://${db_user}:${db_password}@127.0.0.1:${port}/${dev_db}?sslmode=disable"

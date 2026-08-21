@@ -22,6 +22,7 @@ $User = "hive_sandbox"
 $Password = "hive_sandbox"
 $DevDb = "hive_sandbox"
 $TestDb = "hive_sandbox_test"
+$ExtSchema = "extensions"
 $Port = 55432
 
 function Resolve-ComposeArgs {
@@ -86,6 +87,20 @@ if ((Invoke-Psql $DevDb "select 1 from pg_available_extensions where name = 'vec
 if ((Invoke-Psql $DevDb "select 1 from pg_database where datname = '$TestDb'") -ne "1") {
     Write-Host "==> creating $TestDb" -ForegroundColor Cyan
     $null = Invoke-Psql $DevDb "create database $TestDb owner $User"
+}
+
+# Extensions live in their own schema so `public` stays empty and a test's
+# private schema is genuinely the only thing on its search path. This is the one
+# step that needs rights the migration role does not have, which is why it is
+# provisioning rather than migration one.
+foreach ($db in @($DevDb, $TestDb)) {
+    Write-Host "==> ensuring extensions schema in $db" -ForegroundColor Cyan
+    $null = Invoke-Psql $db "create schema if not exists $ExtSchema"
+    $null = Invoke-Psql $db "create extension if not exists vector schema $ExtSchema"
+    if ((Invoke-Psql $db "select 1 from pg_extension e join pg_namespace n on n.oid = e.extnamespace where e.extname = 'vector' and n.nspname = '$ExtSchema'") -ne "1") {
+        Write-Host "vector is not installed in $ExtSchema on $db" -ForegroundColor Red
+        exit 1
+    }
 }
 
 $testUrl = "postgres://${User}:${Password}@127.0.0.1:${Port}/${TestDb}?sslmode=disable"

@@ -1,6 +1,8 @@
 package testdb_test
 
 import (
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/bees-roadhouse/hive-sandbox/internal/testdb"
@@ -63,6 +65,47 @@ func TestSchemasAreIsolated(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("count = %d, want 0; the sibling's rows leaked in", n)
+	}
+}
+
+// `public` is off the search path entirely, which is what makes the isolation
+// real rather than documented-around. Extension types still resolve because
+// pgvector is relocatable and lives in its own schema.
+func TestPublicIsNotOnTheSearchPath(t *testing.T) {
+	t.Parallel()
+
+	pool := testdb.Pool(t)
+	ctx := t.Context()
+
+	var path string
+	if err := pool.QueryRow(ctx, `show search_path`).Scan(&path); err != nil {
+		t.Fatalf("show search_path: %v", err)
+	}
+
+	// Compare entries rather than substrings. The private schema is named after
+	// the test, and this test's own name contains "public".
+	var entries []string
+	for _, part := range strings.Split(path, ",") {
+		entries = append(entries, strings.Trim(strings.TrimSpace(part), `"`))
+	}
+	if slices.Contains(entries, "public") {
+		t.Errorf("search_path = %q, must not contain public", path)
+	}
+	if !slices.Contains(entries, testdb.ExtensionSchema) {
+		t.Errorf("search_path = %q, want it to contain %q", path, testdb.ExtensionSchema)
+	}
+	if len(entries) != 2 {
+		t.Errorf("search_path has %d entries (%q); want exactly the private schema and %q",
+			len(entries), path, testdb.ExtensionSchema)
+	}
+
+	// Resolving the extension type unqualified is what made dropping public
+	// from the path possible in the first place.
+	if _, err := pool.Exec(ctx, `create table vectored (id int, embedding vector(3))`); err != nil {
+		t.Fatalf("vector type not resolvable from search_path %q: %v", path, err)
+	}
+	if _, err := pool.Exec(ctx, `create index on vectored using hnsw (embedding vector_l2_ops)`); err != nil {
+		t.Fatalf("hnsw operator class not resolvable from search_path %q: %v", path, err)
 	}
 }
 

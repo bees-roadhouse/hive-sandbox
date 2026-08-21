@@ -29,6 +29,11 @@ import (
 // tests run. CI sets it; a developer sets it from scripts/db-up.ps1 output.
 const URLEnv = "HIVE_SANDBOX_TEST_DATABASE_URL"
 
+// ExtensionSchema is where extensions are installed, so `public` can stay
+// empty. Created once per database by scripts/db-up.ps1 (or .sh); migration one
+// creates no extensions and therefore runs under a role with no rights to.
+const ExtensionSchema = "extensions"
+
 // setupTimeout bounds schema create and drop. These are millisecond operations
 // against a local server; a hang means something is wrong, not slow.
 const setupTimeout = 30 * time.Second
@@ -49,10 +54,11 @@ func URL(t *testing.T) string {
 // empty schema. The schema is dropped when the test finishes.
 //
 // Unqualified DDL lands in that schema, so a test can `create table thing (...)`
-// without colliding with any other test. The search path also carries `public`
-// as a fallback so extension-provided types stay resolvable; a name that exists
-// only in `public` is therefore still visible, which is the one seam in the
-// isolation.
+// without colliding with any other test. The search path is the private schema
+// plus [ExtensionSchema], and deliberately NOT `public`: pgvector is
+// relocatable, so extension types live in their own schema and `public` can stay
+// empty. That makes the isolation real rather than documented-around ... there is
+// no shared schema left for one test to leak into another through.
 func Pool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
@@ -82,7 +88,7 @@ func Pool(t *testing.T) *pgxpool.Pool {
 	}
 	// Sent in the startup message, so it applies to every connection the pool
 	// opens later, not just the first one.
-	cfg.ConnConfig.RuntimeParams["search_path"] = quoteIdent(schema) + ", public"
+	cfg.ConnConfig.RuntimeParams["search_path"] = quoteIdent(schema) + ", " + quoteIdent(ExtensionSchema)
 	// Small on purpose. Tests run in parallel and the server has a finite
 	// connection budget; a test that needs more can raise it on the config.
 	cfg.MaxConns = 4

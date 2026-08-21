@@ -247,12 +247,12 @@ func (b *Bus) stream(w http.ResponseWriter, r *http.Request, guard *store.Guard,
 		// The watermark rather than store.Head, even though nothing here goes
 		// straight onto the wire: the drop path below sends resync(lastSafe),
 		// and a subscriber dropped before its first checkpoint would otherwise
-		// publish head. See settledPoint.
-		from, err := b.settledPoint(ctx)
-		if err != nil {
-			return err
-		}
-		lastSafe = from
+		// publish head.
+		//
+		// The non-waiting one. A zero value here is "no floor yet", which the
+		// first checkpoint fixes, and blocking would make every connect to an
+		// empty log pay settledWait for nothing.
+		lastSafe = b.settledFloor()
 	} else {
 		replay, err := guard.Replay(ctx, cred, cursor, cursor.At.Add(-b.cfg.Overlap), opts.MaxReplay+1)
 		if err != nil {
@@ -261,7 +261,7 @@ func (b *Bus) stream(w http.ResponseWriter, r *http.Request, guard *store.Guard,
 		if len(replay) > opts.MaxReplay {
 			// Past the bound. Say so rather than silently truncating, which
 			// would look to the client exactly like "nothing happened".
-			from, fromErr := b.settledPoint(ctx)
+			from, fromErr := b.settledRestart(ctx)
 			if fromErr != nil {
 				return fromErr
 			}
@@ -379,31 +379,81 @@ func (b *Bus) emit(sw *sseWriter, e store.Event, lastSafe *store.Cursor) error {
 	return nil
 }
 
-// settledPoint is the position it is safe to tell a client to restart from.
+// How long a resync will wait for a watermark, and how often it looks. Both
+// are bounded rather than derived from PollInterval, because this runs inside a
+// request and a five-second default poll would otherwise become a five-second
+// connect.
+const (
+	settledWait  = 5 * time.Second
+	settledCheck = 20 * time.Millisecond
+)
+
+// settledFloor is the watermark as a floor for future checkpoints, and it never
+// waits.
 //
-// Never store.Head, which is what both callers used to use. Head is the newest
-// row in the whole table, and that is wrong twice over. It sits inside the
-// overlap window, so a client resuming there skips every transaction that took
-// a lower id and commits later ... the precise hazard emit() exists to prevent,
-// routed around. And it is unfiltered, so putting it on the wire tells any
+// Used by the fresh-subscriber branch, where a zero value is simply "no floor
+// yet" and the first checkpoint sets one. Waiting here would make every connect
+// to a system with an empty log block for settledWait, which is the ordinary
+// case for a new install.
+func (b *Bus) settledFloor() store.Cursor {
+	return store.Cursor{At: b.Settled()}
+}
+
+// settledRestart is the position it is safe to tell a client to RESTART from,
+// and unlike the floor above it waits for a real one.
+//
+// Never store.Head, which is what this used to be. Head is the newest row in
+// the whole table, and that is wrong twice over: it sits inside the overlap
+// window, so a client resuming there skips every transaction that took a lower
+// id and commits later ... the precise hazard emit() exists to prevent, routed
+// around ... and it is unfiltered, so putting it on the wire tells any
 // authenticated client the timestamp and row id of an event it may have no
 // right to know exists.
 //
-// The watermark is zero only before the first tail cycle, so this waits for
-// that cycle rather than reaching for a value it must not use. If it is still
-// zero afterwards the log is empty, the resync carries an empty restart point,
-// and the client starts fresh ... which is an acknowledged reset rather than a
-// silent one.
-func (b *Bus) settledPoint(ctx context.Context) (store.Cursor, error) {
+// # Why it waits, which is the part that was wrong
+//
+// The first version returned the watermark even when it was zero, on the
+// reasoning that an empty restart point is an acknowledged reset rather than a
+// silent one. That is false from the client's side. A zero point renders as an
+// empty `from`, the client starts at head, and it cannot tell that apart from
+// being told to start at head deliberately ... so the disclosure fix traded a
+// leak for a SILENT GAP, on the one path where the client provably has a
+// backlog, because this is only reached after reading more rows than MaxReplay.
+//
+// It cannot block forever for the same reason: rows demonstrably exist, so a
+// cycle will produce a watermark, and the kick means waiting for one rather
+// than waiting out a poll interval.
+//
+// Found by CI on Linux and not by a local gate, and the mechanism is worth
+// keeping: the tailer's watermark is zero until its first cycle reads a row,
+// and a test that appends and connects immediately races that cycle. A faster
+// machine LOSES that race, so the local run passed and CI was right.
+func (b *Bus) settledRestart(ctx context.Context) (store.Cursor, error) {
 	if settled := b.Settled(); !settled.IsZero() {
 		return store.Cursor{At: settled}, nil
 	}
-	select {
-	case <-b.Ready():
-	case <-ctx.Done():
-		return store.Cursor{}, ctx.Err()
+	b.kick()
+
+	tick := time.NewTicker(settledCheck)
+	defer tick.Stop()
+	deadline := time.NewTimer(settledWait)
+	defer deadline.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return store.Cursor{}, ctx.Err()
+		case <-deadline.C:
+			// Not a resync with an empty point. The client keeps the cursor it
+			// has, retries, and stays correct; a gap would be permanent.
+			return store.Cursor{}, fmt.Errorf(
+				"bus: no settled watermark after %s; the tailer is not reading", settledWait)
+		case <-tick.C:
+			if settled := b.Settled(); !settled.IsZero() {
+				return store.Cursor{At: settled}, nil
+			}
+		}
 	}
-	return store.Cursor{At: b.Settled()}, nil
 }
 
 func lastEventID(r *http.Request) string {

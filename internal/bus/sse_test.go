@@ -494,3 +494,71 @@ func TestSSEIdleStreamNoticesRevocation(t *testing.T) {
 		t.Fatal("an idle stream on a revoked credential stayed open; curl holds one of these open indefinitely")
 	}
 }
+
+// TestResyncNeverHandsOutAnEmptyRestartPoint is CI's failure, made
+// deterministic.
+//
+// The tailer's watermark is zero until its first cycle READS a row, so a test
+// that appends and connects immediately is racing that cycle. The first version
+// of the resync fix returned the watermark whether or not it existed, which
+// rendered as an empty `from` ... and a client cannot tell "restart from
+// nothing" apart from "start at head", so the disclosure fix traded a leak for
+// a silent gap on the one path where the client provably has a backlog.
+//
+// Locally the race was won every time and the gate was green. On Linux CI it
+// was lost every time, because a faster machine finishes the appends and
+// connects before the tailer's cycle lands. So the reproduction here removes
+// the race rather than reversing it: a channel nobody notifies plus a poll
+// interval longer than the test means the tailer CANNOT have read anything by
+// the time the stream connects, on any machine at any speed.
+func TestResyncNeverHandsOutAnEmptyRestartPoint(t *testing.T) {
+	h := newHarness(t)
+	b := h.run(bus.Config{
+		// No wakeup bell and no poll inside the test's lifetime. The only thing
+		// that can produce a watermark now is the resync path asking for one.
+		Channel:      "a_channel_nobody_notifies",
+		PollInterval: time.Hour,
+		Overlap:      500 * time.Millisecond,
+	})
+	url, token := h.sseServer(t, b, bus.SSEOptions{KeepAlive: time.Hour, MaxReplay: 3})
+
+	first := h.append("first", h.owner)
+	for range 10 {
+		h.append("filler", h.owner)
+	}
+
+	// The precondition the whole test rests on. If this ever stops holding, the
+	// test is exercising the ordinary path and proving nothing.
+	if settled := b.Settled(); !settled.IsZero() {
+		t.Fatalf("the tailer already has a watermark (%v); this test no longer reproduces anything", settled)
+	}
+
+	stream, closeStream := openStream(t, url, token, first.Cursor().String())
+	defer closeStream()
+
+	got := stream.mustEvent(15 * time.Second)
+	if got.event != "resync" {
+		t.Fatalf("past MaxReplay the stream sent %q rather than a resync", got.event)
+	}
+
+	var payload struct {
+		From string `json:"from"`
+	}
+	if err := json.Unmarshal([]byte(got.data), &payload); err != nil {
+		t.Fatalf("resync payload %q: %v", got.data, err)
+	}
+	if payload.From == "" {
+		t.Fatal("the resync carried an empty restart point; the client will start at head and " +
+			"silently lose the backlog it was told to skip")
+	}
+	from, err := store.ParseCursor(payload.From)
+	if err != nil {
+		t.Fatalf("restart point %q does not parse: %v", payload.From, err)
+	}
+	if from.At.IsZero() {
+		t.Fatalf("restart point %q is the zero time", payload.From)
+	}
+	if from.ID != 0 {
+		t.Fatalf("the resync disclosed row id %d; a restart point carries the watermark, not a row", from.ID)
+	}
+}

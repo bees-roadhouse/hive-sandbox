@@ -164,15 +164,22 @@ func ActivateInstall(ctx context.Context, db DB, installID uuid.UUID, by Credent
 		return fmt.Errorf("look up activating actor: %w", err)
 	}
 
-	var owner Owner
-	var ownerKind string
-	err = db.QueryRow(ctx,
-		"SELECT owner_kind, owner_id FROM installs WHERE id = $1", installID).Scan(&ownerKind, &owner.ID)
+	var (
+		owner        Owner
+		ownerKind    string
+		installState string
+		buildStatus  string
+	)
+	err = db.QueryRow(ctx, `
+		SELECT i.owner_kind, i.owner_id, i.state, b.status
+		  FROM installs i
+		  JOIN app_builds b ON b.id = i.build_id
+		 WHERE i.id = $1`, installID).Scan(&ownerKind, &owner.ID, &installState, &buildStatus)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return pgx.ErrNoRows
 	}
 	if err != nil {
-		return fmt.Errorf("look up install owner: %w", err)
+		return fmt.Errorf("look up install: %w", err)
 	}
 	owner.Kind = PrincipalKind(ownerKind)
 
@@ -188,18 +195,13 @@ func ActivateInstall(ctx context.Context, db DB, installID uuid.UUID, by Credent
 		return err
 	}
 
+	// activatedBy and authority are the two routes' evidence, and exactly one of
+	// them is non-NULL on the row afterwards.
+	var activatedBy, authority any
+
 	if kind == "human" && isOwner {
-		tag, upErr := db.Exec(ctx, `
-			UPDATE installs
-			   SET state = 'active', activated_by_actor = $2, activation_authority_id = NULL
-			 WHERE id = $1`, installID, by.ActorID)
-		if upErr != nil {
-			return fmt.Errorf("activate install: %w", upErr)
-		}
-		if tag.RowsAffected() == 0 {
-			return pgx.ErrNoRows
-		}
-		return nil
+		activatedBy = by.ActorID
+		return activate(ctx, db, installID, installState, buildStatus, activatedBy, authority)
 	}
 
 	// Otherwise: a standing authority a human delegated on this specific
@@ -229,15 +231,61 @@ func ActivateInstall(ctx context.Context, db DB, installID uuid.UUID, by Credent
 		return fmt.Errorf("look up install authority: %w", err)
 	}
 
+	authority = authorityID
+	return activate(ctx, db, installID, installState, buildStatus, activatedBy, authority)
+}
+
+// activate is the second half of the promotion seam: what is being promoted.
+//
+// The authority logic above decides WHO may promote, and it was the only
+// question the seam ever asked. Nothing looked at what they were promoting
+// into, so a build with status='withdrawn' activated cleanly, and the install's
+// own state was never read, so 'uninstalling' could be pulled back to 'active'
+// mid-teardown. Chained with a re-registration that silently keeps a withdrawn
+// build withdrawn, that is a live install on a withdrawn build with a trust
+// tier nobody re-approved, and no error anywhere ... D25 defeated at the seam
+// built for it.
+//
+// builds_awaiting_promotion already filters on status='registered'. It is a
+// VIEW: it shows a human the right list and enforces nothing, which is the same
+// distinction as a comment versus a constraint.
+//
+// Deliberately called only AFTER authority is established. A caller with no
+// standing must not learn from the error message whether somebody else's build
+// was withdrawn.
+func activate(ctx context.Context, db DB, installID uuid.UUID,
+	installState, buildStatus string, activatedBy, authority any,
+) error {
+	if buildStatus != "registered" {
+		return fmt.Errorf("%w: the build behind install %s is %q; promotion is the decision about "+
+			"a build that is promotable at all (D25)", ErrDenied, installID, buildStatus)
+	}
+	if installState == "uninstalling" {
+		return fmt.Errorf("%w: install %s is uninstalling; activating it would pull a teardown "+
+			"back to live", ErrDenied, installID)
+	}
+
+	// The same two conditions again, in the UPDATE. Not belt and braces: the
+	// reads above happened at some earlier instant, and a withdrawal committing
+	// in between would otherwise be activated straight over.
 	tag, err := db.Exec(ctx, `
-		UPDATE installs
-		   SET state = 'active', activated_by_actor = NULL, activation_authority_id = $2
-		 WHERE id = $1`, installID, authorityID)
+		UPDATE installs i
+		   SET state = 'active', activated_by_actor = $2, activation_authority_id = $3
+		 WHERE i.id = $1
+		   AND i.state <> 'uninstalling'
+		   AND EXISTS (SELECT 1 FROM app_builds b
+		                WHERE b.id = i.build_id AND b.status = 'registered')`,
+		installID, activatedBy, authority)
 	if err != nil {
-		return fmt.Errorf("activate install under a standing authority: %w", err)
+		return fmt.Errorf("activate install: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return pgx.ErrNoRows
+		// Not ErrNoRows. The install existed a moment ago and the checks above
+		// passed, so this is a concurrent withdrawal or teardown rather than a
+		// caller naming something that is not there, and the two want different
+		// responses from whoever is looking.
+		return fmt.Errorf("%w: install %s stopped being promotable while it was being promoted",
+			ErrDenied, installID)
 	}
 	return nil
 }

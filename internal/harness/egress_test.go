@@ -26,20 +26,117 @@ import (
 // egressProbe asks the four questions that matter, and prints answers a test
 // can parse. curl reads http_proxy and https_proxy on its own, which is the
 // point: nothing in here configures a proxy, it is just there.
+// egressProbe asks the four questions that matter, against an origin this test
+// owns rather than against the live internet.
+//
+// It used to hit example.com and api.github.com, which made it flaky roughly
+// one run in three and made a CI failure ambiguous between "the proxy broke"
+// and "DNS was slow". Nothing here leaves the machine.
 const egressProbe = `
 set +e
-# 1. Direct, bypassing the proxy entirely, straight at an IP so DNS is not what
-#    fails. RFC 5737 documentation range, so this is never a real host. On an
-#    --internal network there is no route and this must fail.
-curl -sS -m 5 --noproxy '*' -o /dev/null http://192.0.2.1/ 2>/dev/null
+# 1. Direct, bypassing the proxy entirely, straight at the origin's address so
+#    DNS is not what fails. On an --internal network there is no route, and
+#    this must fail.
+curl -sS -m 5 --noproxy '*' -o /dev/null http://ORIGIN_IP:8080/ 2>/dev/null
 echo "direct_rc=$?"
 # 2. An allowed host over plain HTTP.
-echo "allowed=$(curl -s -m 25 -o /dev/null -w '%{http_code}' http://example.com/)"
-# 3. A host that is not on the allowlist. The proxy answers, not the origin.
-echo "denied=$(curl -s -m 25 -o /dev/null -w '%{http_code}' http://api.github.com/)"
-# 4. An allowed host over TLS, which is the CONNECT path every agent CLI uses.
-echo "tunnel=$(curl -s -m 25 -o /dev/null -w '%{http_code}' https://example.com/)"
+echo "allowed=$(curl -s -m 20 -o /dev/null -w '%{http_code}' http://ALLOWED_NAME:8080/)"
+# 3. The same bytes under a name that is NOT on the allowlist. The proxy
+#    answers, not the origin, so this proves the allowlist matches on what was
+#    asked for rather than on where it lands.
+echo "denied=$(curl -s -m 20 -o /dev/null -w '%{http_code}' http://DENIED_NAME:8080/)"
+# 4. The CONNECT path, which is what every agent CLI uses for https.
+#    --proxytunnel forces it without needing TLS, so the test does not have to
+#    carry a certificate to exercise the tunnel.
+echo "tunnel=$(curl -s -m 20 -p --proxytunnel -o /dev/null -w '%{http_code}' http://ALLOWED_NAME:8080/)"
 `
+
+// testUplink is a network and an origin container the egress test owns.
+//
+// The subnet is RFC 5737 TEST-NET-1, and that choice is the whole trick. The
+// SSRF guard refuses loopback, RFC1918, link-local, ULA and CGNAT, so an origin
+// on an ordinary Podman network (10.89.x) would be refused ... and the only way
+// to reach it would be -egress-allow-private, which disables the very control
+// this test partly exists to exercise. A test that turns off the control it is
+// validating is worth less than no test.
+//
+// 192.0.2.0/24 is documentation-reserved, unroutable on the real internet, and
+// NOT private by any of those checks. So the guard stays on, does its work, and
+// says yes ... which is what we want it to prove it can still do.
+type testUplink struct {
+	network     string
+	originIP    string
+	allowedName string
+	deniedName  string
+	dnsServer   string
+}
+
+func startTestUplink(t *testing.T) *testUplink {
+	t.Helper()
+
+	id := uniqueSuffix(t)
+	up := &testUplink{
+		network:     "hs-test-uplink-" + id,
+		allowedName: "allowed-" + id,
+		deniedName:  "denied-" + id,
+		// aardvark answers on the network's gateway, and the proxy is pointed
+		// at it explicitly with -egress-dns. That is the same seam the real
+		// deployment uses to escape the internal network's resolver, exercised
+		// rather than bypassed.
+		dnsServer: "192.0.2.1",
+		originIP:  "192.0.2.2",
+	}
+
+	run(t, "network", "create", "--subnet", "192.0.2.0/24", up.network)
+	t.Cleanup(func() { _ = exec.Command("podman", "network", "rm", "--force", up.network).Run() })
+
+	// One container under two names. The allowlist names only one of them, so
+	// the denied case reaches the same bytes by a name that was never allowed
+	// ... which is precisely what the allowlist is supposed to refuse.
+	run(t, "run", "--detach", "--rm",
+		"--name", "origin-"+id,
+		"--network", up.network,
+		"--network-alias", up.allowedName,
+		"--network-alias", up.deniedName,
+		"docker.io/library/alpine:3.21",
+		"sh", "-c",
+		`while true; do printf 'HTTP/1.1 200 OK
+Content-Length: 2
+
+ok' | nc -l -p 8080; done`)
+	t.Cleanup(func() { _ = exec.Command("podman", "rm", "--force", "origin-"+id).Run() })
+
+	// The origin has to be answering before the run starts, or the probe races
+	// it and a slow container start reads as a broken allowlist.
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("podman", "run", "--rm", "--network", up.network,
+			"docker.io/library/alpine:3.21",
+			"wget", "-q", "-T2", "-O-", "http://"+up.allowedName+":8080/").Output()
+		if err == nil && strings.TrimSpace(string(out)) == "ok" {
+			return up
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Fatalf("the test origin never answered on %s:8080", up.allowedName)
+	return nil
+}
+
+// probe renders the script against this uplink.
+func (u *testUplink) probe() string {
+	script := strings.ReplaceAll(egressProbe, "ORIGIN_IP", u.originIP)
+	script = strings.ReplaceAll(script, "ALLOWED_NAME", u.allowedName)
+	return strings.ReplaceAll(script, "DENIED_NAME", u.deniedName)
+}
+
+func run(t *testing.T, args ...string) {
+	t.Helper()
+
+	out, err := exec.Command("podman", args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("podman %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+}
 
 func TestEgressProxyEnforcesTheAllowlist(t *testing.T) {
 	t.Parallel()
@@ -57,6 +154,8 @@ func TestEgressProxyEnforcesTheAllowlist(t *testing.T) {
 		skipOrFail(t, "no egress pin (%v); run scripts/egress-build.sh", err)
 	}
 
+	uplink := startTestUplink(t)
+
 	spec := harness.RunSpec{
 		// Unique per instance: run ids name the network and the proxy, so two
 		// concurrent runs sharing one would share both. `go test -count=2`
@@ -65,10 +164,10 @@ func TestEgressProxyEnforcesTheAllowlist(t *testing.T) {
 		Runtime:      harness.RuntimeClaude,
 		WorkspaceDir: t.TempDir(),
 		Network:      harness.NetworkProxied,
-		EgressAllow:  []string{"example.com"},
+		EgressAllow:  []string{uplink.allowedName + ":8080"},
 		Limits:       harness.DefaultLimits(),
 		Deadline:     3 * time.Minute,
-		Args:         []string{"-c", egressProbe},
+		Args:         []string{"-c", uplink.probe()},
 	}
 	if applyErr := pins.Apply(&spec); applyErr != nil {
 		t.Fatalf("Apply: %v", applyErr)
@@ -82,6 +181,11 @@ func TestEgressProxyEnforcesTheAllowlist(t *testing.T) {
 
 	launcher := &harness.PodmanLauncher{
 		EgressImage: egressPin.Ref(),
+		// The proxy reaches the origin over the test network rather than the
+		// real one, and resolves through that network's own DNS. Both are
+		// existing seams; nothing is special-cased for the test.
+		EgressUplink: uplink.network,
+		EgressDNS:    []string{uplink.dnsServer},
 		// The harness image's entrypoint is the agent CLI. For this probe we
 		// want a shell, and overriding it exercises the same flags either way.
 		ExtraArgs: []string{"--entrypoint", "/bin/sh"},

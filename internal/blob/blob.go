@@ -207,9 +207,24 @@ func (c Class) Valid() bool {
 // Errors the seam defines. Drivers wrap these rather than inventing their own,
 // so a caller can branch on the condition without knowing the backend.
 var (
-	// ErrNotFound means the driver has no bytes at that key. It does not mean
-	// the caller may not read them ... that question is answered above the
-	// seam, against refs.
+	// ErrNotFound means the bytes are not available to this caller. It is
+	// returned for BOTH "no such blob" and "you hold no reference to it", and
+	// that is load-bearing rather than lazy.
+	//
+	// A caller that can tell those apart can be asked for a status code, and a
+	// guest reading that status learns whether arbitrary bytes exist anywhere
+	// on the platform: name a hash, read 403 versus 404, one bit per guess,
+	// guesses free, no bytes ever transferred. That is invariant 3's failure
+	// reachable through an error type instead of through a read.
+	//
+	// So there is one sentinel and one message shape, and the package offers
+	// nothing to switch on. **The distinction is safe to log and never safe to
+	// return** ... put the actor, the hash and "held no reference" in a log
+	// line, where a guest cannot read it.
+	//
+	// This is written here rather than only in a review artifact because the
+	// oracle is invisible unless you already know this is deliberate, and the
+	// person most likely to undo it is someone doing careful error handling.
 	ErrNotFound = errors.New("blob: not found")
 
 	ErrMalformedHash       = errors.New("blob: malformed hash")

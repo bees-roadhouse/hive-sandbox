@@ -4,23 +4,21 @@ An app-of-apps platform. A Go daemon hosts WASM guest apps on wazero behind a
 JSON ABI; apps store and relate data through host-mediated surfaces; workflows
 and AI runs compose them. It replaces `bees-roadhouse/hive`.
 
-**The design is settled and lives outside this repo.** Decision log D0-D23 and
-the plan set:
+**The design is settled and currently lives outside this repo**, in a Traycer
+epic on the maintainer's machine: a decision log running D0 to D23, plus a plan
+set covering the architecture, the pre-built app set, the workflow engine, stream
+transforms, the tools tier, hosted harnesses, the real-time journal, and grants.
 
-```
-C:\Users\natesmith\.traycer\epics\5fdca8f2-6e65-42ac-93d7-68838b9ac714\artifacts\hive-sandbox\
-  decision-log\index.md      <- every settled decision, newest first
-  plan\index.md              <- what gets built, in what order
-  plan\architecture.md       <- the technical shape
-  plan\standard-apps.md      <- the pre-built app set
-  plan\workflow-engine.md    plan\stream-transforms.md
-  plan\tools.md              plan\harnesses.md
-  plan\realtime-journal.md   plan\grants.md
-```
+**If you are reading this from outside that machine, you cannot open it**, and
+that is a real gap rather than a formality ... several of those decisions are
+corrections that building or reviewing forced, and they explain why the code
+looks the way it does. Snapshotting them into `docs/design/` is tracked as
+issue #28.
 
-**Read the decision log before you write code.** If something here and something
-there disagree, the decision log wins and this file is stale ... say so rather
-than working around it.
+Until then, the invariants below and the issue tracker carry the load-bearing
+parts. If something here and something in the decision log disagree, **the
+decision log wins and this file is stale** ... say so rather than working around
+it.
 
 ## Invariants that are load-bearing
 

@@ -101,12 +101,27 @@ Nothing becomes a visible PR red. Run the gate locally before pushing; read the
 gate's OUTPUT, never the exit code of a piped command.
 
 ```powershell
+$env:HIVE_SANDBOX_TEST_DATABASE_URL = .\scripts\db-up.ps1 -Quiet
 .\scripts\gate.ps1        # fmt check, vet, golangci-lint, build, test -race
 ```
 
 ```bash
+export HIVE_SANDBOX_TEST_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
 ./scripts/gate.sh
 ```
+
+**The database line is not optional and the gate now refuses without it.** It
+used to be a suggestion, and the result was shape 2 from the list below at full
+scale: without that variable **125 tests skip themselves** ... every
+Postgres-backed test in the repo, including `TestAbsenceIsDeny` and the whole
+grant predicate suite ... and the gate still printed `GATE GREEN` in about the
+same wall time, because skipping is fast and `-race` makes a skipped suite look
+like a slow one. A fix to a live cross-principal leak was reported as gate-green
+over a reproduction that had never executed.
+
+The gate also NAMES every test that skipped, every run. A skip is a test saying
+out loud that it is not answering the question, and that only helps if somebody
+hears it.
 
 Order matters: `gofmt` AFTER any lint autofix. The toolchain is pinned in
 `go.mod`; CI runs the same version.

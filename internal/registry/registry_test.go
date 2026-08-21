@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bees-roadhouse/hive-sandbox/internal/manifest"
+	"github.com/bees-roadhouse/hive-sandbox/internal/wasmhost"
 )
 
 func journalish() *manifest.Manifest {
@@ -32,11 +33,8 @@ func crudOnly() *manifest.Manifest {
 	}
 }
 
-const modHash = "0000000000000000000000000000000000000000000000000000000000000001"
-
 func TestPrepareAcceptsAMatchingModule(t *testing.T) {
-	p, err := Prepare(journalish(), modHash,
-		[]string{"_initialize", "add_entry", "search", "some_helper"})
+	p, err := Prepare(journalish(), testExports(t, "_initialize", "add_entry", "search", "some_helper"))
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -58,7 +56,7 @@ func TestPrepareAcceptsAMatchingModule(t *testing.T) {
 // A manifest is a claim and the module is the fact. Deciding this at install is
 // the difference between a bad manifest and a failure on somebody's first call.
 func TestPrepareRefusesAMissingExport(t *testing.T) {
-	_, err := Prepare(journalish(), modHash, []string{"_initialize", "add_entry"})
+	_, err := Prepare(journalish(), testExports(t, "_initialize", "add_entry"))
 	if !errors.Is(err, ErrMissingExport) {
 		t.Fatalf("err = %v, want ErrMissingExport", err)
 	}
@@ -75,15 +73,14 @@ func TestPrepareRefusesAMissingExport(t *testing.T) {
 // Extra exports are fine: that is how a guest keeps helpers, and refusing them
 // would make the manifest a second copy of the symbol table.
 func TestPrepareAllowsExtraExports(t *testing.T) {
-	if _, err := Prepare(journalish(), modHash,
-		[]string{"_initialize", "add_entry", "search", "helper", "another"}); err != nil {
+	if _, err := Prepare(journalish(), testExports(t, "_initialize", "add_entry", "search", "helper", "another")); err != nil {
 		t.Fatalf("extra exports were refused: %v", err)
 	}
 }
 
 // A guest that exports _start is a command, not a reactor.
 func TestPrepareRefusesANonReactor(t *testing.T) {
-	_, err := Prepare(journalish(), modHash, []string{"_start", "add_entry", "search"})
+	_, err := Prepare(journalish(), testExports(t, "_start", "add_entry", "search"))
 	if !errors.Is(err, ErrNotReactor) {
 		t.Fatalf("err = %v, want ErrNotReactor", err)
 	}
@@ -96,7 +93,7 @@ func TestPrepareRefusesANonReactor(t *testing.T) {
 // so it installs from a manifest and nothing else. That is the cheapest
 // possible first rung for the builder loop.
 func TestCRUDOnlyAppNeedsNoModule(t *testing.T) {
-	p, err := Prepare(crudOnly(), "", nil)
+	p, err := Prepare(crudOnly(), wasmhost.Exports{})
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -119,7 +116,7 @@ func TestCRUDOnlyAppNeedsNoModule(t *testing.T) {
 
 // Declaring functions with no module is the inverse mistake and fails loudly.
 func TestPrepareRefusesFunctionsWithNoModule(t *testing.T) {
-	_, err := Prepare(journalish(), "", nil)
+	_, err := Prepare(journalish(), wasmhost.Exports{})
 	if !errors.Is(err, ErrNoModule) {
 		t.Fatalf("err = %v, want ErrNoModule", err)
 	}
@@ -128,15 +125,13 @@ func TestPrepareRefusesFunctionsWithNoModule(t *testing.T) {
 // The surface hash is what makes "is this promotion equivalent" answerable
 // without a diff, so it has to move when the surface moves and not otherwise.
 func TestSurfaceHashTracksTheSurface(t *testing.T) {
-	base, err := Prepare(journalish(), modHash,
-		[]string{"_initialize", "add_entry", "search"})
+	base, err := Prepare(journalish(), testExports(t, "_initialize", "add_entry", "search"))
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 
 	// Same manifest, again: identical.
-	again, err := Prepare(journalish(), modHash,
-		[]string{"_initialize", "add_entry", "search"})
+	again, err := Prepare(journalish(), testExports(t, "_initialize", "add_entry", "search"))
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -144,13 +139,16 @@ func TestSurfaceHashTracksTheSurface(t *testing.T) {
 		t.Fatal("two preparations of one manifest disagree")
 	}
 
-	// A different module with the same surface hashes the same, which is the
-	// point: it is the SURFACE address, not the build's.
+	// A DIFFERENT module with the same surface hashes the same, which is the
+	// point: it is the SURFACE address, not the build's. The extra export is
+	// what makes the bytes ... and so the module hash ... differ.
 	other, err := Prepare(journalish(),
-		"000000000000000000000000000000000000000000000000000000000000dead",
-		[]string{"_initialize", "add_entry", "search"})
+		testExports(t, "_initialize", "add_entry", "search", "a_helper"))
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
+	}
+	if other.ModuleHash == base.ModuleHash {
+		t.Fatal("the two fixtures are the same module; the case is not being tested")
 	}
 	if other.SurfaceHash != base.SurfaceHash {
 		t.Error("the surface hash moved when only the module changed")
@@ -159,7 +157,7 @@ func TestSurfaceHashTracksTheSurface(t *testing.T) {
 	// Adding a tool changes it.
 	m := journalish()
 	m.Tools = append(m.Tools, manifest.ToolDef{Name: "journal.find", Function: "search"})
-	changed, err := Prepare(m, modHash, []string{"_initialize", "add_entry", "search"})
+	changed, err := Prepare(m, testExports(t, "_initialize", "add_entry", "search"))
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -173,7 +171,7 @@ func TestSurfaceHashTracksTheSurface(t *testing.T) {
 func TestPrepareValidatesBeforeCheckingTheModule(t *testing.T) {
 	m := journalish()
 	m.Name = "Journal" // uppercase: refused by Validate
-	_, err := Prepare(m, modHash, nil)
+	_, err := Prepare(m, testExports(t))
 	if err == nil {
 		t.Fatal("an invalid manifest was prepared")
 	}
@@ -185,8 +183,7 @@ func TestPrepareValidatesBeforeCheckingTheModule(t *testing.T) {
 // A surface hash without the deriver that produced it is a number nobody can
 // interpret. They travel together from the moment they exist.
 func TestPreparedCarriesTheDeriver(t *testing.T) {
-	p, err := Prepare(journalish(), modHash,
-		[]string{"_initialize", "add_entry", "search"})
+	p, err := Prepare(journalish(), testExports(t, "_initialize", "add_entry", "search"))
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -203,7 +200,7 @@ func TestPreparedCarriesTheDeriver(t *testing.T) {
 // installs.schema_name UNIQUE turned into a confusing conflict ... and would
 // have been a cross-principal data leak without that constraint.
 func TestInstallSpecIsScopedToTheOwner(t *testing.T) {
-	p, err := Prepare(crudOnly(), "", nil)
+	p, err := Prepare(crudOnly(), wasmhost.Exports{})
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}

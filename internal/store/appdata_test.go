@@ -49,7 +49,7 @@ func installApp(t *testing.T, w *world, slug, collection string, owner store.Own
 	if err := m.Validate(); err != nil {
 		t.Fatalf("manifest: %v", err)
 	}
-	plan, err := m.SchemaPlan("user", slug)
+	plan, err := m.SchemaPlan(string(owner.Kind), owner.ID.String())
 	if err != nil {
 		t.Fatalf("schema plan: %v", err)
 	}
@@ -70,7 +70,7 @@ func installApp(t *testing.T, w *world, slug, collection string, owner store.Own
 	}
 
 	installID, err := store.StageInstall(w.ctx, w.s.Pool(), store.InstallSpec{
-		BuildID: buildID, Slug: slug, Owner: owner, SchemaName: plan.Schema,
+		BuildID: buildID, Slug: slug, Owner: owner,
 	}, cred(by, owner.Kind, owner.ID))
 	if err != nil {
 		t.Fatalf("stage install: %v", err)

@@ -8,6 +8,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/bees-roadhouse/hive-sandbox/internal/manifest"
 )
 
 // ErrNotHuman is returned when an act that D19 reserves for a person is
@@ -25,11 +27,29 @@ const CapabilityActivate InstallCapability = "activate"
 // separates building from making live, and staging is the unprivileged half
 // that the builder loop may do unattended.
 type InstallSpec struct {
-	BuildID    uuid.UUID
-	Slug       string
-	Owner      Owner
-	SchemaName string
+	BuildID uuid.UUID
+	Slug    string
+	Owner   Owner
 }
+
+// There is deliberately no SchemaName here.
+//
+// It used to be a parameter, and nothing checked it against the owner. actsFor
+// asks whose INSTALL this is; nothing asked whose SCHEMA it is. So Bob, acting
+// honestly for his own principal, could stage an install he owns that points at
+// Alice's schema ... and the data layer reads the schema off the install row,
+// so every read and write through it lands in her tables.
+//
+// It was not a race. RegisterBuild provisions the schema and staging is a
+// separate act, so the window is however long a person takes to promote. The
+// name is publicly computable from a slug and an actor UUID, and
+// schema_name UNIQUE does not reach it, because that index only fires once the
+// victim has staged and the attacker got there first.
+//
+// The fix is invariant 11 in its plainest form: stop accepting as an argument
+// the fact you are deciding. StageInstall derives the name from the slug and
+// the owner it has already authorised, so there is nothing to supply and
+// nothing to check.
 
 // actsFor reports whether the credential is genuinely the given principal:
 // the pair agrees (acting_kind) and the principal is the one named.
@@ -51,8 +71,8 @@ func actsFor(ctx context.Context, db DB, by Credential, principal Owner) (bool, 
 // StageInstall records an install without turning it on. Any actor that may act
 // for the owning principal may do this, including an AI.
 func StageInstall(ctx context.Context, db DB, spec InstallSpec, by Credential) (uuid.UUID, error) {
-	if spec.SchemaName == "" {
-		return uuid.Nil, errors.New("install needs a schema name")
+	if spec.Slug == "" {
+		return uuid.Nil, errors.New("install needs a slug")
 	}
 	ok, err := actsFor(ctx, db, by, spec.Owner)
 	if err != nil {
@@ -62,6 +82,12 @@ func StageInstall(ctx context.Context, db DB, spec InstallSpec, by Credential) (
 		return uuid.Nil, fmt.Errorf("%w: staging an install writes into a principal's own scope", ErrDenied)
 	}
 
+	// Derived AFTER the ownership check and from the same values it authorised,
+	// so the schema on the row is the one this owner is entitled to whatever the
+	// caller believed. It is the same derivation RegisterBuild used to
+	// provision, which is what makes the install point at a schema that exists.
+	schemaName := manifest.SchemaName(spec.Slug, string(spec.Owner.Kind), spec.Owner.ID.String())
+
 	var id uuid.UUID
 	if err := db.QueryRow(ctx, `
 		INSERT INTO installs (build_id, slug, owner_kind, owner_id, installed_by_actor,
@@ -69,7 +95,7 @@ func StageInstall(ctx context.Context, db DB, spec InstallSpec, by Credential) (
 		VALUES ($1,$2,$3,$4,$5,$6,'disabled')
 		RETURNING id`,
 		spec.BuildID, spec.Slug, string(spec.Owner.Kind), spec.Owner.ID,
-		by.ActorID, spec.SchemaName).Scan(&id); err != nil {
+		by.ActorID, schemaName).Scan(&id); err != nil {
 		return uuid.Nil, fmt.Errorf("stage install: %w", err)
 	}
 	return id, nil

@@ -61,20 +61,20 @@ func helloModule(t *testing.T, caps ...Capability) Module {
 // Fixed ids rather than fresh ones per call, so the pool key is stable across a
 // test and "was this warm" means what it looks like.
 var (
-	actorPia     = uuid.MustParse("11111111-1111-4111-8111-111111111111")
-	principNate  = uuid.MustParse("22222222-2222-4222-8222-222222222222")
-	principMagg  = uuid.MustParse("33333333-3333-4333-8333-333333333333")
+	actorAva     = uuid.MustParse("11111111-1111-4111-8111-111111111111")
+	principAlice = uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	principBob   = uuid.MustParse("33333333-3333-4333-8333-333333333333")
 	installHello = uuid.MustParse("44444444-4444-4444-8444-444444444444")
 )
 
 func testCaller() Caller {
-	return testCallerFor(principNate)
+	return testCallerFor(principAlice)
 }
 
 func testCallerFor(principal uuid.UUID) Caller {
 	return Caller{
 		Credential: identity.Credential{
-			ActorID:       actorPia,
+			ActorID:       actorAva,
 			PrincipalKind: identity.PrincipalUser,
 			PrincipalID:   principal,
 		},
@@ -86,10 +86,30 @@ func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// sharedCacheDir is one on-disk compilation cache for the whole test binary.
+//
+// Every host used to get its own in-memory cache, so every test recompiled the
+// 930 KB reference guest from scratch at ~47 ms a time. Across the suite that
+// was most of the package's runtime, and it was measuring nothing: compilation
+// is covered once, deliberately, by TestCompilationCacheSurvivesRestart.
+//
+// It also means the tests exercise the on-disk cache path that the daemon
+// actually runs, rather than only the in-memory one.
+var sharedCacheDir = sync.OnceValue(func() string {
+	dir, err := os.MkdirTemp("", "wasmhost-cache")
+	if err != nil {
+		return "" // fall back to per-host in-memory caches
+	}
+	return dir
+})
+
 func newTestHost(t *testing.T, cfg Config, deps Deps) *Host {
 	t.Helper()
 	if cfg.Logger == nil {
 		cfg.Logger = quietLogger()
+	}
+	if cfg.CacheDir == "" {
+		cfg.CacheDir = sharedCacheDir()
 	}
 	h, err := New(t.Context(), cfg, deps)
 	if err != nil {
@@ -124,10 +144,23 @@ var engines = []struct {
 	{"interpreter", true},
 }
 
+// The interpreter half is skipped under -short, and only under -short.
+//
+// It is roughly 60x slower than the compiler and it is most of this package's
+// runtime, which is the shape that makes a developer stop running the gate. But
+// moving it to CI only would be worse: compiler-versus-interpreter divergence is
+// a known wazero issue class rather than a hypothetical, and a correctness check
+// you cannot reproduce locally is one you discover by having CI fail at you.
+//
+// So the full run stays the default and the gate runs everything. -short is an
+// explicit choice at the call site for the inner loop.
 func forEachEngine(t *testing.T, body func(t *testing.T, cfg Config)) {
 	t.Helper()
 	for _, e := range engines {
 		t.Run(e.name, func(t *testing.T) {
+			if e.interpreter && testing.Short() {
+				t.Skip("-short: skipping the interpreter half of the conformance canary; the gate runs it")
+			}
 			body(t, Config{Interpreter: e.interpreter, Logger: quietLogger()})
 		})
 	}
@@ -244,7 +277,7 @@ func TestConformanceStorageCapabilityRoundTrip(t *testing.T) {
 			t.Errorf("output = %s", res.Output)
 		}
 		// Identity is the host's, never the guest's (invariants 1 and 2).
-		if got.Caller.ActorID != actorPia || got.Caller.PrincipalID != principNate {
+		if got.Caller.ActorID != actorAva || got.Caller.PrincipalID != principAlice {
 			t.Errorf("caller = %+v, want the credential's pair", got.Caller)
 		}
 		if got.App != "hello" {
@@ -403,11 +436,11 @@ func TestPoolIsolatesByPrincipal(t *testing.T) {
 		return res
 	}
 
-	callAs(principNate)
-	if res := callAs(principMagg); res.Warm {
+	callAs(principAlice)
+	if res := callAs(principBob); res.Warm {
 		t.Error("a second principal was handed the first principal's warm instance")
 	}
-	if res := callAs(principNate); !res.Warm {
+	if res := callAs(principAlice); !res.Warm {
 		t.Error("the first principal lost its own warm instance")
 	}
 }
@@ -488,9 +521,9 @@ func TestCredentialMustPinBothHalves(t *testing.T) {
 		name   string
 		caller Caller
 	}{
-		{"no actor", Caller{Credential: identity.Credential{PrincipalKind: identity.PrincipalUser, PrincipalID: principNate}, InstallID: installHello}},
-		{"no principal", Caller{Credential: identity.Credential{ActorID: actorPia}, InstallID: installHello}},
-		{"no install", Caller{Credential: identity.Credential{ActorID: actorPia, PrincipalKind: identity.PrincipalUser, PrincipalID: principNate}}},
+		{"no actor", Caller{Credential: identity.Credential{PrincipalKind: identity.PrincipalUser, PrincipalID: principAlice}, InstallID: installHello}},
+		{"no principal", Caller{Credential: identity.Credential{ActorID: actorAva}, InstallID: installHello}},
+		{"no install", Caller{Credential: identity.Credential{ActorID: actorAva, PrincipalKind: identity.PrincipalUser, PrincipalID: principAlice}}},
 		{"neither", Caller{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

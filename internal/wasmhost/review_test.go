@@ -127,9 +127,12 @@ func TestReferenceGuestImportsOnlyAllowedWASI(t *testing.T) {
 // whatever actually happened. That asserts an enforcement that did not occur
 // and poisons every latency metric derived from it.
 func TestOverrunIsNotReportedAsTermination(t *testing.T) {
+	// Small, and the ratio is what matters rather than the magnitudes: the
+	// overrun has to be unambiguously past the deadline on a loaded CI runner,
+	// and the whole test is two sleeps of it.
 	const (
-		deadline = 150 * time.Millisecond
-		overrun  = 900 * time.Millisecond
+		deadline = 60 * time.Millisecond
+		overrun  = 400 * time.Millisecond
 	)
 	// A data layer that ignores its context, which is what invariant 7 exists
 	// to forbid and what a Go dependency does by accident.
@@ -277,7 +280,7 @@ func TestLimiterBoundsLiveInstances(t *testing.T) {
 		defer close(busy)
 		_, _ = h.Call(t.Context(), CallRequest{
 			Module: helloModule(t), Source: BytesSource(wasm),
-			Function: "store_query", Caller: testCaller(), Timeout: 2 * time.Second,
+			Function: "store_query", Caller: testCaller(), Timeout: 700 * time.Millisecond,
 		})
 	}()
 

@@ -160,6 +160,19 @@ Three tags off one Containerfile under rootless Podman, taking a few minutes the
 first time and seconds after. See [`harness.md`](harness.md) for the isolation
 defaults, the network modes and the run-record seam.
 
+A run that needs the internet also needs the egress proxy image:
+
+```powershell
+.\scripts\egress-build.ps1
+```
+
+```bash
+./scripts/egress-build.sh
+```
+
+See [`egress.md`](egress.md) for the allowlist syntax and what the proxy
+enforces.
+
 ## Tear down
 
 ```powershell

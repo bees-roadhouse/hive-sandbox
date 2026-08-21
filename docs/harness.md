@@ -80,7 +80,7 @@ container.
 | --- | --- |
 | `NetworkNone` | no interfaces. The default and the zero value. |
 | `NetworkDaemon` | still no interfaces; the daemon's API arrives as a bind-mounted unix socket. |
-| `NetworkProxied` | an internal Podman network shared with an allowlisting egress proxy, with the proxy variables injected. |
+| `NetworkProxied` | a per-run internal Podman network shared with an allowlisting egress proxy, with the proxy variables injected. See [`egress.md`](egress.md). |
 
 `NetworkDaemon` uses a socket rather than a bridge because of a measured
 constraint, not a preference. On rootless Podman 6.0.2, a `--internal` network
@@ -97,9 +97,10 @@ ip: RTNETLINK answers: Network unreachable
 So "no network except the daemon's own API" is not reachable with a bridge. A
 unix socket is, and it has less attack surface anyway.
 
-`NetworkProxied` **fails closed**: a spec that asks for it without a `ProxyURL`
-is an error rather than a quiet fall back to open egress. The proxy container
-itself is not built yet; when it lands, nothing in the supervisor changes.
+`NetworkProxied` **fails closed**: a spec that asks for it with an empty
+`EgressAllow` is an error rather than a quiet fall back to open egress. The proxy
+is built ... see [`egress.md`](egress.md) for the allowlist syntax, the two
+controls it applies, and why the proxy needs explicit DNS servers.
 
 ## Using it
 

@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -760,4 +761,153 @@ func buildIDOf(t *testing.T, w *world, installID uuid.UUID) uuid.UUID {
 		t.Fatalf("read build id: %v", err)
 	}
 	return id
+}
+
+// stagedBuild registers a build and stages an install on it, both owned by
+// owner, and returns the two ids. Both halves are the unprivileged ones ...
+// promotion is the act this file is about.
+func stagedBuild(t *testing.T, w *world, slug string, owner store.Owner, by store.Credential) (uuid.UUID, uuid.UUID) {
+	t.Helper()
+
+	sum := fmt.Sprintf("%064x", fixtureCounter.Add(1))
+	var buildID uuid.UUID
+	if err := w.s.Pool().QueryRow(w.ctx, `
+		INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
+		                        author_actor, owner_kind, owner_id, visibility, trust, status)
+		VALUES ($1, 'app', 'host', '{}', $2, $3, $4, $5, 'private', 'local', 'registered')
+		RETURNING id`, slug, sum, by.ActorID, string(owner.Kind), owner.ID).Scan(&buildID); err != nil {
+		t.Fatalf("register build: %v", err)
+	}
+
+	installID, err := store.StageInstall(w.ctx, w.s.Pool(), store.InstallSpec{
+		BuildID: buildID, Slug: slug, Owner: owner, SchemaName: "app_" + slug + "_" + sum[:8],
+	}, by)
+	if err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	return buildID, installID
+}
+
+func installState(t *testing.T, w *world, installID uuid.UUID) string {
+	t.Helper()
+	var state string
+	if err := w.s.Pool().QueryRow(w.ctx,
+		"SELECT state FROM installs WHERE id = $1", installID).Scan(&state); err != nil {
+		t.Fatalf("read install state: %v", err)
+	}
+	return state
+}
+
+// TestActivatingChecksWhatIsBeingPromotedAndNotOnlyWho.
+//
+// The authority half of this seam is correct and was reviewed as correct: the
+// activator is bound to the credential, ownership is tested, an AI cannot
+// promote its own build. It answered WHO exclusively, and nothing anywhere
+// answered WHAT ... so a build whose status says it is not promotable was
+// promoted, by a properly authorised human, with no error.
+//
+// builds_awaiting_promotion filters on status='registered', which reads like
+// enforcement and is a view. It shows a human the right list. Nothing passes
+// through it.
+//
+// D25 makes promotion THE capability decision. A promotion that cannot see the
+// status of the thing it promotes is deciding about something else.
+func TestActivatingChecksWhatIsBeingPromotedAndNotOnlyWho(t *testing.T) {
+	w := newWorld(t)
+	alice := w.human("alice")
+	aliceOwner := store.Owner{Kind: store.PrincipalUser, ID: alice}
+	aliceCred := cred(alice, store.PrincipalUser, alice)
+
+	buildID, installID := stagedBuild(t, w, "withdrawn-app", aliceOwner, aliceCred)
+
+	if _, err := w.s.Pool().Exec(w.ctx,
+		"UPDATE app_builds SET status = 'withdrawn' WHERE id = $1", buildID); err != nil {
+		t.Fatalf("withdraw build: %v", err)
+	}
+
+	// Alice is the owner and a human. The authority half says yes, correctly,
+	// and it is the only half that used to run.
+	err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, aliceCred)
+	if err == nil {
+		t.Fatal("a withdrawn build was promoted into a live install")
+	}
+	if !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+	if got := installState(t, w, installID); got != "disabled" {
+		t.Fatalf("install state is %q after a refused activation", got)
+	}
+
+	// And the same call succeeds once the build is promotable again, so the
+	// refusal above is about the status rather than about the authority.
+	if _, err := w.s.Pool().Exec(w.ctx,
+		"UPDATE app_builds SET status = 'registered' WHERE id = $1", buildID); err != nil {
+		t.Fatalf("re-register build: %v", err)
+	}
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, aliceCred); err != nil {
+		t.Fatalf("a registered build owned by the activating human was refused: %v", err)
+	}
+	if got := installState(t, w, installID); got != "active" {
+		t.Fatalf("install state is %q after a permitted activation", got)
+	}
+}
+
+// TestActivatingCannotPullATeardownBackToLive. The install's own state was
+// never read either, so an uninstall in progress could be reactivated
+// underneath itself.
+func TestActivatingCannotPullATeardownBackToLive(t *testing.T) {
+	w := newWorld(t)
+	alice := w.human("alice")
+	aliceOwner := store.Owner{Kind: store.PrincipalUser, ID: alice}
+	aliceCred := cred(alice, store.PrincipalUser, alice)
+
+	_, installID := stagedBuild(t, w, "teardown-app", aliceOwner, aliceCred)
+
+	if _, err := w.s.Pool().Exec(w.ctx,
+		"UPDATE installs SET state = 'uninstalling' WHERE id = $1", installID); err != nil {
+		t.Fatalf("begin teardown: %v", err)
+	}
+
+	err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, aliceCred)
+	if err == nil {
+		t.Fatal("an install being torn down was activated")
+	}
+	if !errors.Is(err, store.ErrDenied) {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+	if got := installState(t, w, installID); got != "uninstalling" {
+		t.Fatalf("install state is %q; a refused activation moved a teardown", got)
+	}
+}
+
+// TestActivatingSaysNothingAboutABuildToACallerWithNoStanding.
+//
+// The status check runs AFTER authority is established, and this is why. A
+// stranger learning "that build is withdrawn" learns the state of somebody
+// else's install from a call they were never allowed to make ... the same
+// oracle shape as distinguishing "no such row" from "not yours".
+func TestActivatingSaysNothingAboutABuildToACallerWithNoStanding(t *testing.T) {
+	w := newWorld(t)
+	alice := w.human("alice")
+	bob := w.human("bob")
+	aliceOwner := store.Owner{Kind: store.PrincipalUser, ID: alice}
+	aliceCred := cred(alice, store.PrincipalUser, alice)
+	bobCred := cred(bob, store.PrincipalUser, bob)
+
+	buildID, installID := stagedBuild(t, w, "private-app", aliceOwner, aliceCred)
+	if _, err := w.s.Pool().Exec(w.ctx,
+		"UPDATE app_builds SET status = 'withdrawn' WHERE id = $1", buildID); err != nil {
+		t.Fatalf("withdraw build: %v", err)
+	}
+
+	err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, bobCred)
+	if err == nil {
+		t.Fatal("a stranger activated somebody else's install")
+	}
+	if strings.Contains(err.Error(), "withdrawn") {
+		t.Fatalf("the refusal disclosed the build's status to a caller with no standing: %v", err)
+	}
+	if !errors.Is(err, store.ErrNotHuman) {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
 }

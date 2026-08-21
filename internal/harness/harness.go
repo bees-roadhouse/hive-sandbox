@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"time"
 )
 
@@ -229,9 +230,22 @@ func (s RunSpec) ProxyURL() string {
 	return fmt.Sprintf("http://%s:%d", s.ProxyContainerName(), ProxyPort)
 }
 
+// runIDPattern bounds a run id to what can safely name a container, a network
+// and a label.
+//
+// A run id reaches `podman run --name` and `podman network create`. Anything
+// outside this set either fails opaquely inside podman or, worse, collides with
+// another run's names after podman normalises it.
+var runIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
+
 func (s RunSpec) validate() error {
 	if s.RunID == "" {
 		return errors.New("spec: RunID is required")
+	}
+	if !runIDPattern.MatchString(s.RunID) {
+		return fmt.Errorf(
+			"spec: RunID %q must be 1-63 characters of [A-Za-z0-9_.-] starting alphanumeric; it names a container and a network",
+			s.RunID)
 	}
 	if !s.Runtime.valid() {
 		return fmt.Errorf("spec: unknown runtime %q", s.Runtime)

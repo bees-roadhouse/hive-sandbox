@@ -192,3 +192,59 @@ jobs:
 
       - name: full host suite against the fresh guest
         run: go test -race ./internal/wasmhost/
+
+  # The egress claim ... a harness has no route out and an agent that ignores
+  # HTTP_PROXY fails rather than escapes ... is proven by exactly one test, and
+  # until now that test ran nowhere. Five skip conditions, none of them met by
+  # any job: nothing built the images and the pin files are gitignored on
+  # purpose, because a locally built image has a machine-local digest.
+  #
+  # So this job builds them and pins them in-job, where the digest is real for
+  # this run, and sets HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS so a precondition
+  # that is not met FAILS rather than skips. A skip is right on a laptop that
+  # never built a harness; it is wrong in the one environment that promised to.
+  #
+  # Its own job because it builds container images, and a lint failure should
+  # not wait behind that.
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: podman version
+        run: podman version
+
+      # Only the claude runtime: the egress test drives one image, and building
+      # three would triple the job for nothing. The build script takes a subset
+      # and relocks whatever exists.
+      - name: build the harness image
+        run: ./scripts/harness-build.sh claude
+
+      - name: build the egress proxy image
+        run: ./scripts/egress-build.sh
+
+      - name: the pins exist
+        run: |
+          cat docker/harness/digests.json
+          cat docker/egress/digest.json
+
+      - name: container tests, where a skip is a failure
+        env:
+          HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS: "1"
+        run: |
+          go test -race -count=1 -timeout 15m \
+            -run 'TestEgressProxy|TestPodmanRunsThePinnedImage' \
+            -v ./internal/harness/
+
+      - name: nothing outlived the run
+        if: ${{ always() }}
+        run: |
+          echo "containers:"
+          podman ps --all --filter 'name=hive-sandbox-' --format '{{.Names}}'
+          echo "networks:"
+          podman network ls --format '{{.Name}}' | grep hive-sandbox || echo "  (none)"

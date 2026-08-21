@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -44,16 +45,16 @@ func TestEgressProxyEnforcesTheAllowlist(t *testing.T) {
 	t.Parallel()
 
 	if _, err := exec.LookPath("podman"); err != nil {
-		t.Skip("podman not on PATH")
+		skipOrFail(t, "podman not on PATH")
 	}
 
 	pins, err := harness.LoadPins(filepath.Join("..", "..", harness.DefaultPinsPath))
 	if err != nil {
-		t.Skipf("no harness pins (%v); run scripts/harness-build.sh", err)
+		skipOrFail(t, "no harness pins (%v); run scripts/harness-build.sh", err)
 	}
 	egressPin, err := harness.LoadEgressPin(filepath.Join("..", "..", harness.DefaultEgressPinPath))
 	if err != nil {
-		t.Skipf("no egress pin (%v); run scripts/egress-build.sh", err)
+		skipOrFail(t, "no egress pin (%v); run scripts/egress-build.sh", err)
 	}
 
 	spec := harness.RunSpec{
@@ -73,10 +74,10 @@ func TestEgressProxyEnforcesTheAllowlist(t *testing.T) {
 		t.Fatalf("Apply: %v", applyErr)
 	}
 	if !imagePresent(t, spec.ImageRef()) {
-		t.Skipf("%s not in local storage; run scripts/harness-build.sh", spec.ImageRef())
+		skipOrFail(t, "%s not in local storage; run scripts/harness-build.sh", spec.ImageRef())
 	}
 	if !imagePresent(t, egressPin.Ref()) {
-		t.Skipf("%s not in local storage; run scripts/egress-build.sh", egressPin.Ref())
+		skipOrFail(t, "%s not in local storage; run scripts/egress-build.sh", egressPin.Ref())
 	}
 
 	launcher := &harness.PodmanLauncher{
@@ -220,4 +221,29 @@ func parseAnswers(lines []string) map[string]string {
 func networkExists(t *testing.T, name string) bool {
 	t.Helper()
 	return exec.Command("podman", "network", "exists", name).Run() == nil
+}
+
+// RequireContainerTestsEnv turns every precondition skip in this file into a
+// failure.
+//
+// Augie's finding 4: this file has five skip conditions, and CI built neither
+// image and ran neither build script, so the test that proves the entire egress
+// claim executed nowhere. It skipped on her machine too ... with both images in
+// local storage ... because the pin files are gitignored.
+//
+// Her framing is a category one step earlier than "a test that cannot fail":
+// **a test that never executes**. A skip is the right behaviour on a laptop
+// that has never built a harness, and the wrong behaviour in an environment
+// that promised to build one. So the environment says which it is, and the
+// container CI job sets this.
+const RequireContainerTestsEnv = "HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS"
+
+func skipOrFail(t *testing.T, format string, args ...any) {
+	t.Helper()
+
+	if os.Getenv(RequireContainerTestsEnv) != "" {
+		t.Fatalf("%s is set, so this must not skip: "+format,
+			append([]any{RequireContainerTestsEnv}, args...)...)
+	}
+	t.Skipf(format, args...)
 }

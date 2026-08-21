@@ -46,6 +46,46 @@ type Supervisor struct {
 	MaxStderrTailBytes int
 	DrainGrace         time.Duration
 	TerminateGrace     time.Duration
+
+	// inFlight is the set of run ids currently running, and the enforcement of
+	// the uniqueness the rest of the package assumes.
+	//
+	// A run id names the container, the egress proxy and the run's internal
+	// network. Two live runs sharing one share all three: each gets the union
+	// of both allowlists, and either one's teardown removes the other's
+	// network. That was documented on RunSpec.RunID as a requirement and
+	// enforced nowhere, which is a comment asking a caller to be careful.
+	//
+	// This covers one process, which is where the container names actually
+	// collide. Across processes the run row is the authority ... MemoryStore
+	// already refuses a duplicate, and a Postgres RunStore gets a unique
+	// constraint.
+	inFlightMu sync.Mutex
+	inFlight   map[string]bool
+}
+
+// ErrRunInFlight means a run with that id is already running in this process.
+var ErrRunInFlight = errors.New("harness: a run with this id is already in flight")
+
+// claim reserves a run id for the duration of a run.
+func (s *Supervisor) claim(runID string) error {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+
+	if s.inFlight[runID] {
+		return fmt.Errorf("%w: %s", ErrRunInFlight, runID)
+	}
+	if s.inFlight == nil {
+		s.inFlight = make(map[string]bool)
+	}
+	s.inFlight[runID] = true
+	return nil
+}
+
+func (s *Supervisor) release(runID string) {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	delete(s.inFlight, runID)
 }
 
 func (s *Supervisor) maxLineBytes() int {
@@ -89,6 +129,12 @@ func (s *Supervisor) Run(ctx context.Context, spec RunSpec, onEvent EventFunc) (
 	if err := spec.validate(); err != nil {
 		return Result{}, err
 	}
+
+	// Before anything is created, and released however Run exits.
+	if err := s.claim(spec.RunID); err != nil {
+		return Result{}, err
+	}
+	defer s.release(spec.RunID)
 
 	startedAt := time.Now()
 	result := Result{

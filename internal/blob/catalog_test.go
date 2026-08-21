@@ -267,7 +267,7 @@ func TestTwoOwnersShareOneObject(t *testing.T) {
 
 	// Alice releasing hers must not make the bytes collectable while Bob still
 	// holds one. Counting per tenant is exactly what would get this wrong.
-	if releaseErr := w.catalog.Release(w.ctx, alice, first.Hash, blob.SourceUpload, "upload-a"); releaseErr != nil {
+	if releaseErr := w.catalog.Release(w.ctx, w.pool, alice, first.Hash, blob.SourceUpload, "upload-a"); releaseErr != nil {
 		t.Fatalf("Release: %v", releaseErr)
 	}
 
@@ -404,7 +404,7 @@ func TestSweepCollectsOnlyUnreferencedBytes(t *testing.T) {
 	alice := w.person("alice")
 
 	desc := w.publish([]byte("released and collectable"), capture(alice, "upload-1"), originalClass)
-	if err := w.catalog.Release(w.ctx, alice, desc.Hash, blob.SourceUpload, "upload-1"); err != nil {
+	if err := w.catalog.Release(w.ctx, w.pool, alice, desc.Hash, blob.SourceUpload, "upload-1"); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 
@@ -447,7 +447,7 @@ func TestTrashRefusesWhenAReferenceReappears(t *testing.T) {
 	bob := w.person("bob")
 
 	desc := w.publish([]byte("referenced again mid-sweep"), capture(alice, "upload-1"), originalClass)
-	if err := w.catalog.Release(w.ctx, alice, desc.Hash, blob.SourceUpload, "upload-1"); err != nil {
+	if err := w.catalog.Release(w.ctx, w.pool, alice, desc.Hash, blob.SourceUpload, "upload-1"); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 
@@ -761,5 +761,105 @@ func TestLinkRefCannotRaiseTrust(t *testing.T) {
 		t.Fatalf("Resolve: %v", err)
 	} else if level != trust.Untrusted {
 		t.Errorf("trust = %q after linking under a new source kind, want untrusted", level)
+	}
+}
+
+// The document-update path Storage needs: a document that drops a descriptor
+// releases that reference in the same transaction, and one that keeps a
+// descriptor keeps its reference.
+func TestReleaseBySourceAndHeldBySource(t *testing.T) {
+	t.Parallel()
+
+	w := newCatalogWorld(t)
+	alice := w.person("alice")
+
+	kept := w.publish([]byte("a photo the document keeps"), capture(alice, "upload-1"), originalClass)
+	dropped := w.publish([]byte("a photo the document drops"), capture(alice, "upload-2"), originalClass)
+
+	// A document referencing both.
+	const entry = "entry-7"
+	err := pgx.BeginFunc(w.ctx, w.pool, func(tx pgx.Tx) error {
+		for _, h := range []blob.Hash{kept.Hash, dropped.Hash} {
+			if _, linkErr := w.catalog.LinkRef(w.ctx, tx, alice, h, blob.RefSpec{
+				Cred: alice, SourceKind: blob.SourceCollection, SourceID: entry, Trust: trust.Trusted,
+			}); linkErr != nil {
+				return linkErr
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("link: %v", err)
+	}
+
+	held, err := w.catalog.HeldBySource(w.ctx, w.pool, alice, blob.SourceCollection, entry)
+	if err != nil {
+		t.Fatalf("HeldBySource: %v", err)
+	}
+	if len(held) != 2 {
+		t.Fatalf("held %d references, want 2", len(held))
+	}
+
+	// The update: the new document no longer names `dropped`.
+	if releaseErr := w.catalog.Release(w.ctx, w.pool, alice, dropped.Hash, blob.SourceCollection, entry); releaseErr != nil {
+		t.Fatalf("Release: %v", releaseErr)
+	}
+	held, err = w.catalog.HeldBySource(w.ctx, w.pool, alice, blob.SourceCollection, entry)
+	if err != nil {
+		t.Fatalf("HeldBySource: %v", err)
+	}
+	if len(held) != 1 || held[0] != kept.Hash {
+		t.Errorf("held = %v, want just the kept hash", held)
+	}
+
+	// The delete: everything the document held goes, without the caller having
+	// to remember what was in it.
+	released, err := w.catalog.ReleaseBySource(w.ctx, w.pool, alice, blob.SourceCollection, entry)
+	if err != nil {
+		t.Fatalf("ReleaseBySource: %v", err)
+	}
+	if released != 1 {
+		t.Errorf("released %d, want 1", released)
+	}
+
+	// Releasing nothing is not an error: a document that held no blobs is the
+	// ordinary case, and a special case in every delete path is worse.
+	again, err := w.catalog.ReleaseBySource(w.ctx, w.pool, alice, blob.SourceCollection, entry)
+	if err != nil {
+		t.Errorf("second ReleaseBySource: %v", err)
+	}
+	if again != 0 {
+		t.Errorf("released %d on the second pass, want 0", again)
+	}
+
+	// The original uploads still hold the bytes down, so a document delete did
+	// not collect anything.
+	if count, _ := w.catalog.LiveRefCount(w.ctx, kept.Hash); count != 1 {
+		t.Errorf("kept hash has %d live refs, want 1", count)
+	}
+}
+
+// ReleaseBySource is owner-scoped: one principal cannot release another's
+// references by naming the same source id.
+func TestReleaseBySourceIsOwnerScoped(t *testing.T) {
+	t.Parallel()
+
+	w := newCatalogWorld(t)
+	alice := w.person("alice")
+	carol := w.person("carol")
+
+	desc := w.publish([]byte("alice's document photo"), blob.RefSpec{
+		Cred: alice, SourceKind: blob.SourceCollection, SourceID: "entry-1", Trust: trust.Trusted,
+	}, originalClass)
+
+	released, err := w.catalog.ReleaseBySource(w.ctx, w.pool, carol, blob.SourceCollection, "entry-1")
+	if err != nil {
+		t.Fatalf("ReleaseBySource: %v", err)
+	}
+	if released != 0 {
+		t.Errorf("carol released %d of alice's references", released)
+	}
+	if count, _ := w.catalog.LiveRefCount(w.ctx, desc.Hash); count != 1 {
+		t.Errorf("live refs = %d, want 1", count)
 	}
 }

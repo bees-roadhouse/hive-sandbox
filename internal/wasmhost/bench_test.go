@@ -41,7 +41,7 @@ func benchModule(b *testing.B) ([]byte, Module) {
 }
 
 func benchCaller() Caller {
-	return testCallerFor(principNate)
+	return testCallerFor(principAlice)
 }
 
 // minimalNoop is a hand-written module exporting one memory and one function
@@ -81,7 +81,7 @@ func BenchmarkRuntimeFloor(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			inst, err := h.instantiate(ctx, t, compiled, mod, instanceKey{moduleHash: hash, principal: principNate, tier: t.key, caps: mod.Capabilities.bits()})
+			inst, err := h.instantiate(ctx, t, compiled, mod, instanceKey{moduleHash: hash, principal: principAlice, tier: t.key, caps: mod.Capabilities.bits()})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -145,7 +145,7 @@ func BenchmarkInstantiate(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	key := instanceKey{moduleHash: mod.Hash, principal: principNate, tier: t.key, caps: mod.Capabilities.bits()}
+	key := instanceKey{moduleHash: mod.Hash, principal: principAlice, tier: t.key, caps: mod.Capabilities.bits()}
 
 	b.ReportAllocs()
 	for b.Loop() {
@@ -176,7 +176,7 @@ func BenchmarkInstanceFootprint(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	key := instanceKey{moduleHash: mod.Hash, principal: principNate, tier: t.key, caps: mod.Capabilities.bits()}
+	key := instanceKey{moduleHash: mod.Hash, principal: principAlice, tier: t.key, caps: mod.Capabilities.bits()}
 
 	var heapPer, wasmPer float64
 	for b.Loop() {

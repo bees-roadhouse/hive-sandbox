@@ -61,20 +61,20 @@ func helloModule(t *testing.T, caps ...Capability) Module {
 // Fixed ids rather than fresh ones per call, so the pool key is stable across a
 // test and "was this warm" means what it looks like.
 var (
-	actorPia     = uuid.MustParse("11111111-1111-4111-8111-111111111111")
-	principNate  = uuid.MustParse("22222222-2222-4222-8222-222222222222")
-	principMagg  = uuid.MustParse("33333333-3333-4333-8333-333333333333")
+	actorAva     = uuid.MustParse("11111111-1111-4111-8111-111111111111")
+	principAlice = uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	principBob   = uuid.MustParse("33333333-3333-4333-8333-333333333333")
 	installHello = uuid.MustParse("44444444-4444-4444-8444-444444444444")
 )
 
 func testCaller() Caller {
-	return testCallerFor(principNate)
+	return testCallerFor(principAlice)
 }
 
 func testCallerFor(principal uuid.UUID) Caller {
 	return Caller{
 		Credential: identity.Credential{
-			ActorID:       actorPia,
+			ActorID:       actorAva,
 			PrincipalKind: identity.PrincipalUser,
 			PrincipalID:   principal,
 		},
@@ -277,7 +277,7 @@ func TestConformanceStorageCapabilityRoundTrip(t *testing.T) {
 			t.Errorf("output = %s", res.Output)
 		}
 		// Identity is the host's, never the guest's (invariants 1 and 2).
-		if got.Caller.ActorID != actorPia || got.Caller.PrincipalID != principNate {
+		if got.Caller.ActorID != actorAva || got.Caller.PrincipalID != principAlice {
 			t.Errorf("caller = %+v, want the credential's pair", got.Caller)
 		}
 		if got.App != "hello" {
@@ -436,11 +436,11 @@ func TestPoolIsolatesByPrincipal(t *testing.T) {
 		return res
 	}
 
-	callAs(principNate)
-	if res := callAs(principMagg); res.Warm {
+	callAs(principAlice)
+	if res := callAs(principBob); res.Warm {
 		t.Error("a second principal was handed the first principal's warm instance")
 	}
-	if res := callAs(principNate); !res.Warm {
+	if res := callAs(principAlice); !res.Warm {
 		t.Error("the first principal lost its own warm instance")
 	}
 }
@@ -521,9 +521,9 @@ func TestCredentialMustPinBothHalves(t *testing.T) {
 		name   string
 		caller Caller
 	}{
-		{"no actor", Caller{Credential: identity.Credential{PrincipalKind: identity.PrincipalUser, PrincipalID: principNate}, InstallID: installHello}},
-		{"no principal", Caller{Credential: identity.Credential{ActorID: actorPia}, InstallID: installHello}},
-		{"no install", Caller{Credential: identity.Credential{ActorID: actorPia, PrincipalKind: identity.PrincipalUser, PrincipalID: principNate}}},
+		{"no actor", Caller{Credential: identity.Credential{PrincipalKind: identity.PrincipalUser, PrincipalID: principAlice}, InstallID: installHello}},
+		{"no principal", Caller{Credential: identity.Credential{ActorID: actorAva}, InstallID: installHello}},
+		{"no install", Caller{Credential: identity.Credential{ActorID: actorAva, PrincipalKind: identity.PrincipalUser, PrincipalID: principAlice}}},
 		{"neither", Caller{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +13,30 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
+
+// eventKind is the format a kind must take, and it is the same expression the
+// CHECK on events.kind carries. Two copies is the deliberate trade named there:
+// the column is what holds for every writer including psql, and this is what
+// gives a Go caller an error naming the field rather than a constraint
+// violation from three layers down.
+var eventKind = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
+
+// ErrBadEventKind is a kind that cannot be written.
+var ErrBadEventKind = errors.New("store: event kind is not a dotted identifier")
+
+// ValidEventKind rejects a kind before it can reach a subscriber's frame.
+//
+// A kind is written into the `event:` field of an SSE frame, so a control
+// character in one splits a single event into two frames and lets the second
+// carry an `id:` the server had decided must not be written. Rejecting at the
+// writer is not a substitute for the column constraint and the column
+// constraint is not a substitute for this ... they fail for different callers.
+func ValidEventKind(kind string) error {
+	if !eventKind.MatchString(kind) {
+		return fmt.Errorf("%w: %q", ErrBadEventKind, kind)
+	}
+	return nil
+}
 
 // Cursor is a position in the events stream.
 //
@@ -187,6 +212,9 @@ func AppendEvents(ctx context.Context, db DB, events ...*Event) error {
 
 	var highest Cursor
 	for _, e := range events {
+		if err := ValidEventKind(e.Kind); err != nil {
+			return err
+		}
 		if e.Origin == "" {
 			e.Origin = "local"
 		}

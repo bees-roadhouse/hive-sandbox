@@ -101,12 +101,27 @@ Nothing becomes a visible PR red. Run the gate locally before pushing; read the
 gate's OUTPUT, never the exit code of a piped command.
 
 ```powershell
+$env:HIVE_SANDBOX_TEST_DATABASE_URL = .\scripts\db-up.ps1 -Quiet
 .\scripts\gate.ps1        # fmt check, vet, golangci-lint, build, test -race
 ```
 
 ```bash
+export HIVE_SANDBOX_TEST_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
 ./scripts/gate.sh
 ```
+
+**The database line is not optional and the gate now refuses without it.** It
+used to be a suggestion, and the result was shape 2 from the list below at full
+scale: without that variable **125 tests skip themselves** ... every
+Postgres-backed test in the repo, including `TestAbsenceIsDeny` and the whole
+grant predicate suite ... and the gate still printed `GATE GREEN` in about the
+same wall time, because skipping is fast and `-race` makes a skipped suite look
+like a slow one. A fix to a live cross-principal leak was reported as gate-green
+over a reproduction that had never executed.
+
+The gate also NAMES every test that skipped, every run. A skip is a test saying
+out loud that it is not answering the question, and that only helps if somebody
+hears it.
 
 Order matters: `gofmt` AFTER any lint autofix. The toolchain is pinned in
 `go.mod`; CI runs the same version.
@@ -169,8 +184,32 @@ test/                  integration tests, including Playwright-driven HTTP/SSE
      somewhere else entirely.
   2. **It never executes.** Skip conditions no environment satisfies, or a job
      that builds none of what the test needs. Make the environment that promised
-     to run it *fail* on a skipped precondition rather than guessing.
+     to run it *fail* on a skipped precondition rather than guessing. The worst
+     version: **a platform skip added in the same commit as the code it guards
+     is not evidence, it is a blind spot with a comment on it.** Nobody has ever
+     watched that test run, not once. It usually gets in by copying a legitimate
+     skip already in the package without re-earning it.
   3. **Its fixture is too small to reach the failure.** The property is real and
      the assertion is honest, and `n = 12` against a batch limit of 500 means the
      interesting branch never runs. This one hides best, because the test is
      well written. Ask what size makes the loop take its other path.
+- **Ask what the instrument measured before believing it.** Three detectors,
+  each earned here by nearly shipping the thing it catches:
+  - **Check the clock.** A suite that returns green implausibly fast never ran.
+    Two suites came back in 0.5s because `HIVE_SANDBOX_TEST_DATABASE_URL` was
+    unset, and six security fixes were about to be reported as verified.
+  - **Check the skip.** Count what actually ran, not what was green.
+  - **Check what the mutation removed.** A green mutation result is evidence only
+    if the mutation actually removed the property, and **with defence in depth a
+    single-site mutation does not** ... deleting the Go check leaves the SQL
+    clause standing and vice versa. A pass came back "five uncaught", which reads
+    as five worthless tests and actually meant the redundancy was real.
+    **"Uncaught" is a verdict on the pair, not on the test.**
+- **When arranging the condition changes the outcome, test the decision instead
+  of the mechanism.** Every attempt to stage "process finished, then context
+  cancelled" against a context-bound command kills the process instead ... Linux
+  signals it, Windows poisons `Wait`. The window cannot be arranged, so arranging
+  it proves nothing. The test that worked used a launcher whose command is not
+  context-bound, cancelled before the run started, and asserted the recorded
+  state: deterministic on every platform, no skip, and it fails against the old
+  code.

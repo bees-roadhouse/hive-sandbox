@@ -93,6 +93,7 @@ var requiredPhrases = []string{
 	"never a replay tape",
 	"which way it can go wrong",
 	"Its fixture is too small to reach the failure",
+	"verdict on the pair",
 }
 
 // TestRequiredGuidanceSurvives fails when a merge drops guidance the numbered

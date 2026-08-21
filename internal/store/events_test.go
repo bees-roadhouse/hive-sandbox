@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -401,5 +402,81 @@ func TestBootstrapCredentialIsIdempotentAndPinned(t *testing.T) {
 
 	if err := store.EnsureBootstrapCredential(ctx, s.Pool(), uuid.New(), token); err == nil {
 		t.Fatal("the bootstrap token was repointed at another actor")
+	}
+}
+
+// TestEventKindCannotCarryAFrameSeparator is where the SSE injection is
+// actually stopped.
+//
+// A kind is written into the `event:` field of an SSE frame. A newline in one
+// renders a single event as TWO frames, and the second is free to carry an
+// `id:` on an event the stream had just decided must not have one ... that
+// decision lives in a boolean in the writer, and the injection happens inside
+// the frame the boolean already decided about, so nothing there can catch it.
+// The forged cursor parses to the year 5138, so every reconnect replays from
+// there, returns nothing, and the client's stream is permanently dead.
+//
+// Two layers, tested separately on purpose: the Go check gives a caller an
+// error naming the field, and the CHECK is what holds for a writer that never
+// goes through Go at all. Neither substitutes for the other.
+func TestEventKindCannotCarryAFrameSeparator(t *testing.T) {
+	s, ctx := testStore(t)
+	w := newWorld(t)
+	alice := w.human("alice")
+	owner := store.Owner{Kind: store.PrincipalUser, ID: alice}
+
+	// columnErr is what the DATABASE must reject each one with, named per case
+	// rather than folded into a looser "some error occurred". A test that
+	// accepts any error would also pass if the column were dropped entirely.
+	hostile := []struct{ name, kind, columnErr string }{
+		{"newline", "note.created\nid: 99999999999999-999999\ndata: {\"stolen\":true}", "events_kind_"},
+		{"carriage return", "note.created\rid: 12345-6", "events_kind_"},
+		// Postgres refuses a NUL inside a text value at the encoding layer,
+		// which runs before any CHECK. So this one never reaches the
+		// constraint, and asserting that it does would assert something untrue
+		// about how it is stopped. The writer still needs its own rule for it,
+		// which is the go/ subtest above.
+		{"nul", "note.\x00created", "invalid byte sequence"},
+		{"tab", "note.\tcreated", "events_kind_"},
+		{"empty", "", "events_kind_"},
+		{"space", "note created", "events_kind_"},
+	}
+
+	for _, tc := range hostile {
+		t.Run("go/"+tc.name, func(t *testing.T) {
+			err := store.AppendEvents(ctx, s.Pool(), &store.Event{
+				Kind: tc.kind, Owner: owner, AuthorActor: alice,
+				PrincipalKind: store.PrincipalUser, PrincipalID: alice,
+			})
+			if !errors.Is(err, store.ErrBadEventKind) {
+				t.Fatalf("AppendEvents accepted %q: %v", tc.kind, err)
+			}
+		})
+
+		t.Run("column/"+tc.name, func(t *testing.T) {
+			// Straight past the Go layer, which is the point: this is the
+			// constraint a second producer cannot forget.
+			_, err := s.Pool().Exec(ctx, `
+				INSERT INTO events (kind, owner_kind, owner_id, author_actor,
+				                    principal_kind, principal_id, body)
+				VALUES ($1,'user',$2,$2,'user',$2,'{}')`, tc.kind, alice)
+			if err == nil {
+				t.Fatalf("the column accepted %q", tc.kind)
+			}
+			if !strings.Contains(err.Error(), tc.columnErr) {
+				t.Fatalf("%q was rejected by something other than %s: %v", tc.kind, tc.columnErr, err)
+			}
+		})
+	}
+
+	// And the ordinary shape still writes, so the constraint is not simply
+	// rejecting everything.
+	for _, ok := range []string{"a", "note.created", "journal.entry.created", "seed-1.a_b.v2"} {
+		if err := store.AppendEvents(ctx, s.Pool(), &store.Event{
+			Kind: ok, Owner: owner, AuthorActor: alice,
+			PrincipalKind: store.PrincipalUser, PrincipalID: alice,
+		}); err != nil {
+			t.Fatalf("a legitimate kind %q was refused: %v", ok, err)
+		}
 	}
 }

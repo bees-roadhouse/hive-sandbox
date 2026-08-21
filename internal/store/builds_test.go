@@ -10,6 +10,7 @@ import (
 	"github.com/bees-roadhouse/hive-sandbox/internal/manifest"
 	"github.com/bees-roadhouse/hive-sandbox/internal/registry"
 	"github.com/bees-roadhouse/hive-sandbox/internal/store"
+	"github.com/bees-roadhouse/hive-sandbox/internal/wasmhost"
 )
 
 // preparedFor builds a real Prepared for one owner. The app has one generated
@@ -23,7 +24,7 @@ func preparedFor(t *testing.T, name string, owner store.Owner) registry.InstallS
 			{Name: "links", CRUD: true, Indexes: []string{"btree(created)"}},
 		}},
 	}
-	p, err := registry.Prepare(m, "", nil)
+	p, err := registry.Prepare(m, wasmhost.Exports{})
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}

@@ -617,3 +617,87 @@ func TestRunIDIsReleasedAfterTheRun(t *testing.T) {
 		}
 	}
 }
+
+// detachedLauncher builds a command that is NOT bound to the context.
+//
+// Cancelling the caller's context therefore cannot kill the process, which is
+// the only way to construct the case under test: a run that finishes cleanly
+// while the caller's context is already cancelled. Every attempt to arrange
+// that with a context-bound command kills the process instead ... on Linux it
+// is signalled, on Windows Wait itself returns
+// `TerminateProcess: Access is denied` ... so arranging the window changes the
+// answer.
+type detachedLauncher struct {
+	mode       string
+	terminated atomic.Int32
+}
+
+func (l *detachedLauncher) Command(_ context.Context, _ harness.RunSpec) (*exec.Cmd, error) {
+	cmd := exec.Command(os.Args[0]) //nolint:gosec // the test binary, re-executed as a helper
+	cmd.Env = append(os.Environ(), helperEnv+"="+l.mode)
+	return cmd, nil
+}
+
+func (l *detachedLauncher) Terminate(_ context.Context, _ harness.RunSpec) error {
+	l.terminated.Add(1)
+	return nil
+}
+
+// Augie's finding 10, third item. terminalState asked ctx.Err() first, so a run
+// that exited 0 reported cancelled when the caller's context happened to be
+// cancelled by the time the state was computed.
+//
+// That is a normal shape ... a caller cancels a group after its work finishes
+// ... and reporting a completed agent run as cancelled is worse than cosmetic:
+// an at-most-once step (invariant 10) that reads cancelled may be retried, and
+// the money was already spent.
+func TestACleanExitIsNotReportedAsCancelled(t *testing.T) {
+	t.Parallel()
+
+	launcher := &detachedLauncher{mode: "clean"}
+	sup := &harness.Supervisor{Launcher: launcher}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancelled before the run even starts. The process is detached, so it runs
+	// to completion regardless ... which is precisely the state the old code
+	// misreported.
+	cancel()
+
+	res, err := sup.Run(ctx, testSpec(t, "run-clean-then-cancelled"), nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if res.State != harness.StateSucceeded {
+		t.Errorf("state = %q, want %q; the process exited 0 and the work was done",
+			res.State, harness.StateSucceeded)
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("exit code = %d, want 0", res.ExitCode)
+	}
+	// Cleanup still runs, cancelled context or not.
+	if launcher.terminated.Load() != 1 {
+		t.Errorf("Terminate ran %d times, want 1", launcher.terminated.Load())
+	}
+}
+
+// And a run actually stopped by cancellation still reports cancelled, because a
+// killed process never exits 0.
+func TestCancellationStillReportsCancelled(t *testing.T) {
+	t.Parallel()
+
+	sup := &harness.Supervisor{Launcher: &helperLauncher{mode: "hang"}}
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel()
+	}()
+
+	res, err := sup.Run(ctx, testSpec(t, "run-really-cancelled"), nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.State != harness.StateCancelled {
+		t.Errorf("state = %q, want %q", res.State, harness.StateCancelled)
+	}
+}

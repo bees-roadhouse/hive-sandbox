@@ -8,6 +8,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/bees-roadhouse/hive-sandbox/internal/manifest"
 )
 
 // ErrNotHuman is returned when an act that D19 reserves for a person is
@@ -25,11 +27,29 @@ const CapabilityActivate InstallCapability = "activate"
 // separates building from making live, and staging is the unprivileged half
 // that the builder loop may do unattended.
 type InstallSpec struct {
-	BuildID    uuid.UUID
-	Slug       string
-	Owner      Owner
-	SchemaName string
+	BuildID uuid.UUID
+	Slug    string
+	Owner   Owner
 }
+
+// There is deliberately no SchemaName here.
+//
+// It used to be a parameter, and nothing checked it against the owner. actsFor
+// asks whose INSTALL this is; nothing asked whose SCHEMA it is. So Bob, acting
+// honestly for his own principal, could stage an install he owns that points at
+// Alice's schema ... and the data layer reads the schema off the install row,
+// so every read and write through it lands in her tables.
+//
+// It was not a race. RegisterBuild provisions the schema and staging is a
+// separate act, so the window is however long a person takes to promote. The
+// name is publicly computable from a slug and an actor UUID, and
+// schema_name UNIQUE does not reach it, because that index only fires once the
+// victim has staged and the attacker got there first.
+//
+// The fix is invariant 11 in its plainest form: stop accepting as an argument
+// the fact you are deciding. StageInstall derives the name from the slug and
+// the owner it has already authorised, so there is nothing to supply and
+// nothing to check.
 
 // actsFor reports whether the credential is genuinely the given principal:
 // the pair agrees (acting_kind) and the principal is the one named.
@@ -51,8 +71,8 @@ func actsFor(ctx context.Context, db DB, by Credential, principal Owner) (bool, 
 // StageInstall records an install without turning it on. Any actor that may act
 // for the owning principal may do this, including an AI.
 func StageInstall(ctx context.Context, db DB, spec InstallSpec, by Credential) (uuid.UUID, error) {
-	if spec.SchemaName == "" {
-		return uuid.Nil, errors.New("install needs a schema name")
+	if spec.Slug == "" {
+		return uuid.Nil, errors.New("install needs a slug")
 	}
 	ok, err := actsFor(ctx, db, by, spec.Owner)
 	if err != nil {
@@ -62,6 +82,12 @@ func StageInstall(ctx context.Context, db DB, spec InstallSpec, by Credential) (
 		return uuid.Nil, fmt.Errorf("%w: staging an install writes into a principal's own scope", ErrDenied)
 	}
 
+	// Derived AFTER the ownership check and from the same values it authorised,
+	// so the schema on the row is the one this owner is entitled to whatever the
+	// caller believed. It is the same derivation RegisterBuild used to
+	// provision, which is what makes the install point at a schema that exists.
+	schemaName := manifest.SchemaName(spec.Slug, string(spec.Owner.Kind), spec.Owner.ID.String())
+
 	var id uuid.UUID
 	if err := db.QueryRow(ctx, `
 		INSERT INTO installs (build_id, slug, owner_kind, owner_id, installed_by_actor,
@@ -69,7 +95,7 @@ func StageInstall(ctx context.Context, db DB, spec InstallSpec, by Credential) (
 		VALUES ($1,$2,$3,$4,$5,$6,'disabled')
 		RETURNING id`,
 		spec.BuildID, spec.Slug, string(spec.Owner.Kind), spec.Owner.ID,
-		by.ActorID, spec.SchemaName).Scan(&id); err != nil {
+		by.ActorID, schemaName).Scan(&id); err != nil {
 		return uuid.Nil, fmt.Errorf("stage install: %w", err)
 	}
 	return id, nil
@@ -138,15 +164,22 @@ func ActivateInstall(ctx context.Context, db DB, installID uuid.UUID, by Credent
 		return fmt.Errorf("look up activating actor: %w", err)
 	}
 
-	var owner Owner
-	var ownerKind string
-	err = db.QueryRow(ctx,
-		"SELECT owner_kind, owner_id FROM installs WHERE id = $1", installID).Scan(&ownerKind, &owner.ID)
+	var (
+		owner        Owner
+		ownerKind    string
+		installState string
+		buildStatus  string
+	)
+	err = db.QueryRow(ctx, `
+		SELECT i.owner_kind, i.owner_id, i.state, b.status
+		  FROM installs i
+		  JOIN app_builds b ON b.id = i.build_id
+		 WHERE i.id = $1`, installID).Scan(&ownerKind, &owner.ID, &installState, &buildStatus)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return pgx.ErrNoRows
 	}
 	if err != nil {
-		return fmt.Errorf("look up install owner: %w", err)
+		return fmt.Errorf("look up install: %w", err)
 	}
 	owner.Kind = PrincipalKind(ownerKind)
 
@@ -162,18 +195,13 @@ func ActivateInstall(ctx context.Context, db DB, installID uuid.UUID, by Credent
 		return err
 	}
 
+	// activatedBy and authority are the two routes' evidence, and exactly one of
+	// them is non-NULL on the row afterwards.
+	var activatedBy, authority any
+
 	if kind == "human" && isOwner {
-		tag, upErr := db.Exec(ctx, `
-			UPDATE installs
-			   SET state = 'active', activated_by_actor = $2, activation_authority_id = NULL
-			 WHERE id = $1`, installID, by.ActorID)
-		if upErr != nil {
-			return fmt.Errorf("activate install: %w", upErr)
-		}
-		if tag.RowsAffected() == 0 {
-			return pgx.ErrNoRows
-		}
-		return nil
+		activatedBy = by.ActorID
+		return activate(ctx, db, installID, installState, buildStatus, activatedBy, authority)
 	}
 
 	// Otherwise: a standing authority a human delegated on this specific
@@ -203,15 +231,61 @@ func ActivateInstall(ctx context.Context, db DB, installID uuid.UUID, by Credent
 		return fmt.Errorf("look up install authority: %w", err)
 	}
 
+	authority = authorityID
+	return activate(ctx, db, installID, installState, buildStatus, activatedBy, authority)
+}
+
+// activate is the second half of the promotion seam: what is being promoted.
+//
+// The authority logic above decides WHO may promote, and it was the only
+// question the seam ever asked. Nothing looked at what they were promoting
+// into, so a build with status='withdrawn' activated cleanly, and the install's
+// own state was never read, so 'uninstalling' could be pulled back to 'active'
+// mid-teardown. Chained with a re-registration that silently keeps a withdrawn
+// build withdrawn, that is a live install on a withdrawn build with a trust
+// tier nobody re-approved, and no error anywhere ... D25 defeated at the seam
+// built for it.
+//
+// builds_awaiting_promotion already filters on status='registered'. It is a
+// VIEW: it shows a human the right list and enforces nothing, which is the same
+// distinction as a comment versus a constraint.
+//
+// Deliberately called only AFTER authority is established. A caller with no
+// standing must not learn from the error message whether somebody else's build
+// was withdrawn.
+func activate(ctx context.Context, db DB, installID uuid.UUID,
+	installState, buildStatus string, activatedBy, authority any,
+) error {
+	if buildStatus != "registered" {
+		return fmt.Errorf("%w: the build behind install %s is %q; promotion is the decision about "+
+			"a build that is promotable at all (D25)", ErrDenied, installID, buildStatus)
+	}
+	if installState == "uninstalling" {
+		return fmt.Errorf("%w: install %s is uninstalling; activating it would pull a teardown "+
+			"back to live", ErrDenied, installID)
+	}
+
+	// The same two conditions again, in the UPDATE. Not belt and braces: the
+	// reads above happened at some earlier instant, and a withdrawal committing
+	// in between would otherwise be activated straight over.
 	tag, err := db.Exec(ctx, `
-		UPDATE installs
-		   SET state = 'active', activated_by_actor = NULL, activation_authority_id = $2
-		 WHERE id = $1`, installID, authorityID)
+		UPDATE installs i
+		   SET state = 'active', activated_by_actor = $2, activation_authority_id = $3
+		 WHERE i.id = $1
+		   AND i.state <> 'uninstalling'
+		   AND EXISTS (SELECT 1 FROM app_builds b
+		                WHERE b.id = i.build_id AND b.status = 'registered')`,
+		installID, activatedBy, authority)
 	if err != nil {
-		return fmt.Errorf("activate install under a standing authority: %w", err)
+		return fmt.Errorf("activate install: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return pgx.ErrNoRows
+		// Not ErrNoRows. The install existed a moment ago and the checks above
+		// passed, so this is a concurrent withdrawal or teardown rather than a
+		// caller naming something that is not there, and the two want different
+		// responses from whoever is looking.
+		return fmt.Errorf("%w: install %s stopped being promotable while it was being promoted",
+			ErrDenied, installID)
 	}
 	return nil
 }

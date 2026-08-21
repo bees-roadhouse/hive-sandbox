@@ -400,20 +400,36 @@ func (t *tailer) deliver(dbNow time.Time, events []store.Event) {
 const dedupeFloor = time.Minute
 
 // prune keeps the dedupe set bounded.
-//
-// Measured in EVENT time from the cursor, not wall clock. Only the sweep
-// re-reads rows, only rows at or after cursor.At minus the overlap are in it,
-// and an id older than that can never come back ... whatever the wall clock
-// says about how far behind the tailer is.
 func (t *tailer) prune() {
-	retain := 2 * t.bus.cfg.Overlap
+	pruneSeen(t.seen, t.cursor.At, 2*t.bus.cfg.Overlap)
+}
+
+// pruneSeen drops ids that can no longer come back, and it is one function
+// because the mistake it prevents was made twice in this package at two layers.
+//
+// The map's values are DATABASE time. `now` must be database time too ... the
+// position the reader has reached in the log, not the host's wall clock. The
+// tailer passes its cursor; the SSE stream passes the newest event it has
+// delivered. Comparing database timestamps against time.Now() is comparing two
+// clocks that are allowed to disagree, and it fails in opposite directions
+// depending only on how far behind the reader is: caught up they agree and
+// nothing looks wrong, far behind the entries are evicted early and every row
+// the overlap re-reads arrives a second time.
+//
+// A zero `now` ... a reader that has established no position yet ... needs no
+// special case, and this says so rather than carrying a guard for it. The
+// cutoff would land a retain window before year 1, which no database timestamp
+// precedes, so nothing is dropped. That branch was written first; a mutation
+// run showed the test covering it could not fail, because there is no input
+// that distinguishes having it from not.
+func pruneSeen(seen map[int64]time.Time, now time.Time, retain time.Duration) {
 	if retain < dedupeFloor {
 		retain = dedupeFloor
 	}
-	cutoff := t.cursor.At.Add(-retain)
-	for id, at := range t.seen {
+	cutoff := now.Add(-retain)
+	for id, at := range seen {
 		if at.Before(cutoff) {
-			delete(t.seen, id)
+			delete(seen, id)
 		}
 	}
 }

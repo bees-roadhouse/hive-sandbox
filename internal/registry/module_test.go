@@ -60,10 +60,13 @@ func TestPrepareAgainstTheRealReferenceGuest(t *testing.T) {
 		},
 		Capabilities: []string{"log", "storage"},
 	}
-	p, err := registry.Prepare(m, hash, exports)
+	p, err := registry.Prepare(m, exports)
 	if err != nil {
 		t.Fatalf("Prepare against the real guest: %v", err)
 	}
+	// The hash on the Prepared came from the evidence rather than from a
+	// second parameter, which is the whole of Augie's finding 4: Prepare used
+	// to take both and had no way to tell that they belonged together.
 	if p.ModuleHash != hash {
 		t.Errorf("module hash = %q, want %q", p.ModuleHash, hash)
 	}
@@ -87,7 +90,7 @@ func TestPrepareCatchesADriftedManifest(t *testing.T) {
 		Kind: manifest.KindApp, Name: "hello", Version: 1,
 		Functions: []manifest.Function{{Name: "hello"}, {Name: "renamed_last_week"}},
 	}
-	if _, err := registry.Prepare(m, hash, exports); !errors.Is(err, registry.ErrMissingExport) {
+	if _, err := registry.Prepare(m, exports); !errors.Is(err, registry.ErrMissingExport) {
 		t.Fatalf("err = %v, want ErrMissingExport", err)
 	}
 }
@@ -123,15 +126,7 @@ func TestReferenceGuestIsAReactor(t *testing.T) {
 		t.Fatalf("ModuleExports: %v", err)
 	}
 
-	var hasInit, hasStart bool
-	for _, e := range exports {
-		switch e {
-		case "_initialize":
-			hasInit = true
-		case "_start":
-			hasStart = true
-		}
-	}
+	hasInit, hasStart := exports.Has("_initialize"), exports.Has("_start")
 	if !hasInit {
 		t.Error("the reference guest exports no _initialize; it is not a reactor")
 	}

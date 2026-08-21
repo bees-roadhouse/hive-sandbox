@@ -283,12 +283,11 @@ func (a *AppData) Insert(ctx context.Context, req wasmhost.Request) (wasmhost.Re
 			return fmt.Errorf("insert entity: %w", err)
 		}
 
-		if _, err := tx.Exec(ctx, fmt.Sprintf(`
-			INSERT INTO %s (id, owner_kind, owner_id, author_actor, doc, trust, tainted_by, created_at, updated_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)`, table(info.Schema, d.Collection)),
-			id, string(owner.Kind), owner.ID, req.Caller.ActorID, doc,
-			string(level), nullable(req.TaintedBy), created); err != nil {
-			return fmt.Errorf("insert document: %w", err)
+		if _, docErr := tx.Exec(ctx, fmt.Sprintf(`
+			INSERT INTO %s (id, doc, trust, tainted_by, created_at, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$5)`, table(info.Schema, d.Collection)),
+			id, doc, string(level), nullable(req.TaintedBy), created); docErr != nil {
+			return fmt.Errorf("insert document: %w", docErr)
 		}
 
 		if err := a.emit(ctx, tx, req, info, d.Collection, id, owner, level, "created"); err != nil {
@@ -533,11 +532,10 @@ func (a *AppData) Delete(ctx context.Context, req wasmhost.Request) (wasmhost.Re
 
 // Query lists the documents in a collection this caller may see.
 //
-// The filter is access_decision() and nothing else. There is no pre-filter on
-// the document table's own owner columns, even though they exist and would be
-// cheaper: those are denormalised copies for the app's own indexing, and
-// treating them as authoritative would be a second policy that eventually
-// disagrees with the first.
+// The filter is access_decision() and nothing else. The document table carries
+// no owner columns to be tempted by ... ownership lives on the entities row
+// this joins to, so there is no cheaper copy for a later query to filter on by
+// mistake.
 func (a *AppData) Query(ctx context.Context, req wasmhost.Request) (wasmhost.Response, error) {
 	info, declared, err := resolveInstall(ctx, a.store.Pool(), req.Caller.InstallID)
 	if err != nil {

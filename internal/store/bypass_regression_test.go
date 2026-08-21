@@ -778,8 +778,11 @@ func stagedBuild(t *testing.T, w *world, slug string, owner store.Owner, by stor
 		t.Fatalf("register build: %v", err)
 	}
 
+	// No SchemaName: StageInstall derives it, after the ownership check and
+	// from the values it authorised. A fixture that supplied one was how the
+	// cross-principal capture was reachable in the first place.
 	installID, err := store.StageInstall(w.ctx, w.s.Pool(), store.InstallSpec{
-		BuildID: buildID, Slug: slug, Owner: owner, SchemaName: "app_" + slug + "_" + sum[:8],
+		BuildID: buildID, Slug: slug, Owner: owner,
 	}, by)
 	if err != nil {
 		t.Fatalf("stage: %v", err)

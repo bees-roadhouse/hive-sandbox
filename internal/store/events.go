@@ -239,23 +239,54 @@ func AppendEvents(ctx context.Context, db DB, events ...*Event) error {
 	return nil
 }
 
-// Tail reads the host's view of the log: everything at or after `since`, in
-// stream order, with no visibility filter.
+// Tail reads forward from a cursor: the host's view of the log, unfiltered.
 //
-// `since` is what prunes partitions, and the caller is responsible for making
-// it an OVERLAP WINDOW rather than a watermark: ids are assigned before commit,
-// so a naive "everything after the last thing I saw" permanently skips a row
-// assigned early and committed late. Re-read the window every poll and dedupe
-// by id.
-func Tail(ctx context.Context, db DB, since time.Time, limit int) ([]Event, error) {
+// Strictly after the cursor, so a full batch always makes progress. An earlier
+// version took a bare timestamp derived from the newest row DELIVERED, which
+// meant a burst larger than one batch produced a query that returned the same
+// oldest rows forever: every row already seen, nothing fresh, the timestamp
+// never moving, the batch always full. Two round trips per iteration, delivering
+// nothing, until the process was restarted.
+//
+// The cursor's timestamp is also the lower bound, which is what prunes
+// partitions. Rows that commit late with a position BELOW the cursor are not
+// this function's job; see TailWindow.
+func Tail(ctx context.Context, db DB, after Cursor, limit int) ([]Event, error) {
 	rows, err := db.Query(ctx,
 		`SELECT `+eventColumns+`
 		   FROM events
 		  WHERE created_at >= $1
+		    AND (created_at, id) > ($1, $2)
 		  ORDER BY created_at, id
-		  LIMIT $2`, since, limit)
+		  LIMIT $3`, after.At, after.ID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("tail events: %w", err)
+	}
+	return scanEvents(rows)
+}
+
+// TailWindow re-reads the recent past: everything from `from` up to and
+// including the cursor.
+//
+// This is where the id-gap rule lives. bigserial ids are assigned BEFORE commit,
+// so a transaction that takes its id early and commits late becomes visible
+// after rows with higher positions have already been read ... and Tail, which
+// only ever looks forward, will never return it. Sweeping the window behind the
+// cursor and deduping by id is what catches it.
+//
+// A late commit is recent by construction, because created_at is clock_timestamp
+// at insert and the row is visible within its own transaction's lifetime. So the
+// window only has to be as wide as the longest transaction that writes events.
+func TailWindow(ctx context.Context, db DB, from time.Time, to Cursor, limit int) ([]Event, error) {
+	rows, err := db.Query(ctx,
+		`SELECT `+eventColumns+`
+		   FROM events
+		  WHERE created_at >= $1
+		    AND (created_at, id) <= ($2, $3)
+		  ORDER BY created_at, id
+		  LIMIT $4`, from, to.At, to.ID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("sweep events: %w", err)
 	}
 	return scanEvents(rows)
 }

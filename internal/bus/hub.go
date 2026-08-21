@@ -67,13 +67,20 @@ func (h *hub) subscribe(buffer int) *Subscription {
 // broadcast never blocks. A subscriber whose buffer is full is dropped rather
 // than allowed to stall the tail loop, because one stuck client must not become
 // everyone's latency.
+//
+// Every subscriber gets its own slice header over shared, immutable events. The
+// events themselves are never mutated after the tailer reads them, but a shared
+// slice invites an append by a subscriber that would be visible to the others,
+// and that is a data race waiting for its first caller.
 func (h *hub) broadcast(events []store.Event) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	for id, s := range h.subs {
+		batch := make([]store.Event, len(events))
+		copy(batch, events)
 		select {
-		case s.events <- events:
+		case s.events <- batch:
 		default:
 			delete(h.subs, id)
 			s.markDropped()

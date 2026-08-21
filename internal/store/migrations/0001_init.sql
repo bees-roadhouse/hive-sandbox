@@ -1805,37 +1805,19 @@ $fn$;
 -- exactly the shape that erodes.
 -- ---------------------------------------------------------------------------
 
-CREATE FUNCTION event_row_reason(
-    p_subject_kind   text,
-    p_subject_id     uuid,
-    p_subject_name   text,
-    p_owner_kind     text,
-    p_owner_id       uuid,
-    p_principal_kind text,
-    p_principal_id   uuid,
-    p_actor_id       uuid,
-    p_now            timestamptz
-) RETURNS text
-LANGUAGE plpgsql STABLE PARALLEL SAFE AS $fn$
-BEGIN
-    IF p_subject_kind IS NOT NULL AND p_subject_id IS NOT NULL THEN
-        RETURN access_reason(p_subject_kind, p_subject_id, p_subject_name,
-                             p_principal_kind, p_principal_id, p_actor_id, 'read', p_now);
-    END IF;
-    IF acting_kind(p_actor_id, p_principal_kind, p_principal_id) IS NULL THEN
-        RETURN NULL;
-    END IF;
-    IF p_owner_kind = p_principal_kind AND p_owner_id = p_principal_id THEN
-        RETURN 'owner';
-    END IF;
-    RETURN NULL;
-END;
-$fn$;
-
-COMMENT ON FUNCTION event_row_reason IS
-'Internal to visible_events and visible_event_ids. Do not call directly: the
-owner parameters are only safe because those two read them off the row being
-filtered in the same query.';
+-- Event visibility is inlined into the two functions below rather than living
+-- in a helper.
+--
+-- The helper took the event's owner columns as parameters, and its only guard
+-- was a COMMENT saying not to call it directly. That comment was an accurate
+-- description of invariant 11's failure mode written directly above an instance
+-- of it: an ordinary callable function, and supplying your own principal as the
+-- owner returned 'owner' for any event with no subject ... run state changes,
+-- daemon lifecycle notes, exactly the category with no grant to check instead.
+--
+-- Duplicating three lines of CASE in two callers is the smaller cost. Neither
+-- copy is reachable except through a set-returning function that reads the row
+-- itself, so there is no signature left for a caller to pass an owner through.
 
 -- Replay: everything after the cursor this credential may see, right now.
 --
@@ -1856,9 +1838,17 @@ LANGUAGE sql STABLE AS $fn$
       FROM events e
      WHERE e.created_at >= p_since
        AND (e.created_at, e.id) > (p_after_at, p_after_id)
-       AND event_row_reason(e.subject_kind, e.subject_id, e.subject_name,
-                            e.owner_kind, e.owner_id,
-                            p_principal_kind, p_principal_id, p_actor_id, now()) IS NOT NULL
+       AND CASE
+             WHEN e.subject_kind IS NULL OR e.subject_id IS NULL
+               -- No subject means nothing to grant against, so ownership is the
+               -- only branch. Read off the row, never from a parameter.
+               THEN CASE WHEN e.owner_kind = p_principal_kind
+                          AND e.owner_id = p_principal_id
+                          AND acting_kind(p_actor_id, p_principal_kind, p_principal_id) IS NOT NULL
+                         THEN 'owner' END
+             ELSE access_reason(e.subject_kind, e.subject_id, e.subject_name,
+                                p_principal_kind, p_principal_id, p_actor_id, 'read', now())
+           END IS NOT NULL
      ORDER BY e.created_at, e.id
      LIMIT p_limit;
 $fn$;
@@ -1876,7 +1866,13 @@ LANGUAGE sql STABLE AS $fn$
     SELECT e.id
       FROM unnest(p_ids, p_created_ats) AS c(id, created_at)
       JOIN events e ON e.created_at = c.created_at AND e.id = c.id
-     WHERE event_row_reason(e.subject_kind, e.subject_id, e.subject_name,
-                            e.owner_kind, e.owner_id,
-                            p_principal_kind, p_principal_id, p_actor_id, now()) IS NOT NULL;
+     WHERE CASE
+             WHEN e.subject_kind IS NULL OR e.subject_id IS NULL
+               THEN CASE WHEN e.owner_kind = p_principal_kind
+                          AND e.owner_id = p_principal_id
+                          AND acting_kind(p_actor_id, p_principal_kind, p_principal_id) IS NOT NULL
+                         THEN 'owner' END
+             ELSE access_reason(e.subject_kind, e.subject_id, e.subject_name,
+                                p_principal_kind, p_principal_id, p_actor_id, 'read', now())
+           END IS NOT NULL;
 $fn$;

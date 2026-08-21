@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,6 +105,15 @@ func (h *harness) append(kind string, owner store.Owner) *store.Event {
 	return e
 }
 
+// notify rings the wakeup bell on a channel of this test's own. AppendEvents
+// publishes to the platform channel; this is what makes a private one carry.
+func (h *harness) notify(channel string) {
+	h.t.Helper()
+	if _, err := h.pool.Exec(h.ctx, "SELECT pg_notify($1, '')", channel); err != nil {
+		h.t.Fatalf("notify %s: %v", channel, err)
+	}
+}
+
 // collect drains a subscription until it has n events or the deadline passes.
 func collect(t *testing.T, sub *bus.Subscription, n int, within time.Duration) []store.Event {
 	t.Helper()
@@ -136,11 +146,17 @@ func TestCorrectWithEveryNotificationDropped(t *testing.T) {
 		Channel:      "a_channel_nobody_notifies",
 		PollInterval: 150 * time.Millisecond,
 		Overlap:      2 * time.Second,
+		// Smaller than the burst below, deliberately. With the default of 500
+		// this test could never enter the inner catch-up loop, so it could not
+		// see a tailer that failed to make progress through a backlog ... which
+		// is exactly the bug it did not see. A batch limit under the event count
+		// costs nothing and exercises the path.
+		BatchLimit: 8,
 	})
-	sub := b.Subscribe(64)
+	sub := b.Subscribe(256)
 	defer sub.Close()
 
-	const n = 12
+	const n = 30
 	want := make(map[int64]bool, n)
 	for i := range n {
 		want[h.append(fmt.Sprintf("test.event.%d", i), h.owner).ID] = true
@@ -165,6 +181,72 @@ func TestCorrectWithEveryNotificationDropped(t *testing.T) {
 		t.Fatal("the backstop poll never ran")
 	}
 	t.Logf("delivered %d events on %d polls and %d notifications", len(got), polls, notifications)
+}
+
+// TestBurstLargerThanOneBatchIsFullyDelivered.
+//
+// A burst bigger than BatchLimit inside one Overlap window used to wedge the
+// tailer permanently: the query returned the oldest batch, every row was already
+// in the dedupe set, nothing was fresh, the cursor never moved, the batch was
+// still full, and the loop ran the identical query against Postgres forever
+// delivering nothing. 49 of 200 arrived and the process never recovered.
+//
+// The defaults hid it. AppendEvents is variadic, so one workflow fan-out is a
+// plausible source, and this test uses a batch limit under the burst size for
+// the same reason.
+func TestBurstLargerThanOneBatchIsFullyDelivered(t *testing.T) {
+	h := newHarness(t)
+
+	b := h.run(bus.Config{
+		Channel:      "a_channel_nobody_notifies",
+		PollInterval: 100 * time.Millisecond,
+		Overlap:      5 * time.Second,
+		BatchLimit:   10,
+	})
+	sub := b.Subscribe(1024)
+	defer sub.Close()
+
+	// One call, so every row lands inside one overlap window ... which is the
+	// condition, not an incidental detail.
+	const n = 120
+	events := make([]*store.Event, n)
+	for i := range events {
+		events[i] = &store.Event{
+			Kind: fmt.Sprintf("burst.%d", i), Owner: h.owner, AuthorActor: h.alice,
+			PrincipalKind: store.PrincipalUser, PrincipalID: h.alice,
+		}
+	}
+	if err := store.AppendEvents(h.ctx, h.pool, events...); err != nil {
+		t.Fatalf("append burst: %v", err)
+	}
+
+	want := make(map[int64]bool, n)
+	for _, e := range events {
+		want[e.ID] = true
+	}
+
+	got := collect(t, sub, n, 30*time.Second)
+	for _, e := range got {
+		delete(want, e.ID)
+	}
+	if len(want) != 0 {
+		t.Fatalf("%d of %d events never arrived; the tailer stopped making progress "+
+			"through a burst larger than one batch", len(want), n)
+	}
+
+	// And it is still alive afterwards. The wedge's signature was that nothing
+	// delivered EVER again, so a burst that arrives followed by silence is the
+	// failure this is really about.
+	after := h.append("after.the.burst", h.owner)
+	tail := collect(t, sub, 1, 20*time.Second)
+	if len(tail) != 1 || tail[0].ID != after.ID {
+		t.Fatalf("nothing was delivered after the burst; the tailer is wedged")
+	}
+
+	// polls == 1 was the tell: the tailer never returned to the outer select.
+	if _, polls := b.Stats(); polls == 0 {
+		t.Fatal("the tailer never returned to its poll loop")
+	}
 }
 
 // TestLateCommitWithALowerIDIsNotSkipped is the bug the overlap window exists
@@ -286,7 +368,18 @@ func TestNotificationDeliversFasterThanThePoll(t *testing.T) {
 
 	// A poll interval far longer than the assertion window, so only a
 	// notification can deliver in time.
-	b := h.run(bus.Config{PollInterval: 30 * time.Second, Overlap: 2 * time.Second})
+	//
+	// Its own channel, because a NOTIFY channel is database-wide rather than
+	// schema-wide: on the shared test database the warmup below breaks on
+	// n > 0, and any other package appending an event satisfies that for a
+	// reason unrelated to this test. Publishing to the same channel keeps the
+	// notification path real while making the count mean what it says.
+	channel := "bus_test_" + strings.ReplaceAll(t.Name(), "/", "_")
+	b := h.run(bus.Config{
+		Channel:      channel,
+		PollInterval: 30 * time.Second,
+		Overlap:      2 * time.Second,
+	})
 	sub := b.Subscribe(256)
 	defer sub.Close()
 
@@ -303,12 +396,14 @@ func TestNotificationDeliversFasterThanThePoll(t *testing.T) {
 			t.Fatal("the listener never subscribed")
 		}
 		h.append("warmup", h.owner)
+		h.notify(channel)
 		time.Sleep(100 * time.Millisecond)
 	}
 	before, _ := b.Stats()
 
 	start := time.Now()
 	want := h.append("journal.entry.created", h.owner)
+	h.notify(channel)
 
 	var elapsed time.Duration
 	found := false

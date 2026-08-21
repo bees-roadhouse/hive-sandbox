@@ -133,6 +133,8 @@ func (b *Bus) Settled() time.Time {
 	if micros == 0 {
 		return time.Time{}
 	}
+	// A zero time round-trips through UnixMicro as a zero time rather than as
+	// 0, so this covers the empty-log case as well as the never-set one.
 	return time.UnixMicro(micros).UTC()
 }
 
@@ -219,9 +221,9 @@ func (b *Bus) tailLoop(ctx context.Context) error {
 	}
 
 	t := &tailer{
-		bus:      b,
-		lastSeen: head.At,
-		seen:     map[int64]time.Time{},
+		bus:    b,
+		cursor: head,
+		seen:   map[int64]time.Time{},
 	}
 	if head.ID != 0 {
 		t.seen[head.ID] = head.At
@@ -255,63 +257,136 @@ func (b *Bus) tailLoop(ctx context.Context) error {
 type tailer struct {
 	bus *Bus
 
-	// lastSeen is the newest created_at delivered so far. The next query reads
-	// from lastSeen MINUS the overlap, never from lastSeen itself.
-	lastSeen time.Time
+	// cursor is the highest (created_at, id) this tailer has READ, which is not
+	// the same as the highest it has delivered.
+	//
+	// A burst larger than one batch used to wedge live delivery permanently: the
+	// query rewound to `newest delivered minus the overlap` and returned the
+	// OLDEST rows in that window, so once those were all deduped nothing was
+	// fresh, the position never moved, the batch was still full, and the loop
+	// ran the identical query against Postgres forever delivering nothing.
+	//
+	// What fixes that is store.Tail being a strict forward cursor rather than a
+	// rewind, which is measured: reverting only the query wedges the burst test,
+	// reverting only this advance-on-read does not. Advancing on rows READ is
+	// kept because it is what makes the cursor mean "the log has been read to
+	// here" rather than "something interesting was found here", and a position
+	// that skips over duplicates is a position that lies about progress.
+	//
+	// Catching late commits is a separate bounded sweep, below.
+	cursor store.Cursor
 
 	// seen is what makes re-reading the window free of duplicates. Keyed by id
-	// because that is the only thing guaranteed unique, and pruned by time.
+	// because that is the only thing guaranteed unique, and pruned by EVENT time
+	// relative to the cursor rather than by wall clock.
+	//
+	// The two used to disagree, and the disagreement had a second face: caught
+	// up they agreed and a full duplicate batch livelocked, but far behind, wall
+	// clock pruning had already dropped ids the next query would re-read, so
+	// nothing looked duplicate and the loop escaped by re-delivering the overlap
+	// window on every batch. One defect, livelock or duplicate delivery
+	// depending only on how old the backlog was, and neither errored.
 	seen map[int64]time.Time
 }
+
+// sweepFactor bounds the late-commit sweep relative to a normal batch. The
+// window is only as wide as the longest event-writing transaction, so it should
+// hold far fewer rows than a batch; the multiplier is headroom, and filling it
+// is reported rather than silently truncated.
+const sweepFactor = 4
 
 func (t *tailer) cycle(ctx context.Context) error {
 	cfg := t.bus.cfg
 
+	// One clock read per cycle rather than per iteration. Under a backlog the
+	// inner loop runs many times, and this was half the round trips.
+	dbNow, err := store.Now(ctx, t.bus.pool)
+	if err != nil {
+		return err
+	}
+
+	// 1. Drain forward. Strictly after the cursor, so every full batch moves.
 	for {
-		dbNow, err := store.Now(ctx, t.bus.pool)
+		events, err := store.Tail(ctx, t.bus.pool, t.cursor, cfg.BatchLimit)
 		if err != nil {
 			return err
 		}
+		t.deliver(dbNow, events)
 
-		since := t.lastSeen.Add(-cfg.Overlap)
-		events, err := store.Tail(ctx, t.bus.pool, since, cfg.BatchLimit)
-		if err != nil {
-			return err
-		}
-
-		fresh := make([]store.Event, 0, len(events))
-		for _, e := range events {
-			if _, dup := t.seen[e.ID]; dup {
-				continue
-			}
-			t.seen[e.ID] = e.CreatedAt
-			fresh = append(fresh, e)
-			if e.CreatedAt.After(t.lastSeen) {
-				t.lastSeen = e.CreatedAt
-			}
-		}
-
-		// Anything older than the overlap can no longer gain rows behind it,
-		// so it is safe for a subscriber to checkpoint at.
-		settled := dbNow.Add(-cfg.Overlap)
-		if settled.After(t.lastSeen) {
-			settled = t.lastSeen
-		}
-		t.bus.settledMicros.Store(settled.UnixMicro())
-
-		if len(fresh) > 0 {
-			t.bus.hub.broadcast(fresh)
-		}
-		t.prune(dbNow)
-
-		// A full batch means there is more behind it. Keep reading rather than
-		// waiting for the next tick, or catch-up after an outage would crawl.
 		if len(events) < cfg.BatchLimit {
-			return nil
+			break
 		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+	}
+
+	// 2. Sweep the window behind the cursor for anything that committed late.
+	//
+	// bigserial ids are assigned before commit, so a transaction that took its
+	// id early and committed just now sits BELOW the cursor and step 1 will
+	// never return it. This is the only thing that catches it, and dropping it
+	// would reintroduce the bug the overlap exists for.
+	if !t.cursor.Zero() {
+		from := t.cursor.At.Add(-cfg.Overlap)
+		limit := cfg.BatchLimit * sweepFactor
+		late, err := store.TailWindow(ctx, t.bus.pool, from, t.cursor, limit)
+		if err != nil {
+			return err
+		}
+		if len(late) == limit {
+			// Truncating this sweep silently is how a late commit gets lost,
+			// which is the exact failure mode the sweep exists to prevent.
+			cfg.Logger.Warn("bus: late-commit sweep filled its limit; overlap window may be too wide",
+				"limit", limit, "overlap", cfg.Overlap)
+		}
+		t.deliver(dbNow, late)
+	}
+
+	t.updateSettled(dbNow)
+	t.prune()
+	return nil
+}
+
+// updateSettled publishes the watermark a subscriber may safely resume from.
+//
+// Clamped to the cursor, because a watermark ahead of what has actually been
+// read would invite a client to checkpoint past events nobody has delivered.
+// While the log is empty the cursor is the zero time and so is the watermark,
+// which Settled reports as "not yet known" rather than as the epoch.
+func (t *tailer) updateSettled(dbNow time.Time) {
+	settled := dbNow.Add(-t.bus.cfg.Overlap)
+	if settled.After(t.cursor.At) {
+		settled = t.cursor.At
+	}
+	t.bus.settledMicros.Store(settled.UnixMicro())
+}
+
+// deliver advances the cursor over everything read, publishes the watermark,
+// then broadcasts whatever was not already delivered.
+//
+// The watermark moves BEFORE the broadcast on purpose. A subscriber that has
+// just been handed an event must not be able to read a watermark that predates
+// its own arrival ... otherwise it checkpoints behind where it actually is,
+// which is only ever seen as a duplicate after a reconnect and is therefore
+// exactly the kind of thing nobody notices.
+func (t *tailer) deliver(dbNow time.Time, events []store.Event) {
+	fresh := make([]store.Event, 0, len(events))
+	for _, e := range events {
+		// The cursor moves for every row READ. A duplicate still proves the
+		// log reached this position.
+		if t.cursor.Before(e.Cursor()) {
+			t.cursor = e.Cursor()
+		}
+		if _, dup := t.seen[e.ID]; dup {
+			continue
+		}
+		t.seen[e.ID] = e.CreatedAt
+		fresh = append(fresh, e)
+	}
+	t.updateSettled(dbNow)
+	if len(fresh) > 0 {
+		t.bus.hub.broadcast(fresh)
 	}
 }
 
@@ -325,12 +400,17 @@ func (t *tailer) cycle(ctx context.Context) error {
 const dedupeFloor = time.Minute
 
 // prune keeps the dedupe set bounded.
-func (t *tailer) prune(now time.Time) {
+//
+// Measured in EVENT time from the cursor, not wall clock. Only the sweep
+// re-reads rows, only rows at or after cursor.At minus the overlap are in it,
+// and an id older than that can never come back ... whatever the wall clock
+// says about how far behind the tailer is.
+func (t *tailer) prune() {
 	retain := 2 * t.bus.cfg.Overlap
 	if retain < dedupeFloor {
 		retain = dedupeFloor
 	}
-	cutoff := now.Add(-retain)
+	cutoff := t.cursor.At.Add(-retain)
 	for id, at := range t.seen {
 		if at.Before(cutoff) {
 			delete(t.seen, id)

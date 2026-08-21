@@ -1,0 +1,344 @@
+package store_test
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/bees-roadhouse/hive-sandbox/internal/manifest"
+	"github.com/bees-roadhouse/hive-sandbox/internal/store"
+	"github.com/bees-roadhouse/hive-sandbox/internal/testdb"
+)
+
+// An app schema is a real, database-level schema, so it lands OUTSIDE the
+// private schema testdb puts on the search path. That isolation is by search
+// path, and CREATE SCHEMA app_x ignores a search path entirely.
+//
+// So each test gets a unique app name and drops its own schema. Without that,
+// two parallel tests provisioning `app_journal` would fight, and the loser
+// would fail in a way that looks like a bug in the applier.
+func uniqueApp(t *testing.T) string {
+	t.Helper()
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("read random: %v", err)
+	}
+	return "t_" + hex.EncodeToString(b[:])
+}
+
+func planFor(t *testing.T, app string, collections ...manifest.Collection) manifest.SchemaPlan {
+	t.Helper()
+	m := &manifest.Manifest{
+		Kind: manifest.KindApp, Name: app, Version: 1,
+		Storage:   manifest.Storage{Collections: collections},
+		Functions: []manifest.Function{{Name: "noop"}},
+	}
+	if err := m.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	plan, err := m.SchemaPlan()
+	if err != nil {
+		t.Fatalf("SchemaPlan: %v", err)
+	}
+	return plan
+}
+
+// apply runs a plan in its own transaction and registers cleanup.
+func apply(t *testing.T, pool *pgxpool.Pool, plan manifest.SchemaPlan) error {
+	t.Helper()
+	ctx := t.Context()
+
+	t.Cleanup(func() {
+		// Fresh context and its own transaction: the test's is usually done.
+		dropCtx := context.Background()
+		tx, err := pool.Begin(dropCtx)
+		if err != nil {
+			t.Errorf("begin drop: %v", err)
+			return
+		}
+		defer func() { _ = tx.Rollback(dropCtx) }()
+		if err := store.DropSchemaPlan(dropCtx, tx, plan); err != nil {
+			t.Errorf("drop %s: %v", plan.Schema, err)
+			return
+		}
+		if err := tx.Commit(dropCtx); err != nil {
+			t.Errorf("commit drop: %v", err)
+		}
+	})
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := store.ApplySchemaPlan(ctx, tx, plan); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func TestApplySchemaPlanProvisionsCollections(t *testing.T) {
+	pool := testdb.Pool(t)
+	app := uniqueApp(t)
+
+	plan := planFor(t, app,
+		manifest.Collection{Name: "entries", Indexes: []string{
+			"btree(entry_date)", "gin(tags)", "fts(body)",
+		}},
+		manifest.Collection{Name: "drafts", CRUD: true},
+	)
+	if err := apply(t, pool, plan); err != nil {
+		t.Fatalf("ApplySchemaPlan: %v", err)
+	}
+
+	for _, table := range []string{"entries", "drafts"} {
+		var exists bool
+		if err := pool.QueryRow(t.Context(), `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.tables
+				WHERE table_schema = $1 AND table_name = $2)`,
+			plan.Schema, table,
+		).Scan(&exists); err != nil {
+			t.Fatalf("check %s.%s: %v", plan.Schema, table, err)
+		}
+		if !exists {
+			t.Errorf("%s.%s was not created", plan.Schema, table)
+		}
+	}
+
+	// Owner columns from the first statement, because retrofitting ownership
+	// onto a grown schema is the expensive version (D1.2).
+	for _, col := range []string{"owner_kind", "owner_id", "author_actor", "trust", "tainted_by"} {
+		var exists bool
+		if err := pool.QueryRow(t.Context(), `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = $1 AND table_name = 'entries' AND column_name = $2)`,
+			plan.Schema, col,
+		).Scan(&exists); err != nil {
+			t.Fatalf("check column %s: %v", col, err)
+		}
+		if !exists {
+			t.Errorf("entries is missing %s", col)
+		}
+	}
+
+	// Three declared indexes plus the owner index the host adds unconditionally.
+	var indexes int
+	if err := pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM pg_indexes WHERE schemaname = $1 AND tablename = 'entries'`,
+		plan.Schema,
+	).Scan(&indexes); err != nil {
+		t.Fatalf("count indexes: %v", err)
+	}
+	// btree + gin + fts + owner + the primary key.
+	if indexes < 5 {
+		t.Errorf("entries has %d indexes, want at least 5", indexes)
+	}
+}
+
+// Re-applying is how a manifest diff becomes a migration (D3.3), so it has to
+// be safe rather than merely tolerated.
+func TestApplySchemaPlanIsIdempotent(t *testing.T) {
+	pool := testdb.Pool(t)
+	plan := planFor(t, uniqueApp(t),
+		manifest.Collection{Name: "entries", Indexes: []string{"btree(entry_date)"}})
+
+	if err := apply(t, pool, plan); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	if err := apply(t, pool, plan); err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+}
+
+// A failed install leaves nothing behind, because provisioning runs in the
+// caller's transaction and never commits on its own.
+func TestApplySchemaPlanRollsBackWholly(t *testing.T) {
+	pool := testdb.Pool(t)
+	ctx := t.Context()
+	app := uniqueApp(t)
+	plan := planFor(t, app, manifest.Collection{Name: "entries"})
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := store.ApplySchemaPlan(ctx, tx, plan); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	var exists bool
+	if err := pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)`,
+		plan.Schema,
+	).Scan(&exists); err != nil {
+		t.Fatalf("check schema: %v", err)
+	}
+	if exists {
+		t.Errorf("%s survived a rolled-back transaction", plan.Schema)
+	}
+}
+
+// Uninstall is one statement, which is the point of per-app schemas (D3.2).
+func TestDropSchemaPlanRemovesEverything(t *testing.T) {
+	pool := testdb.Pool(t)
+	ctx := t.Context()
+	plan := planFor(t, uniqueApp(t), manifest.Collection{Name: "entries"})
+
+	if err := apply(t, pool, plan); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := store.DropSchemaPlan(ctx, tx, plan); err != nil {
+		t.Fatalf("drop: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	var exists bool
+	if err := pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)`,
+		plan.Schema,
+	).Scan(&exists); err != nil {
+		t.Fatalf("check schema: %v", err)
+	}
+	if exists {
+		t.Errorf("%s survived a drop", plan.Schema)
+	}
+}
+
+// A vector index is refused rather than silently skipped. A skipped index is a
+// query plan that quietly falls back to a sequential scan over someone's whole
+// memory, which is discovered as "search got slow" months later.
+func TestVectorIndexIsRefusedRatherThanSkipped(t *testing.T) {
+	pool := testdb.Pool(t)
+	ctx := t.Context()
+	plan := planFor(t, uniqueApp(t),
+		manifest.Collection{Name: "entries", Indexes: []string{"vector(embedding, 1536)"}})
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	err = store.ApplySchemaPlan(ctx, tx, plan)
+	if !errors.Is(err, store.ErrNotImplemented) {
+		t.Fatalf("err = %v, want ErrNotImplemented", err)
+	}
+	if !strings.Contains(err.Error(), "vector") {
+		t.Errorf("the error should name what is missing: %v", err)
+	}
+}
+
+// The check at the point of use, which exists because manifest.Validate having
+// already refused these is a claim about today's callers.
+func TestApplySchemaPlanRefusesUnsafeIdentifiers(t *testing.T) {
+	pool := testdb.Pool(t)
+	ctx := t.Context()
+
+	for _, plan := range []manifest.SchemaPlan{
+		{Schema: `app_x"; DROP SCHEMA public; --`},
+		{Schema: "app_x", Collections: []manifest.CollectionPlan{
+			{Name: `entries"; DROP SCHEMA public; --`}}},
+		{Schema: strings.Repeat("a", 64)},
+		{Schema: ""},
+	} {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		err = store.ApplySchemaPlan(ctx, tx, plan)
+		_ = tx.Rollback(ctx)
+
+		if !errors.Is(err, store.ErrUnsafeIdentifier) {
+			t.Errorf("plan %+v: err = %v, want ErrUnsafeIdentifier", plan.Schema, err)
+		}
+	}
+
+	// And the database is intact, which is the assertion that actually matters.
+	var publicExists bool
+	if err := pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = 'public')`,
+	).Scan(&publicExists); err != nil {
+		t.Fatalf("check public: %v", err)
+	}
+	if !publicExists {
+		t.Fatal("a rejected identifier still executed; public is gone")
+	}
+}
+
+// A document path with a quote in it cannot reach the index expression. Belt
+// and brace: ParseIndex refuses it first, and this is the second reason.
+func TestIndexExpressionCannotBeEscaped(t *testing.T) {
+	pool := testdb.Pool(t)
+	ctx := t.Context()
+
+	plan := manifest.SchemaPlan{
+		Schema: "app_" + uniqueApp(t),
+		Collections: []manifest.CollectionPlan{{
+			Name: "entries",
+			Indexes: []manifest.Index{{
+				Method: manifest.IndexBTree,
+				Path:   []string{`body'); DROP SCHEMA public; --`},
+			}},
+		}},
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := store.ApplySchemaPlan(ctx, tx, plan); !errors.Is(err, store.ErrUnsafeIdentifier) {
+		t.Fatalf("err = %v, want ErrUnsafeIdentifier", err)
+	}
+}
+
+// The applier runs in the caller's transaction, so it composes with the rest of
+// an install rather than committing behind it.
+func TestApplySchemaPlanComposesWithOtherWork(t *testing.T) {
+	pool := testdb.Pool(t)
+	ctx := t.Context()
+	plan := planFor(t, uniqueApp(t), manifest.Collection{Name: "entries"})
+
+	err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		if err := store.ApplySchemaPlan(ctx, tx, plan); err != nil {
+			return err
+		}
+		// Something else in the same unit of work fails.
+		return fmt.Errorf("install failed after provisioning")
+	})
+	if err == nil {
+		t.Fatal("expected the install to fail")
+	}
+
+	var exists bool
+	if err := pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)`,
+		plan.Schema,
+	).Scan(&exists); err != nil {
+		t.Fatalf("check schema: %v", err)
+	}
+	if exists {
+		t.Errorf("%s survived a failed install", plan.Schema)
+	}
+}

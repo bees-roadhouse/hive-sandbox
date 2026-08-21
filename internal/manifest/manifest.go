@@ -137,6 +137,7 @@ var (
 	ErrUnknownFunc  = errors.New("manifest: reference to an undeclared function")
 	ErrReservedName = errors.New("manifest: name collides with a generated one")
 	ErrRoute        = errors.New("manifest: invalid route")
+	ErrIndex        = errors.New("manifest: invalid index declaration")
 )
 
 // nameRE is deliberately narrow. These strings become schema names, tool names,
@@ -162,6 +163,13 @@ func (m *Manifest) Validate() error {
 	}
 	if !nameRE.MatchString(m.Name) {
 		errs = append(errs, fmt.Errorf("%w: %q must match %s", ErrName, m.Name, nameRE))
+	} else if len(m.Name) > maxAppName {
+		// Postgres TRUNCATES an over-long identifier rather than rejecting it,
+		// so two apps differing only past the limit would quietly share a
+		// schema. Caught here, where the fix is renaming an app, rather than at
+		// CREATE SCHEMA, where it does not look like an error at all.
+		errs = append(errs, fmt.Errorf("%w: %q is %d characters; %q needs %d or fewer",
+			ErrName, m.Name, len(m.Name), SchemaName(m.Name), maxAppName))
 	}
 	if m.Version < 1 {
 		errs = append(errs, fmt.Errorf("%w: %d", ErrVersion, m.Version))
@@ -207,6 +215,17 @@ func (m *Manifest) Validate() error {
 			errs = append(errs, fmt.Errorf("%w: collection %q", ErrDuplicate, c.Name))
 		}
 		collections[c.Name] = true
+
+		// Index declarations are parsed here rather than trusted, because they
+		// end up inside CREATE INDEX and a manifest is a file an AI writes.
+		// Validating at the DDL end would be too late: by then the dangerous
+		// value is indistinguishable from a legitimate one.
+		for _, decl := range c.Indexes {
+			if _, err := ParseIndex(decl); err != nil {
+				errs = append(errs, fmt.Errorf("collection %q: %w", c.Name, err))
+			}
+		}
+
 		if c.CRUD {
 			for _, op := range crudOps {
 				generated[c.Name+"."+op.tool] = true

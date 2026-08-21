@@ -3,6 +3,12 @@
 *.exe
 *.wasm
 
+# ...except the built first-party guests, which are checked in so `go test ./...`
+# works without a wasm toolchain. CI rebuilds them from source in the `guests`
+# job and runs the same tests against the fresh bytes, which is what keeps the
+# committed artifact honest.
+!internal/wasmhost/testdata/*.wasm
+
 # local dev state
 .env
 .env.local

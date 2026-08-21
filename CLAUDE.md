@@ -79,6 +79,7 @@ cmd/hive-sandbox/      the daemon entrypoint (role flags: --serve-api, --run-wor
 internal/store/        Postgres: migrations, the data layer, the grant predicate
 internal/bus/          events table + LISTEN/NOTIFY + SSE fan-out
 internal/wasmhost/     wazero runtime, compiled-module cache, instance LRU, the ABI
+guest/                 the SDK a WASM guest links against (own module, wasip1 only)
 internal/blob/         the driver seam: disk now, S3-compatible later
 internal/workflow/     defs, runs, steps, claim/lease/timer/wait
 internal/harness/      hosted agent runs (claude / codex / opencode)
@@ -91,6 +92,13 @@ test/                  integration tests, including Playwright-driven HTTP/SSE
 
 - Go 1.26, no CGo anywhere in the host. wazero is pure Go and that is the point.
 - Guests target **WASI preview1 only**. Never import wasip2 or component-model.
+  The host enforces this at link time in `checkModule`, so it is not a
+  convention you can drift away from. Guests build with `-scheduler=none`;
+  every flag in `scripts/guest-build.md` is load-bearing and measured.
+- Guest modules and the guest SDK are **separate Go modules** under `guest/` and
+  `apps/*/`. They only compile for `GOOS=wasip1`, so they are deliberately
+  invisible to `go build ./...`. Built `.wasm` files are checked in; CI rebuilds
+  them from source and reruns the tests against the fresh bytes.
 - Postgres via pgx v5. **Never `LISTEN` on a pooled connection** ... dedicated
   `pgx.Conn` per host via `jackc/pgxlisten`, reconnect 1-2s not the 1m default.
 - Claim work with `FOR UPDATE SKIP LOCKED` plus a lease expiry and a heartbeat.

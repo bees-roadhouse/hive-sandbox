@@ -109,3 +109,54 @@ jobs:
           name: playwright-report
           path: test/e2e/playwright-report/
           retention-days: 7
+
+  # The conformance canary. Two things it catches that `gate` cannot.
+  #
+  # First, the guest source and the committed .wasm drifting apart: the gate
+  # tests run against the checked-in artifact, so a change to apps/hello that
+  # nobody rebuilt would pass. This job rebuilds from source with the pinned
+  # toolchain and runs the same tests against the fresh bytes.
+  #
+  # Second, compiler-versus-interpreter divergence. That is a recurring wazero
+  # issue class, and every TestConformance* case runs under both engines, so a
+  # divergence surfaces here rather than in production. The gate covers that too;
+  # this job covers it against a guest built minutes ago.
+  guests:
+    runs-on: ubuntu-latest
+    env:
+      TINYGO_VERSION: "0.41.1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # tinygo shells out to binaryen's wasm-opt and does not ship it.
+      - name: install tinygo and binaryen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+          curl -fsSL -o /tmp/tinygo.deb \
+            "https://github.com/tinygo-org/tinygo/releases/download/v${TINYGO_VERSION}/tinygo_${TINYGO_VERSION}_amd64.deb"
+          sudo dpkg -i /tmp/tinygo.deb
+          tinygo version
+
+      - name: rebuild guests from source
+        run: ./scripts/build-guests.sh
+
+      - name: guest sources are gofmt clean
+        run: |
+          unformatted=$(gofmt -l guest apps)
+          if [ -n "$unformatted" ]; then
+            echo "unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: conformance under both engines
+        run: go test -race -run 'TestConformance|TestHostFunctionHonorsContext|TestTermination|TestUndeclaredCapability' -v ./internal/wasmhost/
+
+      - name: full host suite against the fresh guest
+        run: go test -race ./internal/wasmhost/

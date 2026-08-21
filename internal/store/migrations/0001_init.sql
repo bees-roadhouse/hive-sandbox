@@ -505,7 +505,13 @@ CREATE CONSTRAINT TRIGGER blobs_live_ref_check
 -- rather than a UI problem to solve later.
 CREATE TABLE app_builds (
     id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    slug          text NOT NULL,
+    -- Bounded, because a slug is not only a name. It is the first segment of
+    -- every event kind this app emits (`<slug>.<collection>.<verb>`), and
+    -- events.kind is constrained; an unbounded slug would let a manifest emit
+    -- a kind the events table refuses, so the app's writes would fail at the
+    -- point of use rather than at registration. Same alphabet as the kind, so
+    -- one cannot produce a value the other rejects.
+    slug          text NOT NULL CHECK (slug ~ '^[a-z0-9][a-z0-9-]{0,62}$'),
     version       text NOT NULL DEFAULT '',
     kind          text NOT NULL CHECK (kind IN ('app', 'tool')),
     impl          text NOT NULL DEFAULT 'wasm' CHECK (impl IN ('wasm', 'host')),
@@ -637,7 +643,9 @@ CREATE INDEX install_authorities_live_idx
 CREATE TABLE installs (
     id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     build_id           uuid NOT NULL REFERENCES app_builds (id),
-    slug               text NOT NULL,
+    -- Same alphabet as app_builds.slug, and for the same reason: this is the
+    -- one the data layer actually reads when it composes an event kind.
+    slug               text NOT NULL CHECK (slug ~ '^[a-z0-9][a-z0-9-]{0,62}$'),
 
     -- An install is owned by the scope it is installed into; the columns are
     -- named owner_* so every grant-filtered read looks the same.
@@ -946,7 +954,23 @@ CREATE TABLE events (
     -- behind every consumer's watermark.
     created_at     timestamptz NOT NULL DEFAULT clock_timestamp(),
 
-    kind           text NOT NULL,
+    -- Two constraints rather than one, and the second is not redundant.
+    --
+    -- The format clause is the ordinary rule: a kind is a dotted identifier the
+    -- platform composes, `<app>.<collection>.<verb>`. The control-character
+    -- clause states the HAZARD directly, because a kind is written into the
+    -- `event:` field of an SSE frame and a newline there renders one event as
+    -- two ... including a forged `id:` on a frame the server had decided must
+    -- not carry one. That forged cursor lands in the year 5138 and a client
+    -- resuming from it receives nothing, forever.
+    --
+    -- Keeping them apart means widening the format later (uppercase, a longer
+    -- name) cannot silently reopen frame injection.
+    kind           text NOT NULL
+                     CONSTRAINT events_kind_is_an_identifier
+                         CHECK (kind ~ '^[a-z0-9][a-z0-9._-]{0,127}$')
+                     CONSTRAINT events_kind_has_no_frame_separator
+                         CHECK (kind !~ '[[:cntrl:]]'),
 
     -- What the event is about, in the shape access_reason() takes, so replay
     -- filters with the same predicate as a live read.

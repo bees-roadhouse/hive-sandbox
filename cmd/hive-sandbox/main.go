@@ -97,7 +97,9 @@ func newMux() *http.ServeMux {
 	// Liveness only. Readiness needs Postgres and the bus, so it lands with them.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","version":%q}`+"\n", version)
+		// A failed write here means the client went away mid-response. Nothing
+		// to do about it and nothing worth logging on a liveness probe.
+		_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`+"\n", version)
 	})
 
 	return mux

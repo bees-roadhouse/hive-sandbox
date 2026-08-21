@@ -46,9 +46,14 @@ jobs:
       - name: vet
         run: go vet ./...
 
-      - uses: golangci/golangci-lint-action@v6
-        with:
-          version: latest
+      # Built from source with the runner's Go rather than downloading a
+      # prebuilt binary: a golangci-lint compiled with an older Go refuses to
+      # load a config targeting a newer one, which is exactly what broke the
+      # first CI run here.
+      - name: lint
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+          "$(go env GOPATH)/bin/golangci-lint" run
 
       # After lint, because lint autofix can reformat.
       - name: gofmt

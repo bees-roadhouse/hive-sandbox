@@ -542,3 +542,78 @@ func TestRunReturnsWhenACallbackBlocksForever(t *testing.T) {
 		t.Fatal("Run never returned with a parked callback, so Terminate never ran")
 	}
 }
+
+// Augie's finding 9. Run-id uniqueness is load-bearing for egress isolation and
+// was documented as a requirement while being enforced nowhere ... which is a
+// comment asking a caller to be careful.
+func TestRunRefusesADuplicateRunID(t *testing.T) {
+	t.Parallel()
+
+	sup := &harness.Supervisor{Launcher: &helperLauncher{mode: "hang"}}
+
+	spec := testSpec(t, "run-duplicate")
+	spec.Deadline = 3 * time.Second
+
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_, _ = sup.Run(t.Context(), spec, nil)
+	}()
+	<-started
+	time.Sleep(200 * time.Millisecond) // let the first run claim the id
+
+	// Two live runs on one id share a container name, a proxy and a network:
+	// each gets the union of both allowlists and either teardown kills the
+	// other.
+	second := testSpec(t, "run-duplicate")
+	second.RunID = spec.RunID
+	second.Deadline = time.Second
+
+	if _, err := sup.Run(t.Context(), second, nil); !errors.Is(err, harness.ErrRunInFlight) {
+		t.Fatalf("second run with the same id = %v, want ErrRunInFlight", err)
+	}
+}
+
+// The id reaches `podman run --name` and `podman network create`, so it has to
+// be something those can name.
+func TestRunIDMustBeNameable(t *testing.T) {
+	t.Parallel()
+
+	sup := &harness.Supervisor{Launcher: &helperLauncher{mode: "clean"}}
+
+	for _, bad := range []string{
+		"has a space",
+		"has/a/slash",
+		"-leading-dash",
+		"has$dollar",
+		strings.Repeat("x", 64),
+		"semi;colon",
+	} {
+		spec := testSpec(t, "x")
+		spec.RunID = bad
+		if _, err := sup.Run(t.Context(), spec, nil); err == nil {
+			t.Errorf("RunID %q was accepted; it names a container and a network", bad)
+		}
+	}
+
+	// And an ordinary one still works.
+	spec := testSpec(t, "run-ok.1_2-3")
+	if _, err := sup.Run(t.Context(), spec, nil); err != nil {
+		t.Errorf("an ordinary run id was refused: %v", err)
+	}
+}
+
+// An id is released however Run exits, or a retry after a failure is refused
+// forever.
+func TestRunIDIsReleasedAfterTheRun(t *testing.T) {
+	t.Parallel()
+
+	sup := &harness.Supervisor{Launcher: &helperLauncher{mode: "fail"}}
+	spec := testSpec(t, "run-released")
+
+	for i := range 3 {
+		if _, err := sup.Run(t.Context(), spec, nil); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+	}
+}

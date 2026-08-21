@@ -238,11 +238,11 @@ func TestPodmanRunsThePinnedImage(t *testing.T) {
 	t.Parallel()
 
 	if _, err := exec.LookPath("podman"); err != nil {
-		t.Skip("podman not on PATH")
+		skipOrFail(t, "podman not on PATH")
 	}
 	pins, err := harness.LoadPins(filepath.Join("..", "..", harness.DefaultPinsPath))
 	if err != nil {
-		t.Skipf("no pins committed (%v); run scripts/harness-build.sh", err)
+		skipOrFail(t, "no pins committed (%v); run scripts/harness-build.sh", err)
 	}
 
 	spec := harness.RunSpec{
@@ -261,7 +261,7 @@ func TestPodmanRunsThePinnedImage(t *testing.T) {
 	}
 
 	if !imagePresent(t, spec.ImageRef()) {
-		t.Skipf("%s is not in local podman storage; run scripts/harness-build.sh", spec.ImageRef())
+		skipOrFail(t, "%s is not in local podman storage; run scripts/harness-build.sh", spec.ImageRef())
 	}
 
 	store := harness.NewMemoryStore()

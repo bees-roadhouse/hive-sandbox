@@ -51,10 +51,6 @@ func TestMigrateIsIdempotent(t *testing.T) {
 func TestMigrateConcurrent(t *testing.T) {
 	s, ctx := testStore(t)
 
-	if _, err := s.Pool().Exec(ctx, "DROP SCHEMA IF EXISTS public CASCADE"); err != nil {
-		_ = err // the test schema is not public; this is a no-op guard
-	}
-
 	const racers = 6
 	var wg sync.WaitGroup
 	errs := make([]error, racers)

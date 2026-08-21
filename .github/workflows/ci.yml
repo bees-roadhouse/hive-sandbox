@@ -40,6 +40,17 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Mirrors what scripts/db-up.sh does locally. Extensions live in their own
+      # schema so `public` stays empty and a test's private schema is the only
+      # thing on its search path; migration one creates no extensions.
+      - name: provision extensions schema
+        env:
+          PGPASSWORD: hive
+        run: |
+          psql -h localhost -U hive -d hive_sandbox_test -v ON_ERROR_STOP=1 \
+            -c "CREATE SCHEMA IF NOT EXISTS extensions" \
+            -c "CREATE EXTENSION IF NOT EXISTS vector SCHEMA extensions"
+
       - name: build
         run: go build ./...
 

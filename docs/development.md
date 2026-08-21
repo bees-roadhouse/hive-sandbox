@@ -105,9 +105,19 @@ func TestThing(t *testing.T) {
 }
 ```
 
-Unqualified DDL lands in the private schema. The search path carries `public`
-behind it so extension types stay resolvable, which is the one seam in the
-isolation: a name that exists only in `public` is still visible.
+Unqualified DDL lands in the private schema. The search path is that schema plus
+`extensions`, and **not** `public`: pgvector is relocatable, so extension types
+live in their own schema and `public` stays empty. There is no shared schema for
+one test to reach another through.
+
+`db-up` creates the `extensions` schema and installs `vector` into it. That is
+provisioning rather than migration one, because it is the only step needing
+rights the migration role does not have.
+
+A corollary worth knowing before you write a store test: **the database is
+shared across tests, only the schema is private.** Anything database-scoped ...
+`DROP SCHEMA public`, `CREATE EXTENSION`, a role change ... is not isolated and
+will follow every test that runs after it, in any package.
 
 ## Run the e2e tests
 

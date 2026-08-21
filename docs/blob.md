@@ -80,9 +80,12 @@ own headers. The list in `ScriptableMIME` is deliberately generous and includes
 `image/svg+xml`, `application/pdf` and everything ending in `+xml`. An
 unparseable type counts as scriptable: absence of information is not permission.
 
-The disk driver cannot presign at all, so today everything is proxied. The rule
-exists now so that turning on Garage is a config change rather than a security
-review.
+The disk driver cannot presign at all, so for as long as it was the only driver,
+everything was proxied and this rule was a claim nobody had tested. The S3
+driver is where it does work, and it enforces the rule twice: `Deliver` consults
+`PlanDelivery`, and `PresignGet` refuses a scriptable type independently. A
+caller that skips `PlanDelivery`, or a `PlanDelivery` that grows a bug, still
+cannot get scriptable bytes signed.
 
 ## Ranges
 
@@ -179,8 +182,65 @@ corruption, while this order leaves at worst a trashed row whose bytes the next
 sweep clears. `DeleteTrashedBytes` refuses any other state, which stops a caller
 reaching past the reference check by calling the driver directly.
 
+## The S3 driver
+
+`S3Driver` targets any S3-compatible store; Garage is the one it is developed
+and tested against. Path-style addressing (Garage serves one endpoint for every
+bucket), a fixed region that must match `s3_region` in the server config because
+SigV4 puts it in the credential scope, and an optional key prefix so one bucket
+can hold more than this platform.
+
+**The prefix is not a tenant boundary.** Two principals who upload the same
+bytes still land on the same key; who may read them is a `blob_refs` row. A
+per-owner prefix would be invariant 3 for the sixth time.
+
+Uploads **buffer to a local temp file** rather than streaming through. The
+address is the digest and the digest is not known until the last byte, so
+something has to hold the bytes. The alternative — stream to a temp key, then
+copy server-side on seal — costs an O(size) copy on every upload; buffering
+costs local disk, once.
+
+### What running it against a real server settled
+
+These were assumptions until Garage answered them, and three of them were wrong
+in a way that would have shipped:
+
+| Claim | What a live Garage does |
+| --- | --- |
+| An expired signature returns 403 | **400.** `MaybeExpired` covers 400, 401 and 403 for this reason; a client that retried only on 403 would surface an expiry as a hard failure |
+| A `Range` against a presigned URL is refused | **206, byte-exact.** SigV4 query presigning signs `host` and the query; `Range` is an unsigned request header, so one signed URL can be fetched whole or in pieces |
+| A ranged GET carries a checksum to verify against | It does not. No `x-amz-checksum-*` on a ranged GET, which is why partial reads are documented as unverifiable rather than verified loosely |
+| `garage layout assign --single-node` sets up a dev cluster | Not in v2.3.0. The layout is assigned to an explicit node id and applied at an explicit version, which is what `scripts/garage-up` does |
+
+Garage itself sits at about 3.2 MB RSS at rest and does not buffer objects, so
+it is cheap enough to leave running on a development machine.
+
+### Running it
+
+```powershell
+.\scripts\garage-up.ps1     # prints the four env vars the tests read
+.\scripts\garage-down.ps1   # -Purge also deletes the volumes
+```
+
+```bash
+./scripts/garage-up.sh
+./scripts/garage-down.sh
+```
+
+The script is idempotent and does four things the container alone does not: it
+generates an RPC secret (gitignored, never committed), waits for the node to
+answer, applies a layout, and mints a key. **A Garage with no layout accepts
+connections and then refuses every write**, which looks exactly like a broken
+driver, so the script is the supported way in.
+
+The S3 tests skip when those variables are unset, and the `blobstore` CI job
+sets `HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS=1` so a skip there is a failure. That
+job runs `garage-up.sh` rather than a service container, so the script
+developers depend on is itself under test.
+
 ## What this does not include yet
 
-The S3/Garage driver (the seam is shaped for it, `Caps.Presign` is the switch),
-the client-side downloader whose rules are recorded above, and eviction —
-`StateEvicted` exists and the class rules are enforced, but nothing evicts yet.
+Multipart upload (every object is a single PUT today, so a very large blob holds
+a very large spool file), eviction — `StateEvicted` exists and the class rules
+are enforced, but nothing evicts yet — and any sweep of abandoned objects on the
+S3 side, which the disk driver has and this does not.

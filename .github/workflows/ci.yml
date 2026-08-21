@@ -248,3 +248,64 @@ jobs:
           podman ps --all --filter 'name=hive-sandbox-' --format '{{.Names}}'
           echo "networks:"
           podman network ls --format '{{.Name}}' | grep hive-sandbox || echo "  (none)"
+
+  # The S3 driver against a backend that can actually presign.
+  #
+  # The disk driver cannot redirect at all, so until Garage existed here,
+  # Caps.Presign, PlanDelivery's redirect arm and every claim about signed URLs
+  # were untested by construction ... and a fake that presigns would have agreed
+  # with whatever the driver did. Three of these assertions are about server
+  # behaviour and nothing but a server can answer them: that a Range against a
+  # signed URL is honoured (SigV4 query presigning signs `host`, not `Range`),
+  # that an expired signature comes back 400 rather than the 403 an AWS-shaped
+  # guess predicts, and that a redirect target actually serves the bytes.
+  #
+  # It runs scripts/garage-up.sh rather than a service container, so the script
+  # developers depend on is itself under test. REQUIRE_CONTAINER_TESTS makes a
+  # missing precondition a failure, for the reason the `containers` job explains.
+  blobstore:
+    runs-on: ubuntu-latest
+    env:
+      # ubuntu-latest ships both; pin the one whose compose is known-good here
+      # rather than letting the script's provider detection decide per-runner.
+      HIVE_SANDBOX_COMPOSE: "docker compose"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # --quiet prints exactly four lines: endpoint, bucket, key id, secret.
+      # The key is minted by this Garage seconds ago and dies with the runner.
+      - name: start garage
+        run: |
+          {
+            read -r endpoint
+            read -r bucket
+            read -r key_id
+            read -r secret
+          } < <(./scripts/garage-up.sh --quiet)
+          if [ -z "$endpoint" ] || [ -z "$secret" ]; then
+            echo "garage-up did not print credentials"
+            exit 1
+          fi
+          echo "HIVE_SANDBOX_TEST_S3_ENDPOINT=$endpoint" >> "$GITHUB_ENV"
+          echo "HIVE_SANDBOX_TEST_S3_BUCKET=$bucket" >> "$GITHUB_ENV"
+          echo "::add-mask::$key_id"
+          echo "::add-mask::$secret"
+          echo "HIVE_SANDBOX_TEST_S3_ACCESS_KEY_ID=$key_id" >> "$GITHUB_ENV"
+          echo "HIVE_SANDBOX_TEST_S3_SECRET_ACCESS_KEY=$secret" >> "$GITHUB_ENV"
+
+      - name: S3 driver tests, where a skip is a failure
+        env:
+          HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS: "1"
+        run: go test -race -count=1 -timeout 10m -run 'TestS3' -v ./internal/blob/
+
+      - name: garage-up is idempotent
+        run: ./scripts/garage-up.sh
+
+      - name: stop garage
+        if: ${{ always() }}
+        run: ./scripts/garage-down.sh --purge

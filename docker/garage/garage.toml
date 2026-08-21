@@ -1,0 +1,31 @@
+# Development Garage. Single node, loopback only, no data worth keeping.
+#
+# There is no secret in this file on purpose. `rpc_secret` comes from
+# GARAGE_RPC_SECRET, which scripts/garage-up generates into garage.env
+# (gitignored) on first run. A literal here would be a credential checked into a
+# public repository, and the fact that it is "only for dev" is exactly the
+# sentence people write before it turns up somewhere it is not.
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+
+# sqlite rather than lmdb: lmdb preallocates a large sparse map file, which on a
+# developer's machine reads as a runaway disk consumer. This store holds test
+# objects.
+db_engine = "sqlite"
+
+# One node, so one copy. Garage requires the acknowledgement rather than
+# inferring it.
+replication_factor = 1
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+
+[s3_api]
+# Must match S3Config.Region. Garage does not care what the region is called and
+# the SigV4 signer cares a great deal ... it goes into the credential scope, so a
+# mismatch is a signature failure with a misleading message.
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+# Path-style addressing only. The driver sets UsePathStyle, and a root_domain
+# here would let a virtual-host request through and hide that if it ever stopped.

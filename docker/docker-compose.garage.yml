@@ -1,0 +1,44 @@
+# Local Garage for the S3 blob driver.
+#
+# Brought up by scripts/garage-up.ps1 / .sh, which generate the RPC secret, wait
+# for real readiness, apply the layout and mint an S3 key. Do not `compose up`
+# this by hand unless you intend to run those steps yourself ... a Garage with no
+# layout applied accepts connections and then refuses every write, which looks
+# exactly like a broken driver.
+#
+# v2.3.0 is the floor. The layout is assigned and applied explicitly by the up
+# script ... there is no --single-node shortcut in this version.
+name: hive-sandbox-garage
+
+services:
+  garage:
+    image: docker.io/dxflrs/garage:v2.3.0
+    container_name: hive-sandbox-garage
+    restart: unless-stopped
+    # Written by garage-up before it calls compose. Holds only a locally
+    # generated RPC secret; gitignored.
+    env_file:
+      - ./garage/garage.env
+    ports:
+      # Loopback only, and off the default 3900 for the same reason Postgres
+      # sits on 55432: a dev fixture must not collide with, or shadow, anything
+      # real on this machine.
+      - "127.0.0.1:53900:3900"
+    volumes:
+      - ./garage/garage.toml:/etc/garage.toml:ro
+      - meta:/var/lib/garage/meta
+      - data:/var/lib/garage/data
+    healthcheck:
+      # The S3 port answering is not readiness ... Garage listens before a layout
+      # exists and then rejects every write. Ask the node about itself instead.
+      test: ["CMD", "/garage", "status"]
+      interval: 2s
+      timeout: 5s
+      retries: 40
+      start_period: 3s
+
+volumes:
+  meta:
+    name: hive-sandbox-garage-meta
+  data:
+    name: hive-sandbox-garage-data

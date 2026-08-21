@@ -27,3 +27,8 @@ test/e2e/.playwright/
 # registry (harnesses.md open question 2).
 docker/harness/digests.json
 docker/egress/digest.json
+
+# Generated per machine by scripts/garage-up, never committed. The dev Garage
+# binds to loopback and holds test objects, but a checked-in RPC secret in a
+# public repo is a thing someone eventually copies into a deployment.
+docker/garage/garage.env

@@ -5,8 +5,10 @@ screenshots, compiled guest modules, guest source, harness transcripts, stream
 spools, oversized workflow step outputs. One store with classes, not a module
 store beside a blob store.
 
-This document covers what has landed: **the driver seam and the disk driver**.
-The reference layer is the next piece, and the last section says what it owes.
+Two halves. The **driver** stores bytes at a content address and knows nothing
+else. The **catalog** owns the `blobs` and `blob_refs` rows, and is where
+ownership, permission and trust live. The last section says what is still
+missing.
 
 ## The address has no owner in it
 
@@ -135,15 +137,50 @@ legitimate idle period: a guest append can span workflow steps.
 Published objects are never swept by the driver. Whether those may go is a
 question about refs.
 
+## The reference layer
+
+`Catalog` is the half that knows about owners. It writes the `blobs` and
+`blob_refs` rows and ties them to bytes.
+
+**`Publish` takes a `pgx.Tx`, not a `DB`.** "No blob exists without a ref" is
+only true if the row and the reference cannot be written separately, and a
+signature accepting a pool would let a caller separate them by accident. The
+type is the enforcement, and `TestNoLiveBlobWithoutARef` proves the rollback.
+
+**`Resolve` looks through the caller's own references and never at the global
+hash space.** A caller holding a hash it has no reference to gets `ErrNotFound`
+— the same error as a hash that was never stored. That is what makes absence
+beat denial: no oracle, no timing difference, no policy to get wrong. It is also
+the property that lets the physical key stay owner-free.
+
+**Trust rides the reference** (`internal/trust`), not the bytes. An upload and a
+fetched page with identical bytes are one `blobs` row and two references that
+honestly disagree, and re-referencing can only move trust downward — otherwise
+global dedup would launder web content into trusted.
+
+**Whatever produced a blob writes its ref, host-internal producers included.**
+`SourceKind` lists every one: modules, guest source, transcripts, spools,
+screenshots, step outputs, harness diffs. A sweeper that does not know about a
+producer deletes that producer's output, so the schema CHECK and the Go type are
+two halves of one rule.
+
+### Collection
+
+`Unreferenced` lists live blobs with no live reference **across every owner**.
+Scoping that count per tenant is precisely what would let one owner's last
+release unlink bytes another still holds — the failure the owner-in-the-key
+design was invented to prevent, and which it would have had to introduce first.
+
+Being a candidate is not permission to delete. `Trash` re-checks under the row
+lock and returns false if a reference appeared in between. The row flips to
+`trashed` inside the transaction and the bytes go after it commits: deleting
+bytes first would leave a live row pointing at nothing, which reads as
+corruption, while this order leaves at worst a trashed row whose bytes the next
+sweep clears. `DeleteTrashedBytes` refuses any other state, which stops a caller
+reaching past the reference check by calling the driver directly.
+
 ## What this does not include yet
 
-The **reference layer**: the `blobs` and `blob_refs` rows, reserve-then-publish
-around a driver write, and `host.blob.read` resolving through the caller's refs.
-
-Until it lands, the headline invariant — **no blob exists without a ref, and
-whatever produced it writes one, host-internal producers included** — is
-documented and not enforced. The driver deliberately cannot enforce it: it
-knows nothing about owners, which is the whole point.
-
-Also not built: the S3/Garage driver (the seam is shaped for it, `Caps.Presign`
-is the switch), and the client-side downloader whose rules are recorded above.
+The S3/Garage driver (the seam is shaped for it, `Caps.Presign` is the switch),
+the client-side downloader whose rules are recorded above, and eviction —
+`StateEvicted` exists and the class rules are enforced, but nothing evicts yet.

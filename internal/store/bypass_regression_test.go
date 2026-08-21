@@ -778,8 +778,10 @@ func stagedBuild(t *testing.T, w *world, slug string, owner store.Owner, by stor
 		t.Fatalf("register build: %v", err)
 	}
 
+	// No SchemaName: StageInstall derives it from the values it authorised, so
+	// there is nothing here for a caller to steer (registry review finding 1).
 	installID, err := store.StageInstall(w.ctx, w.s.Pool(), store.InstallSpec{
-		BuildID: buildID, Slug: slug, Owner: owner, SchemaName: "app_" + slug + "_" + sum[:8],
+		BuildID: buildID, Slug: slug, Owner: owner,
 	}, by)
 	if err != nil {
 		t.Fatalf("stage: %v", err)

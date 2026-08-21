@@ -4,7 +4,7 @@ An app-of-apps platform. A Go daemon hosts WASM guest apps on wazero behind a
 JSON ABI; apps store and relate data through host-mediated surfaces; workflows
 and AI runs compose them. It replaces `bees-roadhouse/hive`.
 
-**The design is settled and lives outside this repo.** Decision log D0-D18 and
+**The design is settled and lives outside this repo.** Decision log D0-D23 and
 the plan set:
 
 ```
@@ -55,6 +55,23 @@ even if the tests pass.
    transforms.
 10. **Money-spending steps are at-most-once.** `agent_run` that comes back from a
     lease reclaim lands `indeterminate` rather than re-firing.
+11. **A check that accepts as an argument the fact it is deciding about is not a
+    check.** The predicate resolves the facts it authorizes against, from the
+    identifiers it was given. If a caller can supply the answer, the caller is
+    the enforcement point and there are as many enforcement points as call sites.
+    Corollaries: an obligation like auditing belongs to the predicate rather than
+    to one call site, and **a trigger cannot enforce what the writer supplies**
+    ... rules about "who did this" need a Go writer that pins the value from the
+    credential, because a trigger has no credential in scope.
+12. **Trust is structural in the ABI, not a field a guest can forget.** Every
+    capability response is `{trust, data}`; taint is tracked host-side per
+    invocation and is monotonic, so a write made after an untrusted read inherits
+    untrusted whatever the guest claims. Sanitizing is a granted, audited
+    capability, never a guest's assertion.
+13. **The daemon's API is reachable over a unix socket, not only a port.** A
+    harness container runs `--network=none` with the socket bind-mounted, because
+    on rootless Podman an `--internal` network has no gateway and cannot reach
+    the host at all. Measured, not assumed.
 
 ## Born-green gate
 

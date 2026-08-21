@@ -1,0 +1,1353 @@
+-- Migration one. Every table here exists because getting it wrong becomes
+-- unrecoverable once a row lands. Decision references are D<n> in
+-- artifacts/hive-sandbox/decision-log.
+--
+-- Rules this file encodes, and which the database (not the application) is
+-- responsible for holding:
+--
+--   * Every content row carries owner_kind + owner_id AND author_actor. "Nate
+--     did this" and "an AI acting for Nate did this" are different facts (D17.4).
+--   * Ownership, permission and trust are properties of a REFERENCE. blobs hold
+--     bytes and nothing else; blob_refs hold owner, refcount and trust (D17.1).
+--   * Revoking a grant deletes it, and inherited children go with it by foreign
+--     key cascade rather than by application code (D18.3).
+--   * Absence of scope is deny. access_reason() is the only expression allowed
+--     to answer "may this actor do this."
+
+-- gen_random_uuid() is core since Postgres 13. No extension needed, which keeps
+-- the migration runnable by a role that cannot CREATE EXTENSION.
+
+-- ---------------------------------------------------------------------------
+-- Actors: users, AI identities and orgs in one addressing model (D1.2).
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE actors (
+    id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    kind           text NOT NULL CHECK (kind IN ('human', 'ai', 'org')),
+    handle         text NOT NULL UNIQUE,
+    display_name   text NOT NULL DEFAULT '',
+
+    -- D13.9: an AI identity is a per-principal instance of a persona, so it
+    -- resolves to exactly one principal. A free-floating persona has nothing a
+    -- grant can be written against, which makes every tag ambiguous.
+    persona        text,
+
+    -- The principal this actor acts for. Humans and orgs are their own
+    -- principal; an AI's principal is the human or org that owns it. An AI
+    -- never appears as a principal (D13.4), which is enforced below.
+    principal_kind text NOT NULL CHECK (principal_kind IN ('user', 'org')),
+    principal_id   uuid NOT NULL REFERENCES actors (id),
+
+    -- D19.1/D19.2. Exactly one actor may have no creator: the bootstrap root,
+    -- guarded by the partial unique index below. A system whose first
+    -- authorization can be requested over the network does not have a root.
+    created_by_actor uuid REFERENCES actors (id),
+
+    meta           jsonb NOT NULL DEFAULT '{}',
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    disabled_at    timestamptz,
+
+    CONSTRAINT actors_persona_iff_ai
+        CHECK ((kind = 'ai') = (persona IS NOT NULL)),
+
+    -- A human or org actor is its own principal, and the principal kind follows
+    -- from the actor kind. Only an AI points somewhere else.
+    CONSTRAINT actors_self_principal
+        CHECK (
+            kind = 'ai'
+            OR (principal_id = id
+                AND principal_kind = CASE kind WHEN 'org' THEN 'org' ELSE 'user' END)
+        ),
+    CONSTRAINT actors_ai_is_not_its_own_principal
+        CHECK (kind <> 'ai' OR principal_id <> id)
+);
+
+CREATE INDEX actors_principal_idx ON actors (principal_kind, principal_id);
+
+-- There is exactly one root, and it is created out of band. Every other actor
+-- names its creator, which is what makes D19.2 checkable.
+CREATE UNIQUE INDEX actors_single_root ON actors ((created_by_actor IS NULL))
+    WHERE created_by_actor IS NULL;
+
+-- A CHECK cannot reach another row, and "an AI's principal is an AI" would
+-- quietly break the authority ceiling in access_reason(). Enforce it here.
+CREATE FUNCTION actors_principal_must_be_a_principal() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    p_kind text;
+BEGIN
+    SELECT kind INTO p_kind FROM actors WHERE id = NEW.principal_id;
+    IF p_kind IS NULL THEN
+        RAISE EXCEPTION 'actor % has no principal row %', NEW.id, NEW.principal_id;
+    END IF;
+    IF p_kind = 'ai' THEN
+        RAISE EXCEPTION 'actor %: an AI actor cannot be a principal', NEW.id;
+    END IF;
+    IF (p_kind = 'org') <> (NEW.principal_kind = 'org') THEN
+        RAISE EXCEPTION 'actor %: principal_kind % disagrees with principal actor kind %',
+            NEW.id, NEW.principal_kind, p_kind;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER actors_principal_check
+    AFTER INSERT OR UPDATE OF principal_kind, principal_id ON actors
+    FOR EACH ROW EXECUTE FUNCTION actors_principal_must_be_a_principal();
+
+-- D19.2: an org admin creates actors within their org; a person creates AI
+-- persona instances owned by themselves. An AI never creates actors. Enforced
+-- as a trigger rather than in a service, because "an AI cannot climb" has to
+-- hold for any writer that reaches this database.
+CREATE FUNCTION actors_creation_policy() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    c_kind text;
+BEGIN
+    IF NEW.created_by_actor IS NULL THEN
+        -- The bootstrap root. The partial unique index already caps this at one
+        -- row; nothing else needs saying here.
+        RETURN NEW;
+    END IF;
+
+    SELECT kind INTO c_kind FROM actors WHERE id = NEW.created_by_actor;
+    IF c_kind IS NULL THEN
+        RAISE EXCEPTION 'actor %: creator % does not exist', NEW.id, NEW.created_by_actor;
+    END IF;
+    IF c_kind = 'ai' THEN
+        RAISE EXCEPTION 'actor %: an AI actor may not create actors (D19.2)', NEW.id;
+    END IF;
+
+    -- A human or org actor is its own principal, so creating one confers no
+    -- authority on the creator. Authority attaches when the new actor is seated
+    -- in an org, and org_members carries that check.
+    IF NEW.kind <> 'ai' THEN
+        RETURN NEW;
+    END IF;
+
+    -- An AI persona instance is owned by a principal, and creating one DOES
+    -- confer authority ... it can act for that principal. So the creator must
+    -- be that person, or an admin of that org.
+    IF NEW.principal_kind = 'user' AND NEW.principal_id = NEW.created_by_actor THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.principal_kind = 'org' AND EXISTS (
+        SELECT 1 FROM org_members m
+         WHERE m.org_id = NEW.principal_id
+           AND m.user_id = NEW.created_by_actor
+           AND m.role = 'admin'
+    ) THEN
+        RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION 'actor %: creator % may not create an AI acting for principal % (D19.2)',
+        NEW.id, NEW.created_by_actor, NEW.principal_id;
+END;
+$$;
+
+CREATE TRIGGER actors_creation_check
+    AFTER INSERT ON actors
+    FOR EACH ROW EXECUTE FUNCTION actors_creation_policy();
+
+-- Membership is where authority actually attaches, so this is where D19.2's
+-- "an org admin, within their org" is enforced.
+CREATE TABLE org_members (
+    org_id        uuid NOT NULL REFERENCES actors (id) ON DELETE CASCADE,
+    user_id       uuid NOT NULL REFERENCES actors (id) ON DELETE CASCADE,
+    role          text NOT NULL CHECK (role IN ('member', 'admin')),
+    added_by_actor uuid NOT NULL REFERENCES actors (id),
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (org_id, user_id)
+);
+
+CREATE INDEX org_members_user_idx ON org_members (user_id);
+
+CREATE FUNCTION org_members_policy() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    org_creator uuid;
+BEGIN
+    IF (SELECT kind FROM actors WHERE id = NEW.org_id) <> 'org' THEN
+        RAISE EXCEPTION 'org_members.org_id % is not an org', NEW.org_id;
+    END IF;
+    IF (SELECT kind FROM actors WHERE id = NEW.user_id) <> 'human' THEN
+        RAISE EXCEPTION 'org_members.user_id % is not a human', NEW.user_id;
+    END IF;
+    IF (SELECT kind FROM actors WHERE id = NEW.added_by_actor) = 'ai' THEN
+        RAISE EXCEPTION 'an AI actor may not seat members in an org (D19.2)';
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM org_members m
+                WHERE m.org_id = NEW.org_id AND m.user_id = NEW.added_by_actor AND m.role = 'admin') THEN
+        RETURN NEW;
+    END IF;
+
+    -- The first seat: the org's own creator becomes its first admin, and there
+    -- is no membership row to check against yet.
+    SELECT created_by_actor INTO org_creator FROM actors WHERE id = NEW.org_id;
+    IF org_creator IS NOT NULL AND org_creator = NEW.added_by_actor
+       AND NOT EXISTS (SELECT 1 FROM org_members m WHERE m.org_id = NEW.org_id AND m.user_id <> NEW.user_id) THEN
+        RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION 'actor % is not an admin of org % (D19.2)', NEW.added_by_actor, NEW.org_id;
+END;
+$$;
+
+CREATE TRIGGER org_members_check
+    AFTER INSERT OR UPDATE ON org_members
+    FOR EACH ROW EXECUTE FUNCTION org_members_policy();
+
+-- ---------------------------------------------------------------------------
+-- Credentials (D17.4, D19.3). The credential is where author_actor and owner
+-- principal enter every request as a PAIR. Without the pair on the request, the
+-- pair can never be populated honestly on a row.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE credentials (
+    id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    actor_id       uuid NOT NULL REFERENCES actors (id) ON DELETE CASCADE,
+    principal_kind text NOT NULL CHECK (principal_kind IN ('user', 'org')),
+    principal_id   uuid NOT NULL REFERENCES actors (id),
+
+    -- The token is never stored. Only its hash comes back here.
+    token_sha256   char(64) NOT NULL UNIQUE CHECK (token_sha256 ~ '^[0-9a-f]{64}$'),
+    label          text NOT NULL DEFAULT '',
+
+    issued_by_actor           uuid NOT NULL REFERENCES actors (id),
+    issued_by_principal_kind  text NOT NULL CHECK (issued_by_principal_kind IN ('user', 'org')),
+    issued_by_principal_id    uuid NOT NULL REFERENCES actors (id),
+
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    expires_at     timestamptz,
+    revoked_at     timestamptz,
+    last_used_at   timestamptz
+);
+
+CREATE INDEX credentials_actor_idx ON credentials (actor_id) WHERE revoked_at IS NULL;
+
+-- D19.3: a principal issues for itself, or an org admin for actors in their
+-- org. An AI never issues credentials, which is the other half of "an AI cannot
+-- climb" (the first half being D18's no-override-for-AI rule).
+CREATE FUNCTION credentials_issue_policy() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    issuer_kind    text;
+    subject_p_kind text;
+    subject_p_id   uuid;
+BEGIN
+    SELECT kind INTO issuer_kind FROM actors WHERE id = NEW.issued_by_actor;
+    IF issuer_kind = 'ai' THEN
+        RAISE EXCEPTION 'credential %: an AI actor may not issue credentials (D19.3)', NEW.id;
+    END IF;
+
+    -- The credential's pair has to be one the subject actor can actually hold.
+    SELECT principal_kind, principal_id INTO subject_p_kind, subject_p_id
+      FROM actors WHERE id = NEW.actor_id;
+    IF (SELECT kind FROM actors WHERE id = NEW.actor_id) = 'ai' THEN
+        IF subject_p_kind IS DISTINCT FROM NEW.principal_kind
+           OR subject_p_id IS DISTINCT FROM NEW.principal_id THEN
+            RAISE EXCEPTION 'credential %: an AI actor is pinned to one principal', NEW.id;
+        END IF;
+    ELSIF NOT (
+        (NEW.principal_kind = 'user' AND NEW.principal_id = NEW.actor_id)
+        OR (NEW.principal_kind = 'org' AND EXISTS (
+                SELECT 1 FROM org_members m
+                 WHERE m.org_id = NEW.principal_id AND m.user_id = NEW.actor_id))
+    ) THEN
+        RAISE EXCEPTION 'credential %: actor % cannot act for principal %',
+            NEW.id, NEW.actor_id, NEW.principal_id;
+    END IF;
+
+    -- The issuer is the credential's own principal, or an admin of it.
+    IF NEW.issued_by_principal_kind = NEW.principal_kind
+       AND NEW.issued_by_principal_id = NEW.principal_id THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.principal_kind = 'org' AND EXISTS (
+        SELECT 1 FROM org_members m
+         WHERE m.org_id = NEW.principal_id
+           AND m.user_id = NEW.issued_by_actor
+           AND m.role = 'admin'
+    ) THEN
+        RETURN NEW;
+    END IF;
+    -- A person issuing for an AI persona instance they own.
+    IF NEW.principal_kind = 'user' AND NEW.principal_id = NEW.issued_by_actor THEN
+        RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION 'credential %: issuer % may not issue for principal % (D19.3)',
+        NEW.id, NEW.issued_by_actor, NEW.principal_id;
+END;
+$$;
+
+CREATE TRIGGER credentials_issue_check
+    AFTER INSERT ON credentials
+    FOR EACH ROW EXECUTE FUNCTION credentials_issue_policy();
+
+-- ---------------------------------------------------------------------------
+-- Grants (D1.3, D18). One table, allowlist only, no deny rows.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE grants (
+    id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    -- subject_id is the install id for install/tool/route/collection, and the
+    -- entity id for entity. subject_name qualifies the three install-scoped
+    -- kinds. Keeping the install id in a column is what makes the allowlist
+    -- rule below a single query instead of a join through the manifest.
+    subject_kind   text NOT NULL
+        CHECK (subject_kind IN ('install', 'tool', 'route', 'collection', 'entity')),
+    subject_id     uuid NOT NULL,
+    subject_name   text,
+
+    target_kind    text NOT NULL CHECK (target_kind IN ('user', 'org')),
+    target_id      uuid NOT NULL REFERENCES actors (id) ON DELETE CASCADE,
+    access         text NOT NULL CHECK (access IN ('read', 'write', 'call')),
+
+    source         text NOT NULL CHECK (source IN ('direct', 'inherited', 'override')),
+
+    -- D18.3: inheritance is materialized. Revocation of a parent deletes every
+    -- inherited child through this cascade, so the invariant is a foreign key
+    -- rather than a code path someone can forget to call.
+    inherited_from uuid REFERENCES grants (id) ON DELETE CASCADE,
+
+    -- Provenance: a grantee can see why they can see something (D13.15).
+    granted_by_actor         uuid NOT NULL REFERENCES actors (id),
+    granted_by_principal_kind text NOT NULL CHECK (granted_by_principal_kind IN ('user', 'org')),
+    granted_by_principal_id   uuid NOT NULL REFERENCES actors (id),
+    reason         text NOT NULL DEFAULT '',
+
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    expires_at     timestamptz,
+
+    -- The tombstone, and it is deliberately NOT a second table. A revoked row
+    -- is invisible to access_reason(); it exists only so the inheritance
+    -- materializer does not resurrect a deliberately narrowed child. The read
+    -- path therefore still has exactly one policy: a live grant, or deny.
+    revoked_at     timestamptz,
+    revoked_by     uuid REFERENCES actors (id),
+
+    CONSTRAINT grants_inherited_iff_parent
+        CHECK ((source = 'inherited') = (inherited_from IS NOT NULL)),
+    -- D18.2: break-glass, never ambient.
+    CONSTRAINT grants_override_is_time_boxed
+        CHECK (source <> 'override' OR expires_at IS NOT NULL),
+    -- Every case the design describes for override is a read. Widening this to
+    -- write should be a deliberate migration, not an accident.
+    CONSTRAINT grants_override_is_read_only
+        CHECK (source <> 'override' OR access = 'read'),
+    CONSTRAINT grants_named_subjects
+        CHECK ((subject_kind IN ('install', 'entity')) = (subject_name IS NULL)),
+    CONSTRAINT grants_revocation_is_attributed
+        CHECK ((revoked_at IS NULL) = (revoked_by IS NULL))
+);
+
+-- NULLS NOT DISTINCT so two install-subject rows (subject_name NULL) collide
+-- rather than silently duplicating.
+CREATE UNIQUE INDEX grants_identity_uq ON grants (
+    subject_kind, subject_id, subject_name,
+    target_kind, target_id, access, inherited_from
+) NULLS NOT DISTINCT;
+
+CREATE INDEX grants_lookup_idx ON grants (subject_kind, subject_id, target_kind, target_id)
+    WHERE revoked_at IS NULL;
+CREATE INDEX grants_target_idx ON grants (target_kind, target_id) WHERE revoked_at IS NULL;
+CREATE INDEX grants_parent_idx ON grants (inherited_from) WHERE inherited_from IS NOT NULL;
+
+-- D18.2: every access that succeeded ONLY because of an override is audited.
+-- access_reason() returns 'override' exactly in that case, which is what makes
+-- "only because" mechanically decidable rather than a judgement call.
+CREATE TABLE grant_override_audit (
+    id             bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    grant_id       uuid REFERENCES grants (id) ON DELETE SET NULL,
+    actor_id       uuid NOT NULL REFERENCES actors (id),
+    principal_kind text NOT NULL CHECK (principal_kind IN ('user', 'org')),
+    principal_id   uuid NOT NULL REFERENCES actors (id),
+    subject_kind   text NOT NULL,
+    subject_id     uuid NOT NULL,
+    subject_name   text,
+    owner_kind     text NOT NULL CHECK (owner_kind IN ('user', 'org')),
+    owner_id       uuid NOT NULL REFERENCES actors (id),
+    access         text NOT NULL,
+    reason         text NOT NULL DEFAULT '',
+    occurred_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX grant_override_audit_actor_idx ON grant_override_audit (actor_id, occurred_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- The grant predicate. THE single enforcement point (D1.4).
+--
+-- Returns the reason access is allowed, or NULL for deny. It returns a reason
+-- rather than a boolean because D18.2 requires auditing accesses that succeeded
+-- ONLY via an override, and a boolean cannot say which branch fired. Branch
+-- order therefore matters: 'override' is evaluated last, so seeing it means
+-- nothing else would have worked.
+--
+-- No caller may consult the grants table directly. If a query needs to filter
+-- rows, it calls this function.
+-- ---------------------------------------------------------------------------
+
+CREATE FUNCTION access_satisfies(p_held text, p_required text) RETURNS boolean
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+    -- write implies read. call is orthogonal: it gates tools and routes, and a
+    -- reader of an install's data has no business invoking its tools.
+    SELECT p_held = p_required OR (p_required = 'read' AND p_held = 'write');
+$$;
+
+CREATE FUNCTION access_reason(
+    p_subject_kind   text,
+    p_subject_id     uuid,
+    p_subject_name   text,
+    p_owner_kind     text,
+    p_owner_id       uuid,
+    p_principal_kind text,
+    p_principal_id   uuid,
+    p_actor_id       uuid,
+    p_access         text,
+    p_now            timestamptz DEFAULT now()
+) RETURNS text
+LANGUAGE plpgsql STABLE PARALLEL SAFE AS $$
+DECLARE
+    a_kind           text;
+    a_principal_kind text;
+    a_principal_id   uuid;
+    a_disabled       timestamptz;
+BEGIN
+    -- Absence of scope is deny, and that starts with an absent actor.
+    IF p_actor_id IS NULL OR p_principal_id IS NULL OR p_owner_id IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    SELECT kind, principal_kind, principal_id, disabled_at
+      INTO a_kind, a_principal_kind, a_principal_id, a_disabled
+      FROM actors WHERE id = p_actor_id;
+
+    IF a_kind IS NULL OR a_disabled IS NOT NULL THEN
+        RETURN NULL;
+    END IF;
+
+    -- Credential coherence (D17.4). The credential pins author_actor AND owner
+    -- principal, and the two have to agree or the pair proves nothing. Checking
+    -- it HERE rather than at the edge is what makes "an AI never gains authority
+    -- its principal lacks" structural: an AI cannot be handed a principal it
+    -- does not belong to, whatever the edge believed.
+    IF a_kind = 'ai' THEN
+        IF a_principal_kind IS DISTINCT FROM p_principal_kind
+           OR a_principal_id IS DISTINCT FROM p_principal_id THEN
+            RETURN NULL;
+        END IF;
+    ELSIF a_kind = 'human' THEN
+        -- A human acts for themselves, or for an org they belong to.
+        IF NOT (
+            (p_principal_kind = 'user' AND p_principal_id = p_actor_id)
+            OR (p_principal_kind = 'org' AND EXISTS (
+                    SELECT 1 FROM org_members m
+                     WHERE m.org_id = p_principal_id AND m.user_id = p_actor_id))
+        ) THEN
+            RETURN NULL;
+        END IF;
+    ELSE
+        -- An org is an owner and a grant target. It is not something that acts.
+        RETURN NULL;
+    END IF;
+
+    -- 1. The principal owns the row.
+    IF p_owner_kind = p_principal_kind AND p_owner_id = p_principal_id THEN
+        RETURN 'owner';
+    END IF;
+
+    -- 2. A grant written against this principal. Direct and inherited are the
+    --    same row shape by construction (D18.3), so they are one branch.
+    IF EXISTS (
+        SELECT 1 FROM grants g
+         WHERE g.subject_kind = p_subject_kind
+           AND g.subject_id = p_subject_id
+           AND g.subject_name IS NOT DISTINCT FROM p_subject_name
+           AND g.target_kind = p_principal_kind
+           AND g.target_id = p_principal_id
+           AND g.source <> 'override'
+           AND access_satisfies(g.access, p_access)
+           AND g.revoked_at IS NULL
+           AND (g.expires_at IS NULL OR g.expires_at > p_now)
+    ) THEN
+        RETURN 'grant';
+    END IF;
+
+    -- 3. A grant written against an org this principal belongs to. Resolved at
+    --    read time against membership, never materialized per member (D18.3):
+    --    materialized rows would be wrong the moment membership changes.
+    IF p_principal_kind = 'user' AND EXISTS (
+        SELECT 1
+          FROM grants g
+          JOIN org_members m ON m.org_id = g.target_id AND m.user_id = p_principal_id
+         WHERE g.subject_kind = p_subject_kind
+           AND g.subject_id = p_subject_id
+           AND g.subject_name IS NOT DISTINCT FROM p_subject_name
+           AND g.target_kind = 'org'
+           AND g.source <> 'override'
+           AND access_satisfies(g.access, p_access)
+           AND g.revoked_at IS NULL
+           AND (g.expires_at IS NULL OR g.expires_at > p_now)
+    ) THEN
+        RETURN 'org_grant';
+    END IF;
+
+    -- 4. Admin override. A grant produced by policy, evaluated in the same
+    --    predicate as everything else, under four constraints (D18.2):
+    --      * org-owned rows only ... being admin of the household does not
+    --        reach a member's personal rows,
+    --      * time-boxed, enforced by the expires_at CHECK on the row,
+    --      * a human actor only ... an AI acting for an admin principal does
+    --        not inherit override, which is D13.14's lesson,
+    --      * audited by the caller, because this branch is reached only when
+    --        nothing above it fired.
+    IF a_kind = 'human' AND p_owner_kind = 'org' AND EXISTS (
+        SELECT 1
+          FROM grants g
+          JOIN org_members m ON m.org_id = p_owner_id AND m.user_id = p_actor_id
+         WHERE g.subject_kind = p_subject_kind
+           AND g.subject_id = p_subject_id
+           AND g.subject_name IS NOT DISTINCT FROM p_subject_name
+           AND g.source = 'override'
+           AND m.role = 'admin'
+           AND g.target_kind = 'user'
+           AND g.target_id = p_actor_id
+           AND access_satisfies(g.access, p_access)
+           AND g.revoked_at IS NULL
+           AND g.expires_at > p_now
+    ) THEN
+        RETURN 'override';
+    END IF;
+
+    RETURN NULL;
+END;
+$$;
+
+-- Tool access, allowlist only (D18.1). An install grant with no tool allowlist
+-- implies the app's full tool set; with one, exactly those tools. Expressed
+-- here rather than at a call site so it cannot become a second policy.
+CREATE FUNCTION tool_access_reason(
+    p_install_id     uuid,
+    p_tool_name      text,
+    p_owner_kind     text,
+    p_owner_id       uuid,
+    p_principal_kind text,
+    p_principal_id   uuid,
+    p_actor_id       uuid,
+    p_now            timestamptz DEFAULT now()
+) RETURNS text
+LANGUAGE plpgsql STABLE PARALLEL SAFE AS $$
+DECLARE
+    has_allowlist boolean;
+BEGIN
+    SELECT EXISTS (
+        SELECT 1 FROM grants g
+         WHERE g.subject_kind = 'tool'
+           AND g.subject_id = p_install_id
+           AND g.revoked_at IS NULL
+           AND (g.expires_at IS NULL OR g.expires_at > p_now)
+           AND (
+                (g.target_kind = p_principal_kind AND g.target_id = p_principal_id)
+             OR (p_principal_kind = 'user' AND g.target_kind = 'org' AND EXISTS (
+                    SELECT 1 FROM org_members m
+                     WHERE m.org_id = g.target_id AND m.user_id = p_principal_id))
+           )
+    ) INTO has_allowlist;
+
+    IF has_allowlist THEN
+        RETURN access_reason('tool', p_install_id, p_tool_name,
+                             p_owner_kind, p_owner_id,
+                             p_principal_kind, p_principal_id, p_actor_id, 'call', p_now);
+    END IF;
+
+    RETURN access_reason('install', p_install_id, NULL,
+                         p_owner_kind, p_owner_id,
+                         p_principal_kind, p_principal_id, p_actor_id, 'call', p_now);
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Blobs. Bytes and references are separate tables because ownership,
+-- permission and trust are properties of a reference (D17.1, D6 key layout).
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE blobs (
+    sha256      char(64) PRIMARY KEY CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    size        bigint NOT NULL CHECK (size >= 0),
+    mime        text NOT NULL DEFAULT 'application/octet-stream',
+    driver      text NOT NULL,
+    driver_ref  text,
+
+    -- pending is the reservation (D6.5): reserve the row, release the lock,
+    -- move the bytes, flip to live. Every crash window fails toward reclaimable
+    -- litter rather than a live row pointing at nothing.
+    state       text NOT NULL CHECK (state IN ('pending', 'live', 'evicted', 'trashed')),
+
+    class       text NOT NULL CHECK (class IN ('derived', 'build', 'capture', 'original')),
+    source_hash char(64) REFERENCES blobs (sha256),
+    recipe      jsonb,
+
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    live_at     timestamptz,
+    evicted_at  timestamptz,
+    trashed_at  timestamptz,
+
+    CONSTRAINT blobs_live_has_bytes
+        CHECK (state <> 'live' OR driver_ref IS NOT NULL),
+    CONSTRAINT blobs_trashed_at_set
+        CHECK ((state = 'trashed') = (trashed_at IS NOT NULL)),
+    -- Evictability needs class AND source AND recipe, or the host drops bytes
+    -- believing it can get them back and then cannot say from what. A capture
+    -- has none of the three and is structurally non-evictable.
+    CONSTRAINT blobs_evictable_only_with_a_recipe
+        CHECK (
+            state <> 'evicted'
+            OR (class IN ('derived', 'build')
+                AND source_hash IS NOT NULL
+                AND recipe IS NOT NULL)
+        )
+);
+
+CREATE INDEX blobs_state_idx ON blobs (state, created_at);
+CREATE INDEX blobs_source_idx ON blobs (source_hash) WHERE source_hash IS NOT NULL;
+
+CREATE TABLE blob_refs (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    sha256       char(64) NOT NULL REFERENCES blobs (sha256) ON DELETE RESTRICT,
+
+    owner_kind   text NOT NULL CHECK (owner_kind IN ('user', 'org')),
+    owner_id     uuid NOT NULL REFERENCES actors (id),
+    author_actor uuid NOT NULL REFERENCES actors (id),
+
+    -- Every producer in the platform, not just host.storage.* (D17.5). A
+    -- sweeper that does not know about modules deletes live modules.
+    source_kind  text NOT NULL CHECK (source_kind IN (
+        'upload', 'collection', 'module', 'guest_source', 'transcript',
+        'spool', 'screenshot', 'step_output', 'harness_diff', 'workflow_input'
+    )),
+    source_id    text NOT NULL,
+
+    -- D17.1. Trust rides the reference, never the bytes: global dedup makes an
+    -- upload and a fetched page with identical bytes one blob row, and
+    -- trusted-first would silently launder web content into trusted.
+    trust        text NOT NULL CHECK (trust IN ('trusted', 'untrusted')),
+
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    -- The mechanism to release a reference has to exist even when the policy is
+    -- "keep forever", or the option cannot be exercised later (D6 retention).
+    released_at  timestamptz,
+
+    UNIQUE (sha256, owner_kind, owner_id, source_kind, source_id)
+);
+
+CREATE INDEX blob_refs_hash_idx ON blob_refs (sha256) WHERE released_at IS NULL;
+CREATE INDEX blob_refs_owner_idx ON blob_refs (owner_kind, owner_id) WHERE released_at IS NULL;
+
+-- Invariant: no blob exists without a ref, and whatever produced it writes one.
+-- A pending reservation has no ref yet by design, so the rule binds at the flip
+-- to live.
+CREATE FUNCTION blobs_live_requires_ref() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.state = 'live' AND NOT EXISTS (
+        SELECT 1 FROM blob_refs r WHERE r.sha256 = NEW.sha256 AND r.released_at IS NULL
+    ) THEN
+        RAISE EXCEPTION 'blob % cannot go live with no reference', NEW.sha256;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER blobs_live_ref_check
+    AFTER INSERT OR UPDATE OF state ON blobs
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION blobs_live_requires_ref();
+
+-- ---------------------------------------------------------------------------
+-- Apps and installs (D1.1).
+-- ---------------------------------------------------------------------------
+
+-- D19.4, settled: building is unattended, promoting is a human act. So a
+-- registered build with no install is a NORMAL RESTING STATE, not an error and
+-- not an incomplete record. The columns below exist so promotion can be an
+-- informed act: which build, from which source, produced by which run, with
+-- which test outcome, waiting on which app. Those are facts on the build row
+-- rather than a UI problem to solve later.
+CREATE TABLE app_builds (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug          text NOT NULL,
+    version       text NOT NULL DEFAULT '',
+    kind          text NOT NULL CHECK (kind IN ('app', 'tool')),
+    impl          text NOT NULL DEFAULT 'wasm' CHECK (impl IN ('wasm', 'host')),
+
+    -- NULL for impl='host' builtins, which have no module bytes.
+    module_sha256 char(64) REFERENCES blobs (sha256),
+    -- The guest source that produced the module. 'build' class blobs are
+    -- rebuildable only if source AND toolchain are both recorded (D6).
+    source_sha256 char(64) REFERENCES blobs (sha256),
+    toolchain     text NOT NULL DEFAULT '',
+
+    manifest      jsonb NOT NULL,
+    content_hash  char(64) NOT NULL UNIQUE CHECK (content_hash ~ '^[0-9a-f]{64}$'),
+
+    -- What produced it. A build with no run is hand-written and first-party;
+    -- a build with one came from the builder loop and says so.
+    built_by_run_id uuid,
+
+    -- The test outcome, attached to the build rather than living in a log
+    -- somebody has to go find.
+    test_state    text NOT NULL DEFAULT 'untested'
+        CHECK (test_state IN ('untested', 'passed', 'failed')),
+    test_summary  jsonb NOT NULL DEFAULT '{}',
+    tested_at     timestamptz,
+
+    -- D17.13: author_kind (user|org) cannot represent "Colette built this for
+    -- Nate." Same author/owner split as every other content row.
+    author_actor  uuid NOT NULL REFERENCES actors (id),
+    owner_kind    text NOT NULL CHECK (owner_kind IN ('user', 'org')),
+    owner_id      uuid NOT NULL REFERENCES actors (id),
+
+    visibility    text NOT NULL CHECK (visibility IN ('private', 'org', 'shared')),
+    -- D10.9: trust tier sets default capabilities. Tools are cheap to create,
+    -- which is exactly why 'local' starts with none.
+    trust         text NOT NULL CHECK (trust IN ('builtin', 'local', 'imported')),
+
+    -- 'registered' is where a build waits for a human, indefinitely and
+    -- correctly. It is deliberately not called 'pending'.
+    status        text NOT NULL CHECK (status IN ('building', 'registered', 'failed', 'withdrawn')),
+
+    created_at    timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT app_builds_wasm_has_a_module
+        CHECK ((impl = 'wasm') = (module_sha256 IS NOT NULL)),
+    CONSTRAINT app_builds_tools_have_no_storage
+        CHECK (kind <> 'tool' OR NOT (manifest ? 'storage')),
+    CONSTRAINT app_builds_tested_at_recorded
+        CHECK ((test_state = 'untested') = (tested_at IS NULL))
+);
+
+CREATE INDEX app_builds_slug_idx ON app_builds (slug, created_at DESC);
+CREATE INDEX app_builds_owner_idx ON app_builds (owner_kind, owner_id);
+CREATE INDEX app_builds_registered_idx ON app_builds (slug, created_at DESC)
+    WHERE status = 'registered';
+
+-- D19.4 is the reason app_builds and installs do not look alike. Producing a
+-- content-addressed module is not privileged, so the builder loop writes
+-- app_builds unattended. Making one live is a distinct act, and the columns
+-- below are what make that distinction structural rather than a convention a
+-- handler is trusted to remember.
+CREATE TABLE installs (
+    id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    build_id           uuid NOT NULL REFERENCES app_builds (id),
+    slug               text NOT NULL,
+
+    -- An install is owned by the scope it is installed into; the columns are
+    -- named owner_* so every grant-filtered read looks the same.
+    owner_kind         text NOT NULL CHECK (owner_kind IN ('user', 'org')),
+    owner_id           uuid NOT NULL REFERENCES actors (id),
+    installed_by_actor uuid NOT NULL REFERENCES actors (id),
+
+    -- Exactly one of these authorises an active install: a human principal, or
+    -- a standing write grant on this install (which is how an unattended
+    -- rebuild rolls a new build into an app a human already stood up).
+    activated_by_actor  uuid REFERENCES actors (id),
+    activation_grant_id uuid REFERENCES grants (id) ON DELETE RESTRICT,
+
+    schema_name        text NOT NULL UNIQUE,
+    state              text NOT NULL CHECK (state IN ('active', 'disabled', 'uninstalling')),
+    created_at         timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT installs_active_is_authorised
+        CHECK (state <> 'active'
+               OR activated_by_actor IS NOT NULL
+               OR activation_grant_id IS NOT NULL),
+
+    UNIQUE (slug, owner_kind, owner_id)
+);
+
+CREATE INDEX installs_owner_idx ON installs (owner_kind, owner_id) WHERE state = 'active';
+
+CREATE FUNCTION installs_activation_policy() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.state <> 'active' THEN
+        RETURN NEW;
+    END IF;
+
+    IF NEW.activated_by_actor IS NOT NULL THEN
+        IF (SELECT kind FROM actors WHERE id = NEW.activated_by_actor) <> 'human' THEN
+            RAISE EXCEPTION
+                'install %: activation needs a human principal or a standing grant (D19.4)',
+                NEW.id;
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    -- The standing grant is scoped to this one install, which is what "scoped
+    -- to one specific app" buys: it cannot promote a build into anything else.
+    --
+    -- It must have been written by a HUMAN. Without that clause the rule is
+    -- decorative: an AI acting for the install's owner already reads 'owner' on
+    -- the row, so it could mint its own standing grant and promote its own
+    -- output. The human-issued grant is the standing decision D19.4 asks for.
+    IF NOT EXISTS (
+        SELECT 1 FROM grants g
+          JOIN actors a ON a.id = g.granted_by_actor AND a.kind = 'human'
+         WHERE g.id = NEW.activation_grant_id
+           AND g.subject_kind = 'install'
+           AND g.subject_id = NEW.id
+           AND g.access = 'write'
+           AND g.source <> 'override'
+           AND g.revoked_at IS NULL
+           AND (g.expires_at IS NULL OR g.expires_at > now())
+    ) THEN
+        RAISE EXCEPTION 'install %: activation grant % is not a live write grant on this install',
+            NEW.id, NEW.activation_grant_id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER installs_activation_check
+    AFTER INSERT OR UPDATE OF state, activated_by_actor, activation_grant_id ON installs
+    FOR EACH ROW EXECUTE FUNCTION installs_activation_policy();
+
+-- What is waiting on a human, with everything needed to decide. Promotion is
+-- meant to be informed rather than a rubber stamp, so the facts live here and
+-- not in whatever the first UI happens to join together.
+CREATE VIEW builds_awaiting_promotion AS
+SELECT b.id            AS build_id,
+       b.slug,
+       b.kind,
+       b.version,
+       b.content_hash,
+       b.module_sha256,
+       b.source_sha256,
+       b.toolchain,
+       b.built_by_run_id,
+       b.author_actor,
+       b.owner_kind,
+       b.owner_id,
+       b.trust,
+       b.test_state,
+       b.test_summary,
+       b.tested_at,
+       b.created_at,
+       -- Which app it is waiting on, and what is live there now, so the
+       -- decision is "replace this with that" rather than "approve a hash".
+       i.id            AS current_install_id,
+       i.build_id      AS current_build_id,
+       i.state         AS current_install_state
+  FROM app_builds b
+  LEFT JOIN installs i
+         ON i.slug = b.slug
+        AND i.owner_kind = b.owner_kind
+        AND i.owner_id = b.owner_id
+ WHERE b.status = 'registered'
+   AND (i.build_id IS NULL OR i.build_id <> b.id);
+
+-- ---------------------------------------------------------------------------
+-- Entities and links: the shared composition layer (D3.4).
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE entities (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    kind         text NOT NULL,
+    install_id   uuid NOT NULL REFERENCES installs (id) ON DELETE CASCADE,
+    collection   text NOT NULL,
+    ref          text NOT NULL,
+
+    owner_kind   text NOT NULL CHECK (owner_kind IN ('user', 'org')),
+    owner_id     uuid NOT NULL REFERENCES actors (id),
+    author_actor uuid NOT NULL REFERENCES actors (id),
+
+    trust        text NOT NULL DEFAULT 'trusted' CHECK (trust IN ('trusted', 'untrusted')),
+    -- D17.12: cause_depth rides everything a run produces, not just mentions,
+    -- or it cannot propagate and the loop guard has nothing to count.
+    cause_depth  int NOT NULL DEFAULT 0 CHECK (cause_depth >= 0),
+    run_id       uuid,
+
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    deleted_at   timestamptz,
+
+    UNIQUE (install_id, collection, ref)
+);
+
+CREATE INDEX entities_owner_idx ON entities (owner_kind, owner_id, kind) WHERE deleted_at IS NULL;
+CREATE INDEX entities_collection_idx ON entities (install_id, collection) WHERE deleted_at IS NULL;
+
+CREATE TABLE links (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    kind         text NOT NULL,
+    src_id       uuid NOT NULL REFERENCES entities (id) ON DELETE CASCADE,
+    dst_id       uuid NOT NULL REFERENCES entities (id) ON DELETE CASCADE,
+
+    owner_kind   text NOT NULL CHECK (owner_kind IN ('user', 'org')),
+    owner_id     uuid NOT NULL REFERENCES actors (id),
+    author_actor uuid NOT NULL REFERENCES actors (id),
+
+    meta         jsonb NOT NULL DEFAULT '{}',
+    created_at   timestamptz NOT NULL DEFAULT now(),
+
+    UNIQUE (kind, src_id, dst_id)
+);
+
+CREATE INDEX links_dst_idx ON links (dst_id, kind);
+
+-- ---------------------------------------------------------------------------
+-- Who may WRITE a grant (D13.14, D18.2, D19.3).
+--
+-- The read predicate above answers "may this actor see this." This answers the
+-- other half, and it is the half that decides whether an AI can climb: a writer
+-- must not be able to end a transaction holding authority its principal did not
+-- already have. It lives in a trigger for the same reason access_reason() lives
+-- in the database ... it has to hold for every writer that reaches this schema,
+-- not only for the ones that remember to call a service.
+-- ---------------------------------------------------------------------------
+
+CREATE FUNCTION subject_owner(p_subject_kind text, p_subject_id uuid)
+RETURNS TABLE (owner_kind text, owner_id uuid)
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    -- tool, route and collection are install-scoped, so subject_id is the
+    -- install id for all three and they share the install's owner.
+    SELECT e.owner_kind, e.owner_id FROM entities e
+     WHERE p_subject_kind = 'entity' AND e.id = p_subject_id
+    UNION ALL
+    SELECT i.owner_kind, i.owner_id FROM installs i
+     WHERE p_subject_kind IN ('install', 'tool', 'route', 'collection') AND i.id = p_subject_id;
+$$;
+
+CREATE FUNCTION grant_issue_denial(
+    p_subject_kind    text,
+    p_subject_id      uuid,
+    p_target_kind     text,
+    p_target_id       uuid,
+    p_source          text,
+    p_by_actor        uuid,
+    p_by_principal_kind text,
+    p_by_principal_id uuid
+) RETURNS text
+LANGUAGE plpgsql STABLE PARALLEL SAFE AS $$
+DECLARE
+    o_kind    text;
+    o_id      uuid;
+    a_kind    text;
+    a_p_kind  text;
+    a_p_id    uuid;
+BEGIN
+    SELECT owner_kind, owner_id INTO o_kind, o_id
+      FROM subject_owner(p_subject_kind, p_subject_id);
+    IF o_kind IS NULL THEN
+        RETURN format('subject %s/%s does not exist', p_subject_kind, p_subject_id);
+    END IF;
+
+    SELECT kind, principal_kind, principal_id INTO a_kind, a_p_kind, a_p_id
+      FROM actors WHERE id = p_by_actor;
+    IF a_kind IS NULL THEN
+        RETURN 'granting actor does not exist';
+    END IF;
+
+    -- The credential's pair has to agree, here as much as on a read.
+    IF a_kind = 'ai' AND (a_p_kind IS DISTINCT FROM p_by_principal_kind
+                          OR a_p_id IS DISTINCT FROM p_by_principal_id) THEN
+        RETURN 'granting actor is not bound to that principal';
+    END IF;
+
+    IF p_source = 'override' THEN
+        -- D18.2: produced by policy, org-owned rows only, human admin only. An
+        -- AI never holds override and therefore never mints one either.
+        IF a_kind <> 'human' THEN
+            RETURN 'only a human actor may enter break-glass (D18.2)';
+        END IF;
+        IF o_kind <> 'org' THEN
+            RETURN 'override never reaches a personally-owned row (D18.2)';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM org_members m
+                        WHERE m.org_id = o_id AND m.user_id = p_by_actor AND m.role = 'admin') THEN
+            RETURN 'break-glass requires admin of the owning org (D18.2)';
+        END IF;
+        RETURN NULL;
+    END IF;
+
+    -- Sharing is not transfer (D13.10), and it is not laundering either: only
+    -- the owner's principal may widen a row. A grantee reads and replies.
+    IF o_kind IS DISTINCT FROM p_by_principal_kind OR o_id IS DISTINCT FROM p_by_principal_id THEN
+        RETURN 'only the owning principal may grant on this subject';
+    END IF;
+
+    -- D13.14: a tag is an exfiltration primitive once an AI can write one.
+    IF a_kind = 'ai' THEN
+        IF p_target_kind = a_p_kind AND p_target_id = a_p_id THEN
+            RETURN NULL;  -- its own principal, widening nothing
+        END IF;
+        IF p_target_kind = 'org' AND (
+            (a_p_kind = 'org' AND a_p_id = p_target_id)
+            OR (a_p_kind = 'user' AND EXISTS (
+                    SELECT 1 FROM org_members m
+                     WHERE m.org_id = p_target_id AND m.user_id = a_p_id))
+        ) THEN
+            RETURN NULL;  -- an org its principal belongs to
+        END IF;
+        IF p_target_kind = 'user' AND a_p_kind = 'user' AND EXISTS (
+            SELECT 1 FROM org_members mine
+              JOIN org_members theirs ON theirs.org_id = mine.org_id
+             WHERE mine.user_id = a_p_id AND theirs.user_id = p_target_id
+        ) THEN
+            RETURN NULL;  -- a member principal of the same org
+        END IF;
+        RETURN 'AI-authored share crosses a principal boundary; '
+               || 'needs a standing grant or human confirmation (D13.14)';
+    END IF;
+
+    RETURN NULL;
+END;
+$$;
+
+CREATE FUNCTION grants_issue_check() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    denial text;
+BEGIN
+    denial := grant_issue_denial(
+        NEW.subject_kind, NEW.subject_id, NEW.target_kind, NEW.target_id,
+        NEW.source, NEW.granted_by_actor,
+        NEW.granted_by_principal_kind, NEW.granted_by_principal_id);
+    IF denial IS NOT NULL THEN
+        RAISE EXCEPTION 'grant refused: %', denial;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER grants_issue_policy
+    AFTER INSERT ON grants
+    FOR EACH ROW EXECUTE FUNCTION grants_issue_check();
+
+-- ---------------------------------------------------------------------------
+-- Events: append-only, the transport of record (D4.5).
+--
+-- Partitioned monthly by created_at so growth stays an operational non-event
+-- (retention: keep). The consequence a consumer MUST know: the tail cursor is
+-- (created_at, id), not id. A partitioned table has no global index on id
+-- alone, so an id-only tail probes every partition forever. See
+-- docs/events-tailing.md.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE events (
+    id             bigint GENERATED BY DEFAULT AS IDENTITY,
+    -- clock_timestamp() rather than now(): now() is transaction start, so a
+    -- long transaction files its rows into a partition that may already be
+    -- behind every consumer's watermark.
+    created_at     timestamptz NOT NULL DEFAULT clock_timestamp(),
+
+    kind           text NOT NULL,
+
+    -- What the event is about, in the shape access_reason() takes, so replay
+    -- filters with the same predicate as a live read.
+    subject_kind   text CHECK (subject_kind IN ('install', 'tool', 'route', 'collection', 'entity')),
+    subject_id     uuid,
+    subject_name   text,
+
+    owner_kind     text NOT NULL CHECK (owner_kind IN ('user', 'org')),
+    owner_id       uuid NOT NULL,
+    author_actor   uuid NOT NULL,
+    principal_kind text NOT NULL CHECK (principal_kind IN ('user', 'org')),
+    principal_id   uuid NOT NULL,
+
+    body           jsonb NOT NULL DEFAULT '{}',
+    trust          text NOT NULL DEFAULT 'trusted' CHECK (trust IN ('trusted', 'untrusted')),
+    cause_depth    int NOT NULL DEFAULT 0 CHECK (cause_depth >= 0),
+    run_id         uuid,
+
+    -- D4.12: cross-hive bridging is far future, but this is the piece that is
+    -- painful to retrofit and it costs nothing today.
+    origin         text NOT NULL DEFAULT 'local',
+    origin_id      text,
+
+    PRIMARY KEY (created_at, id)
+) PARTITION BY RANGE (created_at);
+
+-- Local (non-partitioned) index on id so an id-ordered tail is an index scan
+-- per partition rather than a sequential one.
+CREATE INDEX events_id_idx ON events (id);
+CREATE INDEX events_owner_idx ON events (owner_kind, owner_id, created_at DESC);
+CREATE INDEX events_subject_idx ON events (subject_kind, subject_id, created_at DESC);
+
+-- A DEFAULT partition so a missing month never turns an append-only table into
+-- an outage. It should stay empty; the store creates partitions ahead of time.
+CREATE TABLE events_default PARTITION OF events DEFAULT;
+
+CREATE FUNCTION ensure_events_partition(p_month date) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    lo   date := date_trunc('month', p_month)::date;
+    hi   date := (date_trunc('month', p_month) + interval '1 month')::date;
+    name text := format('events_%s', to_char(lo, 'YYYY_MM'));
+BEGIN
+    IF to_regclass(name) IS NULL THEN
+        EXECUTE format(
+            'CREATE TABLE %I PARTITION OF events FOR VALUES FROM (%L) TO (%L)',
+            name, lo, hi);
+    END IF;
+    RETURN name;
+END;
+$$;
+
+-- D4.12 asks for (origin, origin_id) unique from the first migration. A UNIQUE
+-- constraint on a partitioned table must include the partition key, which would
+-- make it unique per month and useless for bridge dedupe. So global uniqueness
+-- lives in a small side table, written by a trigger, and only for events that
+-- actually came from somewhere else. Locally produced events leave origin_id
+-- NULL and cost nothing.
+CREATE TABLE event_origins (
+    origin           text NOT NULL,
+    origin_id        text NOT NULL,
+    event_id         bigint NOT NULL,
+    event_created_at timestamptz NOT NULL,
+    PRIMARY KEY (origin, origin_id)
+);
+
+CREATE FUNCTION events_record_origin() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO event_origins (origin, origin_id, event_id, event_created_at)
+    VALUES (NEW.origin, NEW.origin_id, NEW.id, NEW.created_at);
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER events_origin_dedupe
+    AFTER INSERT ON events
+    FOR EACH ROW WHEN (NEW.origin_id IS NOT NULL)
+    EXECUTE FUNCTION events_record_origin();
+
+-- Append-only means append-only.
+CREATE FUNCTION reject_mutation() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION '% is append-only', TG_TABLE_NAME;
+END;
+$$;
+
+CREATE TRIGGER events_append_only
+    BEFORE UPDATE OR DELETE ON events
+    FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+
+-- ---------------------------------------------------------------------------
+-- Mentions: host-owned, because a tag is a permission act (D13).
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE mentions (
+    id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    entity_id        uuid NOT NULL REFERENCES entities (id) ON DELETE CASCADE,
+    mentioned_actor  uuid NOT NULL REFERENCES actors (id),
+
+    -- D13.8: the grant goes to the tagged actor's PRINCIPAL. An AI does not own
+    -- memory, so it cannot be the target of a share either.
+    principal_kind   text NOT NULL CHECK (principal_kind IN ('user', 'org')),
+    principal_id     uuid NOT NULL REFERENCES actors (id),
+
+    author_actor     uuid NOT NULL REFERENCES actors (id),
+    owner_kind       text NOT NULL CHECK (owner_kind IN ('user', 'org')),
+    owner_id         uuid NOT NULL REFERENCES actors (id),
+
+    state            text NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'delivered', 'acknowledged', 'actioned', 'dropped')),
+    -- A denied cross-boundary tag is recorded with a reason, not dropped
+    -- silently: the AI should be able to say "I wanted to loop in Apis and
+    -- could not" (D13.14).
+    drop_reason      text,
+
+    -- The share this tag wrote, in the same transaction as the entry and the
+    -- mention (D13.2). SET NULL rather than CASCADE: revoking the share must
+    -- not erase the record that the tag happened.
+    grant_id         uuid REFERENCES grants (id) ON DELETE SET NULL,
+
+    run_id           uuid,
+    cause_depth      int NOT NULL DEFAULT 0 CHECK (cause_depth >= 0),
+    trust            text NOT NULL DEFAULT 'trusted' CHECK (trust IN ('trusted', 'untrusted')),
+
+    delivered_at     timestamptz,
+    acknowledged_at  timestamptz,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT mentions_drop_reason_iff_dropped
+        CHECK ((state = 'dropped') = (drop_reason IS NOT NULL)),
+    UNIQUE (entity_id, mentioned_actor)
+);
+
+CREATE INDEX mentions_inbox_idx ON mentions (principal_kind, principal_id, state, created_at DESC);
+CREATE INDEX mentions_actor_idx ON mentions (mentioned_actor, state);
+
+-- ---------------------------------------------------------------------------
+-- Workflows (D8). The step log is a checkpoint journal, never a replay tape.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE workflow_defs (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    install_id   uuid REFERENCES installs (id) ON DELETE CASCADE,
+    name         text NOT NULL,
+    spec         jsonb NOT NULL,
+    content_hash char(64) NOT NULL UNIQUE CHECK (content_hash ~ '^[0-9a-f]{64}$'),
+
+    owner_kind   text NOT NULL CHECK (owner_kind IN ('user', 'org')),
+    owner_id     uuid NOT NULL REFERENCES actors (id),
+    author_actor uuid NOT NULL REFERENCES actors (id),
+
+    enabled      boolean NOT NULL DEFAULT true,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX workflow_defs_name_idx ON workflow_defs (name, created_at DESC);
+
+-- Definitions are immutable and content-addressed. An AI editing a live
+-- definition would otherwise change what an in-flight run resumes into. Editing
+-- means writing a new row with a new hash and pointing triggers at it.
+CREATE FUNCTION workflow_defs_are_immutable() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.spec IS DISTINCT FROM OLD.spec
+       OR NEW.content_hash IS DISTINCT FROM OLD.content_hash THEN
+        RAISE EXCEPTION 'workflow_defs.% is immutable; write a new definition',
+            CASE WHEN NEW.spec IS DISTINCT FROM OLD.spec THEN 'spec' ELSE 'content_hash' END;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER workflow_defs_immutable
+    BEFORE UPDATE ON workflow_defs
+    FOR EACH ROW EXECUTE FUNCTION workflow_defs_are_immutable();
+
+CREATE TABLE workflow_triggers (
+    id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    def_id     uuid NOT NULL REFERENCES workflow_defs (id) ON DELETE CASCADE,
+    kind       text NOT NULL CHECK (kind IN ('event', 'cron', 'manual', 'webhook')),
+    match      jsonb,
+    cron_expr  text,
+
+    owner_kind text NOT NULL CHECK (owner_kind IN ('user', 'org')),
+    owner_id   uuid NOT NULL REFERENCES actors (id),
+    enabled    boolean NOT NULL DEFAULT true,
+    created_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT workflow_triggers_cron_expr CHECK ((kind = 'cron') = (cron_expr IS NOT NULL))
+);
+
+CREATE INDEX workflow_triggers_event_idx ON workflow_triggers (kind) WHERE enabled;
+
+CREATE TABLE workflow_runs (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    def_id          uuid NOT NULL REFERENCES workflow_defs (id),
+    -- Pinned at start. Resume reads recorded step results and never re-walks
+    -- the definition, so a run is immune to a definition edit mid-flight.
+    definition_hash char(64) NOT NULL,
+    trigger_id      uuid REFERENCES workflow_triggers (id) ON DELETE SET NULL,
+
+    actor_id        uuid NOT NULL REFERENCES actors (id),
+    owner_kind      text NOT NULL CHECK (owner_kind IN ('user', 'org')),
+    owner_id        uuid NOT NULL REFERENCES actors (id),
+
+    input           jsonb NOT NULL DEFAULT '{}',
+    state           text NOT NULL DEFAULT 'running'
+        CHECK (state IN ('running', 'waiting', 'succeeded', 'failed', 'cancelled')),
+
+    -- Idempotent cron enqueue (D4.3) keys on this: the trigger id plus the
+    -- fire time, INSERT ... ON CONFLICT DO NOTHING, RETURNING decides whether
+    -- to notify at all.
+    idem_key        text UNIQUE,
+
+    -- D17.12 / D17.3: both ride the run, and everything the run produces
+    -- inherits them. An untrusted causal chain costs the run its egress.
+    cause_depth     int NOT NULL DEFAULT 0 CHECK (cause_depth >= 0),
+    trust           text NOT NULL DEFAULT 'trusted' CHECK (trust IN ('trusted', 'untrusted')),
+    egress_allowed  boolean NOT NULL DEFAULT false,
+
+    steps_used      int NOT NULL DEFAULT 0,
+    max_steps       int NOT NULL DEFAULT 100 CHECK (max_steps > 0),
+    deadline_at     timestamptz,
+    started_at      timestamptz NOT NULL DEFAULT now(),
+    ended_at        timestamptz,
+    error           text,
+
+    -- The trifecta rule, enforced at spawn rather than trusted to a prompt
+    -- (D17.3): if anything in the causal chain is untrusted, the run has no
+    -- egress unless a human granted that combination explicitly.
+    CONSTRAINT workflow_runs_untrusted_has_no_egress
+        CHECK (trust = 'trusted' OR NOT egress_allowed)
+);
+
+CREATE INDEX workflow_runs_state_idx ON workflow_runs (state, started_at) WHERE state IN ('running', 'waiting');
+CREATE INDEX workflow_runs_owner_idx ON workflow_runs (owner_kind, owner_id, started_at DESC);
+
+CREATE TABLE workflow_steps (
+    id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id               uuid NOT NULL REFERENCES workflow_runs (id) ON DELETE CASCADE,
+    parent_step_id       uuid REFERENCES workflow_steps (id) ON DELETE CASCADE,
+    seq                  int NOT NULL,
+    name                 text NOT NULL,
+    type                 text NOT NULL CHECK (type IN (
+        'wasm_call', 'http', 'agent_run', 'emit', 'workflow_call', 'sleep', 'wait_for_event')),
+
+    -- Declared, not assumed (D8.4). agent_run spends money, so its default is
+    -- at_most_once everywhere (D17.8) and the CHECK stops a definition author
+    -- from talking us out of it.
+    retry_policy         text NOT NULL CHECK (retry_policy IN ('at_least_once', 'at_most_once')),
+
+    input                jsonb NOT NULL DEFAULT '{}',
+    output               jsonb,
+    output_trust         text NOT NULL DEFAULT 'trusted' CHECK (output_trust IN ('trusted', 'untrusted')),
+
+    state                text NOT NULL DEFAULT 'pending' CHECK (state IN (
+        'pending', 'leased', 'waiting_timer', 'waiting_event',
+        'succeeded', 'failed', 'skipped', 'indeterminate')),
+
+    attempt              int NOT NULL DEFAULT 0,
+    max_attempts         int NOT NULL DEFAULT 1 CHECK (max_attempts > 0),
+    next_attempt_at      timestamptz NOT NULL DEFAULT now(),
+
+    lease_owner          text,
+    lease_expires_at     timestamptz,
+    heartbeat_at         timestamptz,
+
+    wake_at              timestamptz,
+    wait_match           jsonb,
+
+    idem_key             text,
+    pending_children     int NOT NULL DEFAULT 0 CHECK (pending_children >= 0),
+    continue_on_error    boolean NOT NULL DEFAULT false,
+
+    error                text,
+    -- An at-most-once step reclaimed from a dead lease cannot know whether its
+    -- effect happened. It lands here rather than re-firing (invariant 10).
+    indeterminate_reason text,
+
+    created_at           timestamptz NOT NULL DEFAULT now(),
+    updated_at           timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT workflow_steps_agent_run_is_at_most_once
+        CHECK (type <> 'agent_run' OR retry_policy = 'at_most_once'),
+    CONSTRAINT workflow_steps_at_most_once_attempts
+        CHECK (retry_policy <> 'at_most_once' OR max_attempts = 1),
+    CONSTRAINT workflow_steps_indeterminate_has_a_reason
+        CHECK ((state = 'indeterminate') = (indeterminate_reason IS NOT NULL)),
+    CONSTRAINT workflow_steps_timer_has_a_wake
+        CHECK (state <> 'waiting_timer' OR wake_at IS NOT NULL),
+    CONSTRAINT workflow_steps_lease_is_bounded
+        CHECK (state <> 'leased' OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL))
+);
+
+CREATE UNIQUE INDEX workflow_steps_idem_uq ON workflow_steps (run_id, idem_key)
+    WHERE idem_key IS NOT NULL;
+
+-- The claim path: FOR UPDATE SKIP LOCKED over this index.
+CREATE INDEX workflow_steps_claim_idx ON workflow_steps (next_attempt_at, created_at)
+    WHERE state = 'pending';
+CREATE INDEX workflow_steps_timer_idx ON workflow_steps (wake_at) WHERE state = 'waiting_timer';
+CREATE INDEX workflow_steps_lease_idx ON workflow_steps (lease_expires_at) WHERE state = 'leased';
+CREATE INDEX workflow_steps_wait_idx ON workflow_steps (run_id) WHERE state = 'waiting_event';
+CREATE INDEX workflow_steps_run_idx ON workflow_steps (run_id, seq);

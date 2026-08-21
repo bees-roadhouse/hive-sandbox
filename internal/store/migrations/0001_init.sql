@@ -566,6 +566,54 @@ CREATE INDEX app_builds_registered_idx ON app_builds (slug, created_at DESC)
 -- app_builds unattended. Making one live is a distinct act, and the columns
 -- below are what make that distinction structural rather than a convention a
 -- handler is trusted to remember.
+--
+-- ---------------------------------------------------------------------------
+-- Install authority: a WRITE-PATH capability, in its own table (D20).
+--
+-- This used to be an ordinary `write` grant on the install subject, and that
+-- was wrong in a way that only showed up when somebody asked what happens if
+-- you give one to a delegate rather than to yourself: a grant on the install
+-- subject is read by the ordinary predicate, so "may roll a rebuilt tool into
+-- this app" also handed out general write on the install. One table carrying
+-- two meanings, which is the trap this design has fallen into four times.
+--
+-- Nothing here is consulted by access_decision(). Holding an install authority
+-- confers no visibility whatsoever, and there is a test that says so.
+-- ---------------------------------------------------------------------------
+CREATE TABLE install_authorities (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    install_id  uuid NOT NULL,
+
+    -- Who holds it. A principal, never an actor: an AI does not hold authority
+    -- of its own, it acts for one that does.
+    holder_kind text NOT NULL CHECK (holder_kind IN ('user', 'org')),
+    holder_id   uuid NOT NULL REFERENCES actors (id) ON DELETE CASCADE,
+
+    -- What it permits, unattended. One value today; the column exists so that
+    -- adding "may uninstall" later is a value rather than a second table.
+    capability  text NOT NULL CHECK (capability IN ('activate')),
+
+    -- Always a human. Without this the rule is decorative: an AI acting for the
+    -- install's owner would simply mint its own and promote its own output.
+    granted_by_actor          uuid NOT NULL REFERENCES actors (id),
+    granted_by_principal_kind text NOT NULL CHECK (granted_by_principal_kind IN ('user', 'org')),
+    granted_by_principal_id   uuid NOT NULL REFERENCES actors (id),
+    reason      text NOT NULL DEFAULT '',
+
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    expires_at  timestamptz,
+    revoked_at  timestamptz,
+    revoked_by  uuid REFERENCES actors (id),
+
+    CONSTRAINT install_authorities_revocation_is_attributed
+        CHECK ((revoked_at IS NULL) = (revoked_by IS NULL)),
+    UNIQUE (install_id, holder_kind, holder_id, capability)
+);
+
+CREATE INDEX install_authorities_live_idx
+    ON install_authorities (install_id, holder_kind, holder_id)
+    WHERE revoked_at IS NULL;
+
 CREATE TABLE installs (
     id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     build_id           uuid NOT NULL REFERENCES app_builds (id),
@@ -578,10 +626,10 @@ CREATE TABLE installs (
     installed_by_actor uuid NOT NULL REFERENCES actors (id),
 
     -- Exactly one of these authorises an active install: a human principal, or
-    -- a standing write grant on this install (which is how an unattended
-    -- rebuild rolls a new build into an app a human already stood up).
-    activated_by_actor  uuid REFERENCES actors (id),
-    activation_grant_id uuid REFERENCES grants (id) ON DELETE RESTRICT,
+    -- a standing authority on this install (which is how an unattended rebuild
+    -- rolls a new build into an app a human already stood up).
+    activated_by_actor      uuid REFERENCES actors (id),
+    activation_authority_id uuid REFERENCES install_authorities (id) ON DELETE RESTRICT,
 
     schema_name        text NOT NULL UNIQUE,
     state              text NOT NULL CHECK (state IN ('active', 'disabled', 'uninstalling')),
@@ -590,7 +638,7 @@ CREATE TABLE installs (
     CONSTRAINT installs_active_is_authorised
         CHECK (state <> 'active'
                OR activated_by_actor IS NOT NULL
-               OR activation_grant_id IS NOT NULL),
+               OR activation_authority_id IS NOT NULL),
 
     UNIQUE (slug, owner_kind, owner_id)
 );
@@ -621,34 +669,98 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    -- The standing grant is scoped to this one install, which is what "scoped
-    -- to one specific app" buys: it cannot promote a build into anything else.
-    --
-    -- It must have been written by a HUMAN. Without that clause the rule is
-    -- decorative: an AI acting for the install's owner already reads 'owner' on
-    -- the row, so it could mint its own standing grant and promote its own
-    -- output. The human-issued grant is the standing decision D19.4 asks for.
+    -- The standing authority is scoped to this one install, which is what
+    -- "scoped to one specific app" buys: it cannot promote a build into
+    -- anything else, and it grants no visibility into anything at all.
     IF NOT EXISTS (
-        SELECT 1 FROM grants g
-          JOIN actors a ON a.id = g.granted_by_actor AND a.kind = 'human'
-         WHERE g.id = NEW.activation_grant_id
-           AND g.subject_kind = 'install'
-           AND g.subject_id = NEW.id
-           AND g.access = 'write'
-           AND g.source <> 'override'
-           AND g.revoked_at IS NULL
-           AND (g.expires_at IS NULL OR g.expires_at > now())
+        SELECT 1 FROM install_authorities ia
+         WHERE ia.id = NEW.activation_authority_id
+           AND ia.install_id = NEW.id
+           AND ia.capability = 'activate'
+           AND ia.revoked_at IS NULL
+           AND (ia.expires_at IS NULL OR ia.expires_at > now())
     ) THEN
-        RAISE EXCEPTION 'install %: activation grant % is not a live write grant on this install',
-            NEW.id, NEW.activation_grant_id;
+        RAISE EXCEPTION 'install %: authority % is not a live activate authority on this install',
+            NEW.id, NEW.activation_authority_id;
     END IF;
     RETURN NEW;
 END;
 $$;
 
 CREATE TRIGGER installs_activation_check
-    AFTER INSERT OR UPDATE OF state, activated_by_actor, activation_grant_id ON installs
+    AFTER INSERT OR UPDATE OF state, activated_by_actor, activation_authority_id ON installs
     FOR EACH ROW EXECUTE FUNCTION installs_activation_policy();
+
+-- install_authorities.install_id could not carry its foreign key at creation
+-- time, because installs did not exist yet. It does now.
+ALTER TABLE install_authorities
+    ADD CONSTRAINT install_authorities_install_fk
+    FOREIGN KEY (install_id) REFERENCES installs (id) ON DELETE CASCADE;
+
+-- Who may write one. The same shape as the grant issue policy, for the same
+-- reason: it has to hold for every writer that reaches this schema, not only
+-- for the ones that remember to call a service.
+CREATE FUNCTION install_authorities_issue_check() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    o_kind text;
+    o_id   uuid;
+BEGIN
+    IF (SELECT kind FROM actors WHERE id = NEW.granted_by_actor) <> 'human' THEN
+        RAISE EXCEPTION
+            'install authority %: only a human may delegate unattended activation (D19.4)', NEW.id;
+    END IF;
+
+    SELECT owner_kind, owner_id INTO o_kind, o_id FROM installs WHERE id = NEW.install_id;
+    IF o_kind IS NULL THEN
+        RAISE EXCEPTION 'install authority %: install % does not exist', NEW.id, NEW.install_id;
+    END IF;
+
+    -- Only the owning principal delegates authority over its own install, and
+    -- the granting actor has to actually be bound to that principal.
+    IF o_kind IS DISTINCT FROM NEW.granted_by_principal_kind
+       OR o_id IS DISTINCT FROM NEW.granted_by_principal_id THEN
+        RAISE EXCEPTION
+            'install authority %: only the owning principal may delegate on this install', NEW.id;
+    END IF;
+    IF acting_kind(NEW.granted_by_actor, NEW.granted_by_principal_kind,
+                   NEW.granted_by_principal_id) IS NULL THEN
+        RAISE EXCEPTION 'install authority %: granting actor is not bound to that principal', NEW.id;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER install_authorities_issue_policy
+    AFTER INSERT ON install_authorities
+    FOR EACH ROW EXECUTE FUNCTION install_authorities_issue_check();
+
+-- Immutable except for revocation, for the same reason grants are: without it,
+-- UPDATE walks around every rule above.
+CREATE FUNCTION install_authorities_are_immutable() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.id IS DISTINCT FROM OLD.id
+       OR NEW.install_id IS DISTINCT FROM OLD.install_id
+       OR NEW.holder_kind IS DISTINCT FROM OLD.holder_kind
+       OR NEW.holder_id IS DISTINCT FROM OLD.holder_id
+       OR NEW.capability IS DISTINCT FROM OLD.capability
+       OR NEW.granted_by_actor IS DISTINCT FROM OLD.granted_by_actor
+       OR NEW.granted_by_principal_kind IS DISTINCT FROM OLD.granted_by_principal_kind
+       OR NEW.granted_by_principal_id IS DISTINCT FROM OLD.granted_by_principal_id
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+       OR NEW.expires_at IS DISTINCT FROM OLD.expires_at THEN
+        RAISE EXCEPTION
+            'an install authority is immutable except for revoked_at and revoked_by';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER install_authorities_immutability
+    BEFORE UPDATE ON install_authorities
+    FOR EACH ROW EXECUTE FUNCTION install_authorities_are_immutable();
 
 -- What is waiting on a human, with everything needed to decide. Promotion is
 -- meant to be informed rather than a rubber stamp, so the facts live here and
@@ -1545,3 +1657,71 @@ $fn$;
 CREATE TRIGGER grants_immutability
     BEFORE UPDATE ON grants
     FOR EACH ROW EXECUTE FUNCTION grants_are_immutable_except_revocation();
+
+-- Unsharing, with the irreversible half behind explicit intent.
+--
+-- Two different operations wear one name, and conflating them was a bug:
+--
+--   * An INHERITED row is tombstoned. The tombstone keeps its slot in
+--     grants_identity_uq, which is what stops the materializer resurrecting a
+--     deliberately narrowed child on the next write. Reversible: re-share the
+--     parent and it re-materializes.
+--   * A DIRECT row is DELETED. Tombstoning one would occupy the exact slot a
+--     re-share needs, so "unshare then share again" would dead-end. Deleting is
+--     irreversible, and it cascades to every child that inherited from it.
+--
+-- So a caller who did not think about the difference gets an error rather than
+-- a silent deletion. p_delete_direct is the caller saying it meant the second
+-- one. Attention is not a safety mechanism; intent is.
+--
+-- One statement, so the refusal and the writes cannot interleave with another
+-- transaction between the check and the act.
+CREATE FUNCTION unshare(
+    p_subject_kind  text,
+    p_subject_id    uuid,
+    p_subject_name  text,
+    p_target_kind   text,
+    p_target_id     uuid,
+    p_by            uuid,
+    p_delete_direct boolean
+) RETURNS TABLE (tombstoned bigint, deleted bigint)
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    directs bigint;
+BEGIN
+    SELECT count(*) INTO directs FROM grants g
+     WHERE g.subject_kind = p_subject_kind AND g.subject_id = p_subject_id
+       AND g.subject_name IS NOT DISTINCT FROM p_subject_name
+       AND g.target_kind = p_target_kind AND g.target_id = p_target_id
+       AND g.source = 'direct' AND g.revoked_at IS NULL;
+
+    IF directs > 0 AND NOT p_delete_direct THEN
+        RAISE EXCEPTION
+            'unshare would delete % directly-issued grant(s), which cannot be undone; '
+            'say so explicitly or narrow only the inherited ones', directs
+            USING ERRCODE = 'raise_exception';
+    END IF;
+
+    WITH narrowed AS (
+        UPDATE grants g
+           SET revoked_at = now(), revoked_by = p_by
+         WHERE g.subject_kind = p_subject_kind AND g.subject_id = p_subject_id
+           AND g.subject_name IS NOT DISTINCT FROM p_subject_name
+           AND g.target_kind = p_target_kind AND g.target_id = p_target_id
+           AND g.source = 'inherited' AND g.revoked_at IS NULL
+        RETURNING 1
+    ), removed AS (
+        DELETE FROM grants g
+         WHERE g.subject_kind = p_subject_kind AND g.subject_id = p_subject_id
+           AND g.subject_name IS NOT DISTINCT FROM p_subject_name
+           AND g.target_kind = p_target_kind AND g.target_id = p_target_id
+           AND g.source = 'direct' AND g.revoked_at IS NULL
+           AND p_delete_direct
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM narrowed), (SELECT count(*) FROM removed)
+      INTO tombstoned, deleted;
+
+    RETURN NEXT;
+END;
+$fn$;

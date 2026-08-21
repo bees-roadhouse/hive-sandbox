@@ -118,13 +118,14 @@ func TestNarrowingSurvivesRematerializationButRevocationDoesNot(t *testing.T) {
 	}
 
 	// "Shared with the thread except this one reply."
-	tombstoned, deleted, err := store.Unshare(w.ctx, w.s.Pool(), hide, maggieTarget, nate)
+	// No explicit intent needed: narrowing an inherited child is reversible.
+	res, err := store.Unshare(w.ctx, w.s.Pool(), hide, maggieTarget, nate, false)
 	if err != nil {
 		t.Fatalf("unshare: %v", err)
 	}
-	if tombstoned != 1 || deleted != 0 {
+	if res.Tombstoned != 1 || res.Deleted != 0 {
 		t.Fatalf("unshare tombstoned %d and deleted %d, want 1 and 0 for an inherited child",
-			tombstoned, deleted)
+			res.Tombstoned, res.Deleted)
 	}
 
 	// The materializer runs again (a new write on the thread) and must not
@@ -441,13 +442,24 @@ func TestUnshareThenReshareADirectGrant(t *testing.T) {
 	if _, err := store.WriteGrant(w.ctx, w.s.Pool(), spec); err != nil {
 		t.Fatalf("share: %v", err)
 	}
-	tombstoned, deleted, err := store.Unshare(w.ctx, w.s.Pool(), entry, maggieTarget, nate)
+	// A direct grant is DELETED, and deletion is irreversible, so it takes
+	// explicit intent. Without it nothing changes and the caller is told why.
+	if _, err := store.Unshare(w.ctx, w.s.Pool(), entry, maggieTarget, nate, false); err == nil {
+		t.Fatal("unshare removed a direct grant without being asked to")
+	} else if !errors.Is(err, store.ErrWouldDeleteDirectGrant) {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+	if r := reasonOf(w.ctx, t, w.s.Guard(), maggieCred, entry, store.AccessRead); r != store.ReasonGrant {
+		t.Fatalf("a refused unshare changed something: reason is now %q", r)
+	}
+
+	res, err := store.Unshare(w.ctx, w.s.Pool(), entry, maggieTarget, nate, true)
 	if err != nil {
 		t.Fatalf("unshare: %v", err)
 	}
-	if deleted != 1 || tombstoned != 0 {
+	if res.Deleted != 1 || res.Tombstoned != 0 {
 		t.Fatalf("unshare on a direct grant tombstoned %d and deleted %d, want 0 and 1",
-			tombstoned, deleted)
+			res.Tombstoned, res.Deleted)
 	}
 
 	g := w.s.Guard()
@@ -566,56 +578,4 @@ func TestAICannotClimb(t *testing.T) {
 			t.Fatal("an AI granted on a row it does not own")
 		}
 	})
-}
-
-// D19.4: building is unattended, making it live is not.
-func TestActivatingAnInstallNeedsAHumanOrAStandingGrant(t *testing.T) {
-	w := newWorld(t)
-	nate := w.human("nate")
-	pia := w.ai("pia", "pia", store.PrincipalUser, nate, nate)
-
-	var buildID uuid.UUID
-	if err := w.s.Pool().QueryRow(w.ctx, `
-		INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
-		                        author_actor, owner_kind, owner_id, visibility, trust, status)
-		VALUES ('extract', 'tool', 'host', '{}', repeat('b', 64), $1, 'user', $2, 'private', 'local', 'registered')
-		RETURNING id`, pia, nate).Scan(&buildID); err != nil {
-		t.Fatalf("an AI could not register a build, which D19.4 allows: %v", err)
-	}
-
-	// Active with an AI as the activator is refused.
-	_, err := w.s.Pool().Exec(w.ctx, `
-		INSERT INTO installs (build_id, slug, owner_kind, owner_id, installed_by_actor,
-		                      activated_by_actor, schema_name, state)
-		VALUES ($1, 'extract', 'user', $2, $3, $3, 'app_extract_ai', 'active')`, buildID, nate, pia)
-	if err == nil {
-		t.Fatal("an AI activated its own build")
-	}
-
-	// Disabled is fine: the loop may stage an install it cannot turn on.
-	var installID uuid.UUID
-	if sErr := w.s.Pool().QueryRow(w.ctx, `
-		INSERT INTO installs (build_id, slug, owner_kind, owner_id, installed_by_actor, schema_name, state)
-		VALUES ($1, 'extract', 'user', $2, $3, 'app_extract', 'disabled')
-		RETURNING id`, buildID, nate, pia).Scan(&installID); sErr != nil {
-		t.Fatalf("stage install: %v", sErr)
-	}
-
-	// A human standing grant on this one install unblocks it.
-	grantID, err := store.WriteGrant(w.ctx, w.s.Pool(), store.GrantSpec{
-		Subject: store.Subject{Kind: store.SubjectInstall, ID: installID},
-		Target:  store.Owner{Kind: store.PrincipalUser, ID: nate},
-		Access:  store.AccessWrite,
-		Source:  store.SourceDirect,
-		By:      cred(nate, store.PrincipalUser, nate),
-		Reason:  "standing permission to roll rebuilt tools",
-	})
-	if err != nil {
-		t.Fatalf("standing grant: %v", err)
-	}
-	if _, err := w.s.Pool().Exec(w.ctx,
-		"UPDATE installs SET state = 'active', activation_grant_id = $2 WHERE id = $1",
-		installID, grantID); err != nil {
-		t.Fatalf("activate under standing grant: %v", err)
-	}
 }

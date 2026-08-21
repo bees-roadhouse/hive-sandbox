@@ -765,6 +765,26 @@ CREATE TRIGGER install_authorities_immutability
 -- What is waiting on a human, with everything needed to decide. Promotion is
 -- meant to be informed rather than a rubber stamp, so the facts live here and
 -- not in whatever the first UI happens to join together.
+-- D25: promotion IS the capability decision, so the promotion surface has to
+-- show capabilities.
+--
+-- There is no per-capability grant and there deliberately is not going to be
+-- one: capabilities are content-addressed with the build, so "install it but
+-- deny egress" yields an app that does not work as built, and the granularity
+-- people actually want is finer and already exists elsewhere (the egress
+-- allowlist rather than the egress capability, the agent budget rather than the
+-- agent_run capability). Declaring is granting, at install granularity.
+--
+-- Which puts the whole weight on this view. Sorted and deduplicated so that a
+-- reordered manifest is not mistaken for a change ... jsonb array equality is
+-- order-sensitive, and a false "capabilities changed" trains people to click
+-- through the true one.
+CREATE FUNCTION capability_set(m jsonb) RETURNS jsonb
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT coalesce(jsonb_agg(DISTINCT c ORDER BY c), '[]'::jsonb)
+      FROM jsonb_array_elements_text(coalesce(m -> 'capabilities', '[]'::jsonb)) AS c;
+$$;
+
 CREATE VIEW builds_awaiting_promotion AS
 SELECT b.id            AS build_id,
        b.slug,
@@ -787,12 +807,34 @@ SELECT b.id            AS build_id,
        -- decision is "replace this with that" rather than "approve a hash".
        i.id            AS current_install_id,
        i.build_id      AS current_build_id,
-       i.state         AS current_install_state
+       i.state         AS current_install_state,
+
+       -- What this build is asking for, and what is live now (D25).
+       capability_set(b.manifest)  AS capabilities,
+       capability_set(cb.manifest) AS current_capabilities,
+
+       -- The one that matters. A build whose capabilities differ from the live
+       -- install is a CHANGE, not an equivalent promotion, and the risk is an
+       -- app that has never had egress gaining it in v2 and being promoted as
+       -- routine. Null for a first install, where there is nothing to compare
+       -- against and every capability is new by definition.
+       CASE WHEN i.build_id IS NULL THEN NULL
+            ELSE capability_set(b.manifest) IS DISTINCT FROM capability_set(cb.manifest)
+       END AS capability_change,
+
+       -- Capabilities this build gains over the live one, so the reviewer reads
+       -- the delta rather than diffing two arrays by eye.
+       CASE WHEN i.build_id IS NULL THEN NULL
+            ELSE (SELECT coalesce(jsonb_agg(c ORDER BY c), '[]'::jsonb)
+                    FROM jsonb_array_elements_text(capability_set(b.manifest)) AS c
+                   WHERE NOT capability_set(cb.manifest) ? c)
+       END AS capabilities_gained
   FROM app_builds b
   LEFT JOIN installs i
          ON i.slug = b.slug
         AND i.owner_kind = b.owner_kind
         AND i.owner_id = b.owner_id
+  LEFT JOIN app_builds cb ON cb.id = i.build_id
  WHERE b.status = 'registered'
    AND (i.build_id IS NULL OR i.build_id <> b.id);
 

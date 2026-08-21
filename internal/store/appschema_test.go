@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -142,6 +143,167 @@ func TestApplySchemaPlanProvisionsCollections(t *testing.T) {
 	// btree + gin + fts + owner + the primary key.
 	if indexes < 5 {
 		t.Errorf("entries has %d indexes, want at least 5", indexes)
+	}
+}
+
+// Augie's finding 1, landed as a reproduction before the fix.
+//
+// checkIdent bounds the identifiers it is GIVEN at 63. Nothing bounded the ones
+// this file DERIVES from them: `<collection>_owner_idx` is ten characters
+// longer, and nameRE permitted a 63-character collection. Postgres truncates an
+// over-long identifier to 63 rather than rejecting it, so the derived name
+// collapses onto the collection name, which the table already occupies in
+// pg_class ... and IF NOT EXISTS turns that collision into a NOTICE. pgx does
+// not surface NOTICEs, so every CREATE INDEX reported success and
+// ApplySchemaPlan returned nil having created not one index.
+//
+// The owner index is the one that matters, and its own comment says why: every
+// grant-filtered read starts from the owner pair. On a long-named collection it
+// was not indexed at all, which is a sequential scan on the security-critical
+// read path, reported as a successful install.
+func TestLongCollectionNameStillGetsItsIndexes(t *testing.T) {
+	pool := testdb.Pool(t)
+	ctx := t.Context()
+
+	// The longest name Validate accepts. If the cap moves, this fails inside
+	// planFor and says so rather than testing something else.
+	long := "c" + strings.Repeat("x", manifest.MaxCollectionName()-1)
+	plan := planFor(t, uniqueApp(t),
+		manifest.Collection{Name: long, Indexes: []string{"btree(entry_date)"}})
+	if err := apply(t, pool, plan); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	rows, err := pool.Query(ctx,
+		`SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = $2`,
+		plan.Schema, long)
+	if err != nil {
+		t.Fatalf("list indexes: %v", err)
+	}
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		names = append(names, n)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+
+	// Primary key, owner index, and the declared btree.
+	if len(names) < 3 {
+		t.Errorf("collection %q has indexes %v; the install reported success with fewer than three",
+			long, names)
+	}
+	var hasOwner bool
+	for _, n := range names {
+		if strings.Contains(n, "owner") {
+			hasOwner = true
+		}
+	}
+	if !hasOwner {
+		t.Errorf("no owner index on %q, so every grant-filtered read on it is a sequential scan. Got %v",
+			long, names)
+	}
+}
+
+// The applier refuses rather than truncates, even if a caller skipped Validate.
+// Two independent reasons again: the manifest caps the name, and this catches a
+// derived name that would not fit anyway.
+func TestDerivedIndexNameIsRefusedRatherThanTruncated(t *testing.T) {
+	pool := testdb.Pool(t)
+	ctx := t.Context()
+
+	plan := manifest.SchemaPlan{
+		Schema: "app_" + uniqueApp(t),
+		// 63 characters: a legal identifier on its own, too long once suffixed.
+		Collections: []manifest.CollectionPlan{{Name: "c" + strings.Repeat("x", 62)}},
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := store.ApplySchemaPlan(ctx, tx, plan); !errors.Is(err, store.ErrUnsafeIdentifier) {
+		t.Fatalf("err = %v, want ErrUnsafeIdentifier; a truncating name was accepted", err)
+	}
+}
+
+// updated_at is maintained by a trigger, so a writer cannot forget it.
+//
+// This is the test Megan asked for, and it asserts the property rather than the
+// convention: an UPDATE that says nothing about updated_at still moves it. The
+// trigger is correct here specifically because now() is a clock read rather
+// than a fact the writer supplies, which is the distinction D21 is about.
+func TestUpdatedAtIsMaintainedWithoutTheWriter(t *testing.T) {
+	pool := testdb.Pool(t)
+	ctx := t.Context()
+	plan := planFor(t, uniqueApp(t), manifest.Collection{Name: "entries"})
+	if err := apply(t, pool, plan); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	table := pgx.Identifier{plan.Schema, "entries"}.Sanitize()
+
+	var id string
+	var created, firstUpdated time.Time
+	if err := pool.QueryRow(ctx, `INSERT INTO `+table+`
+		(owner_kind, owner_id, author_actor, doc)
+		VALUES ('user', gen_random_uuid(), gen_random_uuid(), '{"a":1}')
+		RETURNING id, created_at, updated_at`,
+	).Scan(&id, &created, &firstUpdated); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	// A writer that touches only doc, exactly as a forgetful one would.
+	var secondUpdated time.Time
+	if err := pool.QueryRow(ctx,
+		`UPDATE `+table+` SET doc = '{"a":2}' WHERE id = $1 RETURNING updated_at`, id,
+	).Scan(&secondUpdated); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if !secondUpdated.After(firstUpdated) {
+		t.Errorf("updated_at did not move on an update that ignored it: %s -> %s",
+			firstUpdated, secondUpdated)
+	}
+
+	// created_at stays put, or the column means nothing.
+	var afterCreated time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT created_at FROM `+table+` WHERE id = $1`, id).Scan(&afterCreated); err != nil {
+		t.Fatalf("reselect: %v", err)
+	}
+	if !afterCreated.Equal(created) {
+		t.Errorf("created_at moved: %s -> %s", created, afterCreated)
+	}
+}
+
+// The trigger function lives in the app's own schema, so uninstall stays one
+// statement and no app's triggers depend on an object outside their blast
+// radius.
+func TestTouchFunctionLivesInTheAppSchema(t *testing.T) {
+	pool := testdb.Pool(t)
+	plan := planFor(t, uniqueApp(t), manifest.Collection{Name: "entries"})
+	if err := apply(t, pool, plan); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	var exists bool
+	if err := pool.QueryRow(t.Context(), `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_proc p
+			JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = $1 AND p.proname = 'set_updated_at')`,
+		plan.Schema,
+	).Scan(&exists); err != nil {
+		t.Fatalf("check function: %v", err)
+	}
+	if !exists {
+		t.Errorf("set_updated_at is not in %s", plan.Schema)
 	}
 }
 

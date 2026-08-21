@@ -54,6 +54,12 @@ func ApplySchemaPlan(ctx context.Context, tx pgx.Tx, plan manifest.SchemaPlan) e
 		return fmt.Errorf("create schema %s: %w", plan.Schema, err)
 	}
 
+	if len(plan.Collections) > 0 {
+		if err := applyTouchFunction(ctx, tx, schema); err != nil {
+			return err
+		}
+	}
+
 	for _, c := range plan.Collections {
 		if err := applyCollection(ctx, tx, plan.Schema, c); err != nil {
 			return err
@@ -74,6 +80,27 @@ func DropSchemaPlan(ctx context.Context, tx pgx.Tx, plan manifest.SchemaPlan) er
 	return nil
 }
 
+// applyTouchFunction installs the updated_at trigger function into the app's
+// own schema.
+//
+// Per-app rather than platform-wide so that DROP SCHEMA CASCADE remains the
+// whole of uninstall (D3.2). A shared function would make every app's triggers
+// depend on an object outside their blast radius, which is the same dependency
+// inversion that keeps foreign keys to `actors` out of these tables.
+func applyTouchFunction(ctx context.Context, tx pgx.Tx, quotedSchema string) error {
+	_, err := tx.Exec(ctx, `CREATE OR REPLACE FUNCTION `+quotedSchema+`.set_updated_at()
+		RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.updated_at = now();
+			RETURN NEW;
+		END;
+		$$`)
+	if err != nil {
+		return fmt.Errorf("create set_updated_at in %s: %w", quotedSchema, err)
+	}
+	return nil
+}
+
 // applyCollection creates one collection's table and indexes.
 //
 // The table shape is the same for every collection and is not the app's to
@@ -88,7 +115,7 @@ func applyCollection(ctx context.Context, tx pgx.Tx, schema string, c manifest.C
 
 	// trust travels with the row, not with the bytes in it (invariant 3), and
 	// it defaults trusted to match every other content table in migration one.
-	_, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+table+` (
+	if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+table+` (
 		id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
 		owner_kind  text NOT NULL CHECK (owner_kind IN ('user', 'org')),
 		owner_id    uuid NOT NULL,
@@ -98,17 +125,47 @@ func applyCollection(ctx context.Context, tx pgx.Tx, schema string, c manifest.C
 		tainted_by  text,
 		created_at  timestamptz NOT NULL DEFAULT now(),
 		updated_at  timestamptz NOT NULL DEFAULT now()
-	)`)
-	if err != nil {
+	)`); err != nil {
 		return fmt.Errorf("create table %s.%s: %w", schema, c.Name, err)
 	}
 
 	// Every grant-filtered read starts from the owner pair, so it is indexed
 	// unconditionally rather than left to an app to remember.
-	ownerIdx := quoteIdent(c.Name + "_owner_idx")
+	ownerIdx, nameErr := derivedIdent(c.Name, "_owner_idx")
+	if nameErr != nil {
+		return nameErr
+	}
 	if _, err := tx.Exec(ctx,
 		"CREATE INDEX IF NOT EXISTS "+ownerIdx+" ON "+table+" (owner_kind, owner_id)"); err != nil {
 		return fmt.Errorf("create owner index on %s.%s: %w", schema, c.Name, err)
+	}
+
+	// updated_at IS maintained by a trigger, and this is the one place the
+	// project's usual "no triggers" instinct does not apply.
+	//
+	// That instinct comes from D21: a trigger cannot enforce what the writer
+	// supplies, because a trigger has no credential in scope. Every rule about
+	// WHO did something needs a Go writer that pins the value from the
+	// credential. Entirely correct, and it says nothing about this column,
+	// because `now()` is not a fact the writer supplies ... it is a clock read,
+	// identical whoever is asking.
+	//
+	// Leaving it to writers had one failure mode and Megan named it before it
+	// happened: a column that is right in the code one person wrote and wrong
+	// in the code the next person writes. A column that is sometimes maintained
+	// is worse than one that always is, so it always is.
+	trigger, triggerErr := derivedIdent(c.Name, "_touch")
+	if triggerErr != nil {
+		return triggerErr
+	}
+	if _, err := tx.Exec(ctx,
+		"DROP TRIGGER IF EXISTS "+trigger+" ON "+table); err != nil {
+		return fmt.Errorf("drop touch trigger on %s.%s: %w", schema, c.Name, err)
+	}
+	if _, err := tx.Exec(ctx,
+		"CREATE TRIGGER "+trigger+" BEFORE UPDATE ON "+table+
+			" FOR EACH ROW EXECUTE FUNCTION "+quoteIdent(schema)+".set_updated_at()"); err != nil {
+		return fmt.Errorf("create touch trigger on %s.%s: %w", schema, c.Name, err)
 	}
 
 	for i, idx := range c.Indexes {
@@ -131,7 +188,10 @@ func applyIndex(
 	// The index name is derived rather than taken from the manifest, so two
 	// apps cannot argue about it and an app cannot name one after something
 	// that already exists.
-	name := quoteIdent(fmt.Sprintf("%s_%s_%d_idx", collection, idx.Method, ordinal))
+	name, err := derivedIdent(collection, fmt.Sprintf("_%s_%d_idx", idx.Method, ordinal))
+	if err != nil {
+		return err
+	}
 
 	var stmt string
 	switch idx.Method {
@@ -147,11 +207,18 @@ func applyIndex(
 		stmt = "CREATE INDEX IF NOT EXISTS " + name + " ON " + table +
 			" USING gin (to_tsvector('english', " + expr + "))"
 	case manifest.IndexVector:
-		// Vector wants a typed column rather than a jsonb expression, and
-		// choosing between ivfflat and hnsw is a decision with real tradeoffs
-		// that nobody has made. Refused loudly rather than half-built: a
-		// silently skipped index is a query plan that quietly falls back to a
-		// sequential scan over someone's whole memory.
+		// Vector wants a typed column rather than a jsonb expression. Refused
+		// loudly rather than half-built: a silently skipped index is a query
+		// plan that quietly falls back to a sequential scan over someone's
+		// whole memory, discovered months later as "search got slow".
+		//
+		// The index method is Megan's call when she builds search, and her
+		// provisional answer is hnsw, on the access pattern rather than a
+		// benchmark: ivfflat needs training data to build a useful index and
+		// degrades as the corpus outgrows what it was trained on, which is
+		// exactly the shape of a journal that starts empty and grows forever.
+		// hnsw costs more to build and does not care. Recorded here so the
+		// reasoning survives to whoever fills this branch in.
 		return fmt.Errorf("%w: vector indexes need a typed column and an index method "+
 			"nobody has chosen yet (%s.%s: %s)",
 			errNotImplemented, schema, collection, idx)
@@ -230,6 +297,31 @@ func checkIdent(s string) error {
 	}
 	return nil
 }
+
+// derivedIdent builds an identifier the platform derives from a manifest name,
+// and REFUSES one that would not fit rather than letting Postgres truncate it.
+//
+// Truncation is the dangerous half. An over-long index name collapses onto the
+// collection name, which the table already occupies in pg_class, and the
+// IF NOT EXISTS that makes re-apply idempotent turns that collision into a
+// NOTICE. pgx does not surface NOTICEs, so the statement reports success and
+// the index does not exist. manifest.Validate bounds these names already; this
+// is the check at the point of use, for the caller that skipped it.
+func derivedIdent(base, suffix string) (string, error) {
+	if err := checkIdent(base); err != nil {
+		return "", err
+	}
+	name := base + suffix
+	if len(name) > maxIdentifier {
+		return "", fmt.Errorf(
+			"%w: %q is %d characters and Postgres truncates at %d, which would silently "+
+				"collide with an existing object", ErrUnsafeIdentifier, name, len(name), maxIdentifier)
+	}
+	return quoteIdent(name), nil
+}
+
+// maxIdentifier is Postgres's limit, and the reason derivedIdent exists.
+const maxIdentifier = 63
 
 // quoteIdent double-quotes an identifier. Everything reaching it has already
 // passed checkIdent, so the doubling is belt on brace.

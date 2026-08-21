@@ -1,7 +1,12 @@
 package manifest
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"path"
 	"strings"
 	"testing"
 )
@@ -227,6 +232,79 @@ func TestValidateRejectsBadRoutes(t *testing.T) {
 	}
 }
 
+// Augie's finding 2. These validated cleanly and then panicked http.ServeMux at
+// mount, which is a trap for a consumer that does not exist yet.
+func TestValidateRejectsPatternsServeMuxPanicsOn(t *testing.T) {
+	for _, bad := range []string{
+		"/a{b",       // unterminated
+		"/{id}/{id}", // repeated wildcard name
+		"//double",   // empty segment
+		"/./dot",     // relative segment
+		"/a{b}",      // wildcard is not the whole segment
+		"/{}",        // empty wildcard name
+		"/{Id}",      // unusable wildcard name
+		"/x}y",       // unmatched brace
+		"/{id...}",   // matches everything below it
+		"/{a}{b}",    // two wildcards in one segment
+	} {
+		m := journalish()
+		m.Routes = append(m.Routes, RouteDef{Method: "GET", Path: bad, Function: "search"})
+		if err := m.Validate(); !errors.Is(err, ErrRoute) {
+			t.Errorf("path %q: err = %v, want ErrRoute", bad, err)
+		}
+	}
+}
+
+// The other half, and the one that keeps the rule honest: everything Validate
+// ACCEPTS must actually mount. Asserted against a real ServeMux, because the
+// failure mode is a panic and a hand-written expectation would drift from Go's
+// grammar the first time it changes.
+func TestAcceptedRoutesMountWithoutPanicking(t *testing.T) {
+	good := []string{
+		"/entries", "/entries/{id}", "/a/b/c", "/{id}", "/search",
+		"/entries/{id}/replies/{reply}", "/trailing/",
+	}
+	m := journalish()
+	m.Routes = nil
+	for _, p := range good {
+		m.Routes = append(m.Routes, RouteDef{Method: "GET", Path: p, Function: "search"})
+	}
+	if err := m.Validate(); err != nil {
+		t.Fatalf("a mountable route was rejected: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	for _, r := range m.Derive().Routes {
+		pattern := r.Method + " " + FullPath("journal", r)
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					t.Errorf("Validate accepted %q and ServeMux panicked: %v", pattern, p)
+				}
+			}()
+			mux.HandleFunc(pattern, func(http.ResponseWriter, *http.Request) {})
+		}()
+	}
+}
+
+// Refused on one surface and silently resolved on the other was the whole of
+// finding 3: routes had no duplicate check, so the last declaration won and
+// which one that was depended on file order.
+func TestValidateRejectsDuplicateRoutes(t *testing.T) {
+	m := journalish()
+	m.Routes = append(m.Routes, RouteDef{Method: "POST", Path: "/entries", Function: "search"})
+	if err := m.Validate(); !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("err = %v, want ErrDuplicate", err)
+	}
+
+	// Same path, different method, is not a duplicate.
+	m = journalish()
+	m.Routes = append(m.Routes, RouteDef{Method: "DELETE", Path: "/entries", Function: "search"})
+	if err := m.Validate(); err != nil {
+		t.Fatalf("distinct methods on one path were refused: %v", err)
+	}
+}
+
 func TestValidateRejectsDuplicates(t *testing.T) {
 	m := journalish()
 	m.Functions = append(m.Functions, Function{Name: "search"})
@@ -236,25 +314,75 @@ func TestValidateRejectsDuplicates(t *testing.T) {
 }
 
 // The registry content-addresses what it installs, so two derivations of the
-// same manifest have to be identical. Map iteration order would otherwise make
-// that untrue in a way that only shows up occasionally.
+// same manifest have to be identical.
+//
+// The first version of this test compared tool names and route paths and
+// NOTHING ELSE, while its comment claimed byte-identity ... so InputSchema,
+// Capabilities, Impl, Function, Collection and Op were all unasserted, over a
+// fixture of two collections and two tools that map iteration order could never
+// have destabilised anyway. It would have passed against a Derive that shuffled
+// every schema.
+//
+// So: marshal the whole Surface and compare bytes, over a corpus big enough for
+// the failure it names to be possible.
 func TestDeriveIsDeterministic(t *testing.T) {
-	first := journalish().Derive()
-	for i := 0; i < 20; i++ {
-		next := journalish().Derive()
-		if len(next.Tools) != len(first.Tools) || len(next.Routes) != len(first.Routes) {
-			t.Fatalf("derivation %d differs in length", i)
+	build := func() *Manifest {
+		m := &Manifest{Kind: KindApp, Name: "big", Version: 1}
+		for i := 0; i < 40; i++ {
+			name := fmt.Sprintf("c%02d", i)
+			m.Storage.Collections = append(m.Storage.Collections, Collection{
+				Name: name, CRUD: true,
+				Indexes: []string{
+					fmt.Sprintf("btree(f%02d)", i),
+					fmt.Sprintf("gin(t%02d)", i),
+				},
+			})
+			fn := fmt.Sprintf("fn%02d", i)
+			m.Functions = append(m.Functions, Function{Name: fn})
+			m.Tools = append(m.Tools, ToolDef{
+				Name: fmt.Sprintf("h%02d.run", i), Function: fn,
+				Description: "hand written",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"zeta": map[string]any{"type": "string"},
+						"beta": map[string]any{"type": "integer"},
+						"iota": map[string]any{"type": "boolean"},
+						"nu":   map[string]any{"type": "number"},
+					},
+				},
+			})
+			m.Routes = append(m.Routes, RouteDef{
+				Method: "GET", Path: "/h" + fmt.Sprintf("%02d", i), Function: fn,
+			})
+			// Declared in reverse, so CapabilityNames has real work to do.
+			m.Capabilities = append(m.Capabilities, fmt.Sprintf("cap%02d", 40-i))
 		}
-		for j := range next.Tools {
-			if next.Tools[j].Name != first.Tools[j].Name {
-				t.Fatalf("derivation %d: tool %d is %q, first run had %q",
-					i, j, next.Tools[j].Name, first.Tools[j].Name)
-			}
+		return m
+	}
+
+	if err := build().Validate(); err != nil {
+		t.Fatalf("fixture is invalid: %v", err)
+	}
+
+	// json.Marshal sorts map keys, which is what makes InputSchema comparable
+	// at all. That is also the caveat for whoever content-addresses a Surface:
+	// see the note on Surface.
+	first, err := json.Marshal(build().Derive())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if len(first) < 10000 {
+		t.Fatalf("fixture is %d bytes; too small to catch what this test claims", len(first))
+	}
+
+	for i := 0; i < 50; i++ {
+		next, err := json.Marshal(build().Derive())
+		if err != nil {
+			t.Fatalf("marshal %d: %v", i, err)
 		}
-		for j := range next.Routes {
-			if next.Routes[j].Path != first.Routes[j].Path || next.Routes[j].Method != first.Routes[j].Method {
-				t.Fatalf("derivation %d: route %d differs", i, j)
-			}
+		if !bytes.Equal(first, next) {
+			t.Fatalf("derivation %d differs from the first; the surface is not content-addressable", i)
 		}
 	}
 }
@@ -276,13 +404,54 @@ func TestToolNameRoundTrips(t *testing.T) {
 	}
 }
 
-// The host owns the mount prefix, so an app cannot collide with another install.
+// The host owns the mount prefix, so an app cannot collide with another
+// install.
+//
+// The first version iterated two benign routes and asserted a prefix, which
+// cannot fail for the reason the name gives: a route that escapes its prefix is
+// one that TRIES to, and none of them tried. These do.
 func TestMountPathIsHostOwned(t *testing.T) {
-	s := journalish().Derive()
-	for _, r := range s.Routes {
-		full := FullPath("journal", r)
-		if !strings.HasPrefix(full, "/apps/journal/") {
-			t.Errorf("route %s %s mounted at %q, outside the app's prefix", r.Method, r.Path, full)
+	// Every one of these is refused by Validate, which is the real defence. The
+	// assertion here is the second one: even handed a Route that got past it,
+	// FullPath cannot produce a path outside the app's prefix.
+	// Every one of these resolves outside the prefix if it is ever concatenated,
+	// so Validate is what has to stop them. FullPath is concatenation and is
+	// documented as not being a boundary ... this asserts the boundary is where
+	// the doc says it is.
+	for _, escape := range []string{
+		"/../other", "/..", "/../../etc", "/a/../../b", "/a/../../../root",
+	} {
+		m := journalish()
+		m.Routes = append(m.Routes, RouteDef{Method: "GET", Path: escape, Function: "search"})
+		if err := m.Validate(); !errors.Is(err, ErrRoute) {
+			t.Errorf("path %q was accepted: err = %v", escape, err)
 		}
+	}
+
+	// The composition property that does hold, and the one a mounter relies on:
+	// for every path Validate ACCEPTS, FullPath stays inside the prefix even
+	// after path.Clean resolves it.
+	accepted := []string{
+		"/entries", "/entries/{id}", "/a/b/c", "/{id}", "/trailing/", "/.hidden", "/x..y",
+	}
+	m := journalish()
+	m.Routes = nil
+	for _, p := range accepted {
+		m.Routes = append(m.Routes, RouteDef{Method: "GET", Path: p, Function: "search"})
+	}
+	if err := m.Validate(); err != nil {
+		t.Fatalf("fixture rejected: %v", err)
+	}
+	for _, r := range m.Derive().Routes {
+		full := FullPath("journal", r)
+		if !strings.HasPrefix(path.Clean(full), MountPath("journal")+"/") {
+			t.Errorf("accepted route %s resolves to %q, outside %q",
+				r.Path, path.Clean(full), MountPath("journal"))
+		}
+	}
+
+	// Two apps cannot reach each other, which is what the prefix is for.
+	if FullPath("journal", Route{Path: "/x"}) == FullPath("calendar", Route{Path: "/x"}) {
+		t.Error("two apps derived the same mount path")
 	}
 }

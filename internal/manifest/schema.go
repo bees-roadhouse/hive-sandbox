@@ -158,6 +158,55 @@ func SchemaName(app string) string { return schemaPrefix + app }
 // names narrowly was supposed to close in the first place.
 const maxAppName = maxIdentifier - len(schemaPrefix)
 
+// derivedSuffixes are every suffix the platform appends to a COLLECTION name
+// when it derives an identifier. The list is here rather than in the package
+// that builds them, because the name has to be bounded where it is validated
+// and a bound is only correct if it knows every suffix.
+//
+// This is the sibling of the maxAppName bug and it is worse, because it fails
+// silently: bounding the inputs at 63 and forgetting the derived names meant
+// `<collection>_owner_idx` truncated back onto the collection name, collided
+// with the table in pg_class, and IF NOT EXISTS reported that collision as
+// success. The install said yes and no index existed ... including the owner
+// index every grant-filtered read depends on.
+//
+// The ordinal is padded to four digits' worth of room, so an app with a
+// thousand indexes on one collection is bounded by the same arithmetic rather
+// than by luck.
+var derivedSuffixes = []string{
+	"_owner_idx",       // applyCollection
+	"_touch",           // the updated_at trigger
+	"_vector_9999_idx", // applyIndex, longest method and ordinal
+}
+
+// longestDerivedSuffix is the reservation every collection name pays.
+func longestDerivedSuffix() int {
+	longest := 0
+	for _, s := range derivedSuffixes {
+		if len(s) > longest {
+			longest = len(s)
+		}
+	}
+	return longest
+}
+
+// MaxCollectionName is the longest collection name whose derived identifiers
+// all still fit. Exported because the tests that keep this honest live in two
+// packages, and a duplicated constant would drift.
+func MaxCollectionName() int { return maxIdentifier - longestDerivedSuffix() }
+
+// MaxIdentifier is Postgres's identifier limit, exported for the same reason.
+func MaxIdentifier() int { return maxIdentifier }
+
+// DerivedSuffixes is every suffix the platform appends to a collection name.
+// Exported so a test can assert the budget covers all of them, which is what
+// makes adding a longer one fail here rather than in Postgres.
+func DerivedSuffixes() []string {
+	out := make([]string, len(derivedSuffixes))
+	copy(out, derivedSuffixes)
+	return out
+}
+
 // SchemaPlan derives storage provisioning from a validated manifest.
 //
 // A tool has no storage by construction (D10.3), so this returns a plan with no

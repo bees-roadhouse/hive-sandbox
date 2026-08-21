@@ -165,7 +165,18 @@ type Upload interface {
 	Abort(ctx context.Context) error
 }
 
-// Sealed is a published object.
+// Sealed is a published object, and evidence that whoever holds it had the
+// bytes.
+//
+// The evidence matters. A reference may be written on the strength of a Sealed
+// because sealing means the bytes passed through this process and were hashed
+// here; a bare Hash means only that someone learned a number. Those are not the
+// same fact, and a signature taking Hash cannot tell them apart.
+//
+// So Sealed carries an unexported marker that only [NewSealed] sets, which
+// means a caller outside this package cannot construct one from a hash it
+// happens to know. Drivers implemented outside this package must use
+// [NewSealed]; that is deliberate friction on the one path that grants access.
 type Sealed struct {
 	Hash Hash
 	Size int64
@@ -174,7 +185,24 @@ type Sealed struct {
 	// writes a ref: invariant 8 is that no blob exists without one, and a dedup
 	// hit is exactly the case where forgetting is easy.
 	Deduped bool
+
+	// fromSeal is set only by NewSealed. Its absence is what stops a bare hash
+	// being laundered into a reference.
+	fromSeal bool
 }
+
+// NewSealed records that bytes were sealed by a driver.
+//
+// Only call this having actually hashed the bytes. Everything above the seam
+// treats a Sealed as proof of possession, and this is the only place that proof
+// is minted.
+func NewSealed(h Hash, size int64, deduped bool) Sealed {
+	return Sealed{Hash: h, Size: size, Deduped: deduped, fromSeal: true}
+}
+
+// SealedByDriver reports whether a Sealed came from a real seal rather than
+// from a struct literal someone filled in with a hash.
+func (s Sealed) SealedByDriver() bool { return s.fromSeal }
 
 // ---- delivery ----
 

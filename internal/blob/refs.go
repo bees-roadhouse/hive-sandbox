@@ -79,6 +79,10 @@ func (c *Catalog) Publish(
 	prov Provenance,
 	spec RefSpec,
 ) (Descriptor, Ref, error) {
+	if !sealed.SealedByDriver() {
+		return Descriptor{}, Ref{}, errors.New(
+			"blob: Publish needs a Sealed from a driver; a hash alone is not evidence of possession")
+	}
 	if sealed.Hash.IsZero() {
 		return Descriptor{}, Ref{}, fmt.Errorf("%w: zero hash", ErrMalformedHash)
 	}
@@ -118,40 +122,110 @@ func (c *Catalog) Publish(
 		return Descriptor{}, Ref{}, fmt.Errorf("blob: refusing to publish over a trashed blob %s", sealed.Hash)
 	}
 
-	ref, err := insertRef(ctx, tx, sealed.Hash, spec)
+	ref, err := insertRef(ctx, tx, sealed.Hash, spec, spec.Trust.Normalize())
 	if err != nil {
 		return Descriptor{}, Ref{}, err
 	}
 	return Descriptor{Hash: sealed.Hash, Size: sealed.Size, MIME: mimeType}, ref, nil
 }
 
-// AddRef writes another reference to bytes that are already live.
+// AddRef writes another reference to bytes the caller has just sealed.
 //
 // This is the host-internal producer's entry point as much as a guest's. A
 // module, a transcript, a screenshot and a spool all come through here, because
 // a sweeper that does not know about a producer deletes that producer's output
 // (D17.5).
-func (c *Catalog) AddRef(ctx context.Context, tx pgx.Tx, h Hash, spec RefSpec) (Ref, error) {
+//
+// **It takes a Sealed, not a Hash, and that is the access control.** An earlier
+// version took a hash and checked only that the row existed globally, which
+// made a bare sha256 into a bearer token for the bytes: a stranger who learned
+// a digest could write themselves a reference and read someone else's document,
+// claim any trust level for it, and use the error to probe which hashes exist.
+// That is invariant 3 for the fifth time, in the package written to give it
+// teeth.
+//
+// Honest dedup has the caller holding the bytes. A Sealed is evidence of that
+// and a Hash is not, so the signature can now tell the two apart. To reference
+// bytes already held without re-sealing them, use [Catalog.LinkRef].
+func (c *Catalog) AddRef(ctx context.Context, tx pgx.Tx, sealed Sealed, spec RefSpec) (Ref, error) {
 	if err := spec.validate(); err != nil {
 		return Ref{}, err
 	}
+	if !sealed.SealedByDriver() {
+		return Ref{}, errors.New(
+			"blob: AddRef needs a Sealed from a driver; a hash alone is not evidence of possession")
+	}
+	if sealed.Hash.IsZero() {
+		return Ref{}, fmt.Errorf("%w: zero hash", ErrMalformedHash)
+	}
 
+	if err := requireReferenceable(ctx, tx, sealed.Hash); err != nil {
+		return Ref{}, err
+	}
+	return insertRef(ctx, tx, sealed.Hash, spec, spec.Trust.Normalize())
+}
+
+// LinkRef references bytes the caller already holds, under a new producer.
+//
+// This is the path for "attach the photo I already have to this entry": no new
+// bytes, so no Sealed, and authorization comes from an existing live reference
+// instead. A caller with no reference gets the same ErrNotFound as a hash that
+// was never stored, exactly as [Catalog.Resolve] does.
+//
+// The new reference can never be more trusted than what the caller already
+// holds. Trust rides the reference, but a caller cannot improve its own view of
+// bytes by re-describing them: that would launder untrusted content through a
+// second source kind.
+func (c *Catalog) LinkRef(
+	ctx context.Context,
+	tx pgx.Tx,
+	cred identity.Credential,
+	h Hash,
+	spec RefSpec,
+) (Ref, error) {
+	if err := spec.validate(); err != nil {
+		return Ref{}, err
+	}
+	if err := cred.Validate(); err != nil {
+		return Ref{}, err
+	}
+	// The credential authorising the link and the credential owning the new
+	// reference have to be the same principal, or this becomes a way to write
+	// references into somebody else's ownership.
+	if spec.Cred.OwnerOf() != cred.OwnerOf() {
+		return Ref{}, errors.New("blob: LinkRef cannot write a reference owned by another principal")
+	}
+
+	held, err := c.resolveTx(ctx, tx, cred, h)
+	if err != nil {
+		return Ref{}, err
+	}
+	if err := requireReferenceable(ctx, tx, h); err != nil {
+		return Ref{}, err
+	}
+
+	// Weakest of what they asked for and what they already have.
+	return insertRef(ctx, tx, h, spec, trust.Weaker(spec.Trust, held))
+}
+
+// requireReferenceable rejects bytes that are absent or deliberately deleted.
+func requireReferenceable(ctx context.Context, tx pgx.Tx, h Hash) error {
 	var state State
 	if err := tx.QueryRow(ctx, `SELECT state FROM blobs WHERE sha256 = $1`, h.String()).Scan(&state); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return Ref{}, fmt.Errorf("%w: %s", ErrNotFound, h)
+			return fmt.Errorf("%w: %s", ErrNotFound, h)
 		}
-		return Ref{}, fmt.Errorf("blob: look up %s: %w", h, err)
+		return fmt.Errorf("blob: look up %s: %w", h, err)
 	}
 	if state == StateTrashed {
-		return Ref{}, fmt.Errorf("%w: %s is trashed", ErrNotFound, h)
+		return fmt.Errorf("%w: %s is trashed", ErrNotFound, h)
 	}
-	return insertRef(ctx, tx, h, spec)
+	return nil
 }
 
-func insertRef(ctx context.Context, tx pgx.Tx, h Hash, spec RefSpec) (Ref, error) {
+func insertRef(ctx context.Context, tx pgx.Tx, h Hash, spec RefSpec, level trust.Level) (Ref, error) {
 	owner := spec.Cred.OwnerOf()
-	level := spec.Trust.Normalize()
+	level = level.Normalize()
 
 	ref := Ref{
 		Hash:        h,
@@ -198,6 +272,17 @@ func insertRef(ctx context.Context, tx pgx.Tx, h Hash, spec RefSpec) (Ref, error
 // references may honestly disagree, and the safe direction to resolve a
 // disagreement about provenance is downward.
 func (c *Catalog) Resolve(ctx context.Context, cred identity.Credential, h Hash) (Descriptor, trust.Level, error) {
+	return c.resolveWith(ctx, c.db, cred, h)
+}
+
+// resolveTx is Resolve inside a caller's transaction, so an authorization check
+// and the write it authorises cannot be separated by another writer.
+func (c *Catalog) resolveTx(ctx context.Context, tx pgx.Tx, cred identity.Credential, h Hash) (trust.Level, error) {
+	_, level, err := c.resolveWith(ctx, tx, cred, h)
+	return level, err
+}
+
+func (c *Catalog) resolveWith(ctx context.Context, db DB, cred identity.Credential, h Hash) (Descriptor, trust.Level, error) {
 	if err := cred.Validate(); err != nil {
 		return Descriptor{}, trust.Untrusted, err
 	}
@@ -212,7 +297,7 @@ func (c *Catalog) Resolve(ctx context.Context, cred identity.Credential, h Hash)
 		mimeType     string
 		untrustedAny bool
 	)
-	err := c.db.QueryRow(ctx, `
+	err := db.QueryRow(ctx, `
 		SELECT b.size, b.mime, bool_or(r.trust = 'untrusted')
 		FROM blob_refs r
 		JOIN blobs b ON b.sha256 = r.sha256

@@ -85,6 +85,10 @@ func whatToDo() string {
 // Add a phrase here when you add guidance to CLAUDE.md that a stale merge would
 // silently drop. Keep them short and distinctive rather than whole sentences, so
 // ordinary rewording does not trip them.
+// A phrase must not span a line break: the file is hard-wrapped and
+// strings.Contains works on the raw bytes, so a phrase that reads as one
+// sentence in the rendered markdown can be two lines in the source. Prefer a
+// short heading over a clause.
 var requiredPhrases = []string{
 	"land the reproduction as a failing test",
 	"only looks like enforcement is worse than none",
@@ -94,6 +98,8 @@ var requiredPhrases = []string{
 	"which way it can go wrong",
 	"Its fixture is too small to reach the failure",
 	"verdict on the pair",
+	"Check that the package built",
+	"the contradiction was in the instrument",
 }
 
 // TestRequiredGuidanceSurvives fails when a merge drops guidance the numbered

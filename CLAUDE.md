@@ -193,8 +193,26 @@ test/                  integration tests, including Playwright-driven HTTP/SSE
      the assertion is honest, and `n = 12` against a batch limit of 500 means the
      interesting branch never runs. This one hides best, because the test is
      well written. Ask what size makes the loop take its other path.
-- **Ask what the instrument measured before believing it.** Three detectors,
-  each earned here by nearly shipping the thing it catches:
+- **Ask what the instrument measured before believing it.** The general form,
+  and every detector below is an instance of it: **the instrument answered a
+  narrower question than the one you are about to report.** Six, each earned
+  here by nearly shipping the thing it catches:
+  - **Check the platform.** Green on your machine is a claim about your machine.
+    A test that passed three times on Windows failed deterministically on Linux,
+    because the tailer's watermark is empty until its first cycle *reads a row*
+    and a faster machine loses that race every time. This repo's gate sees one
+    OS, one Postgres, one scheduler. CI is the only thing that can see the rest.
+  - **Check that the package built.** A count of what was *skipped* cannot see
+    what was never *built*. A test package that does not compile has zero tests
+    rather than skipped ones, so "0 skipped" reads identically for "everything
+    ran" and "this package does not exist" ... and `go build ./...` will not tell
+    you, because test files are not part of it. This is aimed at the skip-naming
+    gate below: the moment anyone treats "no skips" as the safety signal, this
+    class reads clean. It happened here for two commits and took out the whole
+    grant predicate suite plus the reproduction for a live cross-principal leak.
+  - **Check that the mutation applied.** "I ran the mutation" and "the mutation
+    applied" are different facts. A regex that missed a multi-line `case` made a
+    mutation a no-op; the test passed and read as weak.
   - **Check the clock.** A suite that returns green implausibly fast never ran.
     Two suites came back in 0.5s because `HIVE_SANDBOX_TEST_DATABASE_URL` was
     unset, and six security fixes were about to be reported as verified.
@@ -205,6 +223,15 @@ test/                  integration tests, including Playwright-driven HTTP/SSE
     clause standing and vice versa. A pass came back "five uncaught", which reads
     as five worthless tests and actually meant the redundancy was real.
     **"Uncaught" is a verdict on the pair, not on the test.**
+- **Some instruments cannot express the distinction the question needs, and no
+  amount of careful reading fixes that.** The six above are people over-reading
+  an instrument. This one is different: the SSE test reader silently discarded an
+  all-empty block, so "no frame arrived" covered three unrelated causes ... the
+  handler returned, the branch was starved, or a frame was written the parser
+  could not represent. Two people reasoned carefully from that signal and reached
+  a contradiction, because **the contradiction was in the instrument.** When the
+  evidence cannot distinguish the hypotheses, stop reasoning and fix the
+  instrument.
 - **When arranging the condition changes the outcome, test the decision instead
   of the mechanism.** Every attempt to stage "process finished, then context
   cancelled" against a context-bound command kills the process instead ... Linux

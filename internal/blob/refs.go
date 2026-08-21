@@ -312,7 +312,7 @@ func (c *Catalog) resolveWith(ctx context.Context, db DB, cred identity.Credenti
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Not "forbidden". Not found.
-			return Descriptor{}, trust.Untrusted, fmt.Errorf("%w: %s", ErrNoRef, h)
+			return Descriptor{}, trust.Untrusted, fmt.Errorf("%w: %s", ErrNotFound, h)
 		}
 		return Descriptor{}, trust.Untrusted, fmt.Errorf("blob: resolve %s: %w", h, err)
 	}
@@ -351,8 +351,16 @@ func (c *Catalog) Open(
 //
 // The mechanism has to exist even while the policy is "keep forever", or the
 // option cannot be exercised later.
+//
+// It takes a DB rather than a pgx.Tx, unlike the write paths, and the asymmetry
+// is deliberate. Publish must be transactional because a live blob with no
+// reference is the dangerous direction. A release that does not happen leaves a
+// reference alive, which only keeps bytes that could have gone ... conservative,
+// not corrupting. So a caller updating a document passes its transaction and
+// gets both together, and a caller releasing on its own can pass the pool.
 func (c *Catalog) Release(
 	ctx context.Context,
+	db DB,
 	cred identity.Credential,
 	h Hash,
 	kind SourceKind,
@@ -363,7 +371,7 @@ func (c *Catalog) Release(
 	}
 	owner := cred.OwnerOf()
 
-	tag, err := c.db.Exec(ctx, `
+	tag, err := db.Exec(ctx, `
 		UPDATE blob_refs
 		SET released_at = now()
 		WHERE sha256 = $1 AND owner_kind = $2 AND owner_id = $3
@@ -374,9 +382,98 @@ func (c *Catalog) Release(
 		return fmt.Errorf("blob: release ref for %s: %w", h, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: no live reference to %s", ErrNoRef, h)
+		return fmt.Errorf("%w: no live reference to %s", ErrNotFound, h)
 	}
 	return nil
+}
+
+// ReleaseBySource drops every reference one producer holds, and reports how
+// many.
+//
+// This is the delete path: a document going away releases everything it held,
+// in the caller's transaction, without the caller having to remember which
+// descriptors were in it. Remembering is exactly what an update-then-delete
+// sequence gets wrong, and a reference nobody can name again is a reference
+// nobody can release.
+//
+// Releasing nothing is not an error. A document that held no blobs is the
+// common case, and making the caller branch on it would mean every delete path
+// carries a special case for the ordinary situation.
+func (c *Catalog) ReleaseBySource(
+	ctx context.Context,
+	db DB,
+	cred identity.Credential,
+	kind SourceKind,
+	sourceID string,
+) (int, error) {
+	if err := cred.Validate(); err != nil {
+		return 0, err
+	}
+	if !kind.Valid() {
+		return 0, fmt.Errorf("blob: unknown source kind %q", kind)
+	}
+	if sourceID == "" {
+		return 0, errors.New("blob: ReleaseBySource needs a source id")
+	}
+	owner := cred.OwnerOf()
+
+	tag, err := db.Exec(ctx, `
+		UPDATE blob_refs
+		SET released_at = now()
+		WHERE owner_kind = $1 AND owner_id = $2
+		  AND source_kind = $3 AND source_id = $4
+		  AND released_at IS NULL`,
+		string(owner.Kind), owner.ID, string(kind), sourceID)
+	if err != nil {
+		return 0, fmt.Errorf("blob: release refs for %s/%s: %w", kind, sourceID, err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// HeldBySource lists the bytes one producer currently references.
+//
+// The update path needs it: a document that dropped a descriptor has to release
+// that reference in the same transaction, and the only way to know which ones
+// went is to compare what is held against what the new document names.
+func (c *Catalog) HeldBySource(
+	ctx context.Context,
+	db DB,
+	cred identity.Credential,
+	kind SourceKind,
+	sourceID string,
+) ([]Hash, error) {
+	if err := cred.Validate(); err != nil {
+		return nil, err
+	}
+	owner := cred.OwnerOf()
+
+	rows, err := db.Query(ctx, `
+		SELECT sha256 FROM blob_refs
+		WHERE owner_kind = $1 AND owner_id = $2
+		  AND source_kind = $3 AND source_id = $4
+		  AND released_at IS NULL`,
+		string(owner.Kind), owner.ID, string(kind), sourceID)
+	if err != nil {
+		return nil, fmt.Errorf("blob: list refs for %s/%s: %w", kind, sourceID, err)
+	}
+	defer rows.Close()
+
+	var out []Hash
+	for rows.Next() {
+		var text string
+		if err := rows.Scan(&text); err != nil {
+			return nil, fmt.Errorf("blob: scan ref: %w", err)
+		}
+		h, err := ParseHash(text)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("blob: list refs for %s/%s: %w", kind, sourceID, err)
+	}
+	return out, nil
 }
 
 // LiveRefCount counts references keeping bytes alive, across every owner.

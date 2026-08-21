@@ -193,12 +193,21 @@ func (p Provenance) validate() error {
 // defaultMIME is what a blob gets when nobody said. Matches the column default.
 const defaultMIME = "application/octet-stream"
 
-// ErrNoRef means the caller holds no live reference to those bytes.
+// There is deliberately no second sentinel for "you hold no reference to these
+// bytes".
 //
-// Deliberately indistinguishable from ErrNotFound to anything above: a caller
-// that can tell "exists but not yours" from "does not exist" has an oracle for
-// the global hash space. Absence beats denial.
-var ErrNoRef = ErrNotFound
+// It used to exist as an alias of ErrNotFound, which was safe and read as
+// though the two might differ ... enough that a caller asked for them to be
+// told apart so it could return 403 for one and 404 for the other. That would
+// have handed a guest an oracle over the GLOBAL hash space: name a hash inside
+// a document, read the status, learn whether those bytes exist anywhere on the
+// platform. One bit per guess, and the guesses are free.
+//
+// So there is one sentinel, one message shape, and nothing to switch on. A
+// comment saying "do not distinguish these" is a rule someone has to remember;
+// a package with only one error is a fact they inherit. The distinction is
+// safe to LOG ... actor, hash, "held no reference" ... and never safe to
+// return.
 
 // Catalog is the reference layer: the blobs and blob_refs rows, and the rule
 // that ties them to bytes.

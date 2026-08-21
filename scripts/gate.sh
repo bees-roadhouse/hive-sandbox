@@ -29,8 +29,42 @@ if [ -n "$unformatted" ]; then
   failed+=("gofmt")
 fi
 
+# A gate that reports green over a suite it never ran is worse than no gate,
+# because it is the reason somebody stops checking. Without this variable 121
+# tests skip themselves, including every test that touches Postgres, and the
+# run still says GATE GREEN in about the same wall time ... skipping is fast,
+# and -race makes a skipped suite look like a slow one.
+#
+# So this is a hard precondition rather than a warning. `db-up` is idempotent
+# and takes seconds; there is no case where running the gate without a database
+# is what somebody meant.
+echo "==> database precondition"
+if [ -z "${HIVE_SANDBOX_TEST_DATABASE_URL:-}" ]; then
+  echo "HIVE_SANDBOX_TEST_DATABASE_URL is not set."
+  echo "Every Postgres-backed test would SKIP and the gate would still print GATE GREEN."
+  echo "Fix with:"
+  echo "  export HIVE_SANDBOX_TEST_DATABASE_URL=\"\$(./scripts/db-up.sh --quiet)\""
+  failed+=("database-url-unset")
+else
+  echo "  $(echo "$HIVE_SANDBOX_TEST_DATABASE_URL" | sed -E 's#://[^@]*@#://***@#')"
+fi
+
 echo "==> go test -race ./..."
-go test -race ./... || failed+=("test")
+test_log=$(mktemp)
+go test -race -v ./... 2>&1 | tee "$test_log" | grep -E '^(ok|FAIL|\?|---)|^\s+--- (FAIL|SKIP)' || true
+grep -qE '^FAIL' "$test_log" && failed+=("test")
+
+# Name what did not run. A skip is a test that told you it was not answering
+# the question, and the only way that stays visible is if the gate says so out
+# loud every time rather than burying it in -v output nobody passes.
+skipped=$(grep -oE '^\s*--- SKIP: [^ ]+' "$test_log" | sed 's/.*SKIP: //' | sort -u || true)
+if [ -n "$skipped" ]; then
+  echo
+  echo "SKIPPED ($(echo "$skipped" | wc -l | tr -d ' ')) ... these did NOT run:"
+  echo "$skipped" | sed 's/^/  /'
+  echo "Container-image tests need scripts/harness-build.sh and scripts/egress-build.sh."
+fi
+rm -f "$test_log"
 
 if [ ${#failed[@]} -gt 0 ]; then
   echo

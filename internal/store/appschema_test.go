@@ -44,7 +44,7 @@ func planFor(t *testing.T, app string, collections ...manifest.Collection) manif
 	if err := m.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
-	plan, err := m.SchemaPlan()
+	plan, err := m.SchemaPlan("user", app)
 	if err != nil {
 		t.Fatalf("SchemaPlan: %v", err)
 	}

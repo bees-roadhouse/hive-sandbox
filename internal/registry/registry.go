@@ -131,7 +131,6 @@ func SurfaceHash(s manifest.Surface) (string, error) {
 type Prepared struct {
 	Manifest *manifest.Manifest
 	Surface  manifest.Surface
-	Schema   manifest.SchemaPlan
 	// SurfaceHash content-addresses what this install exposes. It changes when
 	// the tool or route surface changes, which is what makes "is this promotion
 	// an equivalent one" answerable without a diff.
@@ -176,18 +175,13 @@ func Prepare(m *manifest.Manifest, moduleHash string, exports []string) (Prepare
 		}
 	}
 
-	plan, err := m.SchemaPlan()
-	if err != nil {
-		return Prepared{}, err
-	}
-
 	hash, err := SurfaceHash(surface)
 	if err != nil {
 		return Prepared{}, err
 	}
 
 	return Prepared{
-		Manifest: m, Surface: surface, Schema: plan,
+		Manifest: m, Surface: surface,
 		SurfaceHash: hash, DeriveVersion: manifest.DeriveVersion,
 		ModuleHash: moduleHash,
 	}, nil
@@ -195,3 +189,67 @@ func Prepare(m *manifest.Manifest, moduleHash string, exports []string) (Prepare
 
 // NeedsModule reports whether this app has any guest code at all.
 func (p Prepared) NeedsModule() bool { return len(p.Surface.Functions) > 0 }
+
+// InstallSpec is everything a writer needs to register this build and install
+// it, in a form that carries no database handle.
+//
+// Same seam as SchemaPlan, one level up: the registry decides WHAT gets
+// written and internal/store is the only thing that writes it, because the
+// grant predicate lives there and a second package holding a pool would be a
+// second package reaching Postgres with no reason to know about grants.
+//
+// It is also why this package imports no pgx at all. A registry that could open
+// a transaction would eventually open one.
+type InstallSpec struct {
+	// Slug is the app name. Unique per owner, not globally.
+	Slug string
+	Kind string
+	// ManifestJSON is stored verbatim, so what was installed can be read back
+	// rather than re-derived.
+	ManifestJSON []byte
+
+	// SurfaceHash and DeriveVersion travel together or not at all. A hash with
+	// no deriver is a number nobody can interpret; the schema enforces it.
+	SurfaceHash   string
+	DeriveVersion int
+
+	// ModuleHash is empty for an app that needs no wasm (D24).
+	ModuleHash string
+
+	Schema manifest.SchemaPlan
+}
+
+// InstallSpec renders what to write for one OWNER. It does not decide who may
+// write it: that is a grant, resolved by the caller against the connecting
+// actor.
+//
+// The owner is a parameter because the schema name is scoped to it. Two owners
+// installing the same app get separate schemas and therefore separate
+// documents, which an app-scoped name would not have given them.
+func (p Prepared) InstallSpec(ownerKind, ownerID string) (InstallSpec, error) {
+	plan, err := p.Manifest.SchemaPlan(ownerKind, ownerID)
+	if err != nil {
+		return InstallSpec{}, err
+	}
+	spec, err := p.installSpec()
+	if err != nil {
+		return InstallSpec{}, err
+	}
+	spec.Schema = plan
+	return spec, nil
+}
+
+func (p Prepared) installSpec() (InstallSpec, error) {
+	raw, err := json.Marshal(p.Manifest)
+	if err != nil {
+		return InstallSpec{}, fmt.Errorf("registry: encode manifest: %w", err)
+	}
+	return InstallSpec{
+		Slug:          p.Manifest.Name,
+		Kind:          string(p.Manifest.Kind),
+		ManifestJSON:  raw,
+		SurfaceHash:   p.SurfaceHash,
+		DeriveVersion: p.DeriveVersion,
+		ModuleHash:    p.ModuleHash,
+	}, nil
+}

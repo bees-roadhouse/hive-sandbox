@@ -100,6 +100,14 @@ Surface was:
 
 // The golden fixture has to actually reach the branches it claims to, or it is
 // a well-written test of the easy path (CLAUDE.md, shape three).
+//
+// **It protects against coverage SHRINKING, not against it failing to GROW.**
+// Add a branch to Derive and nothing here knows to demand it: the fixture
+// quietly stops being complete and no test complains. The golden catches most
+// of that, because a new branch usually changes the derived bytes for some
+// input ... but a branch nothing in this fixture exercises produces no byte
+// change and no failure. Read this as "coverage cannot shrink", never as
+// "coverage is guaranteed", and extend the fixture when you extend Derive.
 func TestGoldenFixtureReachesEveryBranch(t *testing.T) {
 	s := goldenManifest().Derive()
 

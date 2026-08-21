@@ -1,6 +1,8 @@
 package manifest
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -149,14 +151,38 @@ const maxIdentifier = 63
 // host provisioned is distinguishable from one somebody made by hand.
 const schemaPrefix = "app_"
 
-// SchemaName is where an app's collections live.
-func SchemaName(app string) string { return schemaPrefix + app }
+// SchemaName is where ONE INSTALL's collections live.
+//
+// Scoped to the owner, not just the app, and that was a real bug rather than a
+// refinement: an earlier version returned `app_<slug>`, which is per-APP. But
+// `installs.schema_name` is UNIQUE and the data layer reads the schema off the
+// install row, so two owners installing the same app either collided on that
+// constraint or ... had the constraint not existed ... would have shared one
+// schema and therefore each other's documents.
+//
+// It failed closed, which is the only reason this is a story about a unique
+// index rather than about a cross-principal data leak.
+//
+// Derived from (slug, owner) rather than from the install id, because the
+// schema has to be provisionable BEFORE the install row exists, and because
+// re-installing the same app for the same owner must land on the same schema
+// for a manifest diff to be a migration rather than a second copy.
+func SchemaName(app string, ownerKind string, ownerID string) string {
+	sum := sha256.Sum256([]byte(ownerKind + ":" + ownerID))
+	return schemaPrefix + app + "_" + hex.EncodeToString(sum[:])[:ownerSuffixLen]
+}
+
+// ownerSuffixLen is how much of the owner digest lands in the schema name. Eight
+// hex characters is 32 bits: at family scale a collision is not a rounding
+// error, it is not going to happen, and `schema_name UNIQUE` catches it loudly
+// if it ever does.
+const ownerSuffixLen = 8
 
 // maxAppName is what fits once the prefix is applied. Enforced in Validate so
 // the failure lands on the manifest rather than on the CREATE SCHEMA, which is
 // the exact "legal in a manifest, illegal in Postgres" gap that validating
 // names narrowly was supposed to close in the first place.
-const maxAppName = maxIdentifier - len(schemaPrefix)
+const maxAppName = maxIdentifier - len(schemaPrefix) - 1 - ownerSuffixLen
 
 // derivedSuffixes are every suffix the platform appends to a COLLECTION name
 // when it derives an identifier. The list is here rather than in the package
@@ -211,8 +237,8 @@ func DerivedSuffixes() []string {
 //
 // A tool has no storage by construction (D10.3), so this returns a plan with no
 // collections for one, and the registry skips provisioning entirely.
-func (m *Manifest) SchemaPlan() (SchemaPlan, error) {
-	plan := SchemaPlan{Schema: SchemaName(m.Name)}
+func (m *Manifest) SchemaPlan(ownerKind, ownerID string) (SchemaPlan, error) {
+	plan := SchemaPlan{Schema: SchemaName(m.Name, ownerKind, ownerID)}
 	if m.Kind != KindApp {
 		return plan, nil
 	}

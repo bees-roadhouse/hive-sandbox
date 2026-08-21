@@ -49,7 +49,7 @@ func installApp(t *testing.T, w *world, slug, collection string, owner store.Own
 	if err := m.Validate(); err != nil {
 		t.Fatalf("manifest: %v", err)
 	}
-	plan, err := m.SchemaPlan()
+	plan, err := m.SchemaPlan("user", slug)
 	if err != nil {
 		t.Fatalf("schema plan: %v", err)
 	}

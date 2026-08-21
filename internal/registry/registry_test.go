@@ -46,8 +46,12 @@ func TestPrepareAcceptsAMatchingModule(t *testing.T) {
 	if !p.NeedsModule() {
 		t.Error("an app with functions reported needing no module")
 	}
-	if p.Schema.Schema != "app_journal" {
-		t.Errorf("schema = %q", p.Schema.Schema)
+	spec, err := p.InstallSpec("user", "alice")
+	if err != nil {
+		t.Fatalf("InstallSpec: %v", err)
+	}
+	if !strings.HasPrefix(spec.Schema.Schema, "app_journal_") {
+		t.Errorf("schema = %q, want an owner-scoped app_journal_*", spec.Schema.Schema)
 	}
 }
 
@@ -191,5 +195,39 @@ func TestPreparedCarriesTheDeriver(t *testing.T) {
 	}
 	if p.SurfaceHash == "" || p.DeriveVersion == 0 {
 		t.Error("a surface hash and its deriver must both be set, or neither")
+	}
+}
+
+// Two owners installing the same app get separate schemas, and therefore
+// separate documents. An app-scoped name gave them one schema, which
+// installs.schema_name UNIQUE turned into a confusing conflict ... and would
+// have been a cross-principal data leak without that constraint.
+func TestInstallSpecIsScopedToTheOwner(t *testing.T) {
+	p, err := Prepare(crudOnly(), "", nil)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	alice, err := p.InstallSpec("user", "alice-id")
+	if err != nil {
+		t.Fatalf("InstallSpec: %v", err)
+	}
+	bob, err := p.InstallSpec("user", "bob-id")
+	if err != nil {
+		t.Fatalf("InstallSpec: %v", err)
+	}
+	if alice.Schema.Schema == bob.Schema.Schema {
+		t.Fatalf("two owners share schema %q", alice.Schema.Schema)
+	}
+
+	// And it is stable, or re-installing would land somewhere new every time
+	// and a manifest diff could never be a migration.
+	again, err := p.InstallSpec("user", "alice-id")
+	if err != nil {
+		t.Fatalf("InstallSpec: %v", err)
+	}
+	if again.Schema.Schema != alice.Schema.Schema {
+		t.Errorf("the same owner got two schemas: %q then %q",
+			alice.Schema.Schema, again.Schema.Schema)
 	}
 }

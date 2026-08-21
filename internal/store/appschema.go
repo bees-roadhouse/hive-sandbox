@@ -101,25 +101,41 @@ func applyTouchFunction(ctx context.Context, tx pgx.Tx, quotedSchema string) err
 	return nil
 }
 
-// applyCollection creates one collection's table and indexes.
+// applyCollection creates one collection's table, its updated_at trigger and
+// its indexes.
 //
 // The table shape is the same for every collection and is not the app's to
-// choose. Owner columns are present from the first statement, because
-// retrofitting ownership onto a grown schema is the expensive version and
-// carrying two columns from the start makes later policy additive (D1.2).
+// choose.
 func applyCollection(ctx context.Context, tx pgx.Tx, schema string, c manifest.CollectionPlan) error {
 	if err := checkIdent(c.Name); err != nil {
 		return err
 	}
 	table := quoteIdent(schema) + "." + quoteIdent(c.Name)
 
-	// trust travels with the row, not with the bytes in it (invariant 3), and
-	// it defaults trusted to match every other content table in migration one.
+	// There is deliberately no owner pair and no author here.
+	//
+	// A document's ownership lives on its `entities` row, which is also what a
+	// grant is written against and what the predicate resolves through. A copy
+	// on this table would be a second place to read ownership from, and the only
+	// thing stopping a query filtering on the cheaper copy would be a comment
+	// ... which is attention rather than intent, and the failure would be an
+	// access decision made against a stale duplicate.
+	//
+	// The join to `entities` is what a read pays instead. At family scale that
+	// is nothing, and if profiling ever says otherwise the columns come back
+	// with something stronger than a comment keeping reads off them.
+	//
+	// The id IS the entity's id, and there is deliberately no foreign key saying
+	// so either: an app schema has to be provisionable without the platform's
+	// tables in the same search path, which is the same dependency inversion
+	// that keeps references to `actors` out of here. What keeps the two rows
+	// together is that one transaction writes both and one removes both.
+	//
+	// trust IS duplicated from `entities`, and that is not the same case: it
+	// travels with the row (invariant 3), it is read by the layer serving the
+	// document, and nothing authorizes on it.
 	if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+table+` (
-		id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-		owner_kind  text NOT NULL CHECK (owner_kind IN ('user', 'org')),
-		owner_id    uuid NOT NULL,
-		author_actor uuid NOT NULL,
+		id          uuid PRIMARY KEY,
 		doc         jsonb NOT NULL DEFAULT '{}',
 		trust       text NOT NULL DEFAULT 'trusted' CHECK (trust IN ('trusted', 'untrusted')),
 		tainted_by  text,
@@ -127,17 +143,6 @@ func applyCollection(ctx context.Context, tx pgx.Tx, schema string, c manifest.C
 		updated_at  timestamptz NOT NULL DEFAULT now()
 	)`); err != nil {
 		return fmt.Errorf("create table %s.%s: %w", schema, c.Name, err)
-	}
-
-	// Every grant-filtered read starts from the owner pair, so it is indexed
-	// unconditionally rather than left to an app to remember.
-	ownerIdx, nameErr := derivedIdent(c.Name, "_owner_idx")
-	if nameErr != nil {
-		return nameErr
-	}
-	if _, err := tx.Exec(ctx,
-		"CREATE INDEX IF NOT EXISTS "+ownerIdx+" ON "+table+" (owner_kind, owner_id)"); err != nil {
-		return fmt.Errorf("create owner index on %s.%s: %w", schema, c.Name, err)
 	}
 
 	// updated_at IS maintained by a trigger, and this is the one place the
@@ -150,10 +155,9 @@ func applyCollection(ctx context.Context, tx pgx.Tx, schema string, c manifest.C
 	// because `now()` is not a fact the writer supplies ... it is a clock read,
 	// identical whoever is asking.
 	//
-	// Leaving it to writers had one failure mode and Megan named it before it
-	// happened: a column that is right in the code one person wrote and wrong
-	// in the code the next person writes. A column that is sometimes maintained
-	// is worse than one that always is, so it always is.
+	// Leaving it to writers had one failure mode: a column that is right in the
+	// code one person wrote and wrong in the code the next person writes. A
+	// column that is sometimes maintained is worse than one that always is.
 	trigger, triggerErr := derivedIdent(c.Name, "_touch")
 	if triggerErr != nil {
 		return triggerErr

@@ -115,9 +115,9 @@ func TestApplySchemaPlanProvisionsCollections(t *testing.T) {
 		}
 	}
 
-	// Owner columns from the first statement, because retrofitting ownership
-	// onto a grown schema is the expensive version (D1.2).
-	for _, col := range []string{"owner_kind", "owner_id", "author_actor", "trust", "tainted_by"} {
+	// Trust travels with the row (invariant 3), and tainted_by says which
+	// operation first weakened the invocation that wrote it.
+	for _, col := range []string{"id", "doc", "trust", "tainted_by", "created_at", "updated_at"} {
 		var exists bool
 		if err := pool.QueryRow(t.Context(), `
 			SELECT EXISTS (
@@ -132,7 +132,28 @@ func TestApplySchemaPlanProvisionsCollections(t *testing.T) {
 		}
 	}
 
-	// Three declared indexes plus the owner index the host adds unconditionally.
+	// And ownership is NOT here, which is the load-bearing half.
+	//
+	// A document's owner lives on its entities row, which is what a grant is
+	// written against and what the predicate resolves through. A copy on this
+	// table would be a second place to read ownership from, and the only thing
+	// keeping a query off the cheaper copy would be a comment. This asserts the
+	// absence so the columns cannot come back without someone deciding to.
+	for _, col := range []string{"owner_kind", "owner_id", "author_actor"} {
+		var exists bool
+		if err := pool.QueryRow(t.Context(), `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = $1 AND table_name = 'entries' AND column_name = $2)`,
+			plan.Schema, col,
+		).Scan(&exists); err != nil {
+			t.Fatalf("check column %s: %v", col, err)
+		}
+		if exists {
+			t.Errorf("entries carries %s; ownership belongs to the entities row alone", col)
+		}
+	}
+
 	var indexes int
 	if err := pool.QueryRow(t.Context(),
 		`SELECT count(*) FROM pg_indexes WHERE schemaname = $1 AND tablename = 'entries'`,
@@ -140,9 +161,10 @@ func TestApplySchemaPlanProvisionsCollections(t *testing.T) {
 	).Scan(&indexes); err != nil {
 		t.Fatalf("count indexes: %v", err)
 	}
-	// btree + gin + fts + owner + the primary key.
-	if indexes < 5 {
-		t.Errorf("entries has %d indexes, want at least 5", indexes)
+	// btree + gin + fts + the primary key. There is no owner index any more,
+	// because there are no owner columns to index.
+	if indexes < 4 {
+		t.Errorf("entries has %d indexes, want at least 4", indexes)
 	}
 }
 
@@ -192,20 +214,22 @@ func TestLongCollectionNameStillGetsItsIndexes(t *testing.T) {
 		t.Fatalf("rows: %v", err)
 	}
 
-	// Primary key, owner index, and the declared btree.
-	if len(names) < 3 {
-		t.Errorf("collection %q has indexes %v; the install reported success with fewer than three",
+	// Primary key and the declared btree. There is no owner index any more,
+	// because there are no owner columns: a document's owner lives on its
+	// entities row, which is what the predicate resolves through.
+	if len(names) < 2 {
+		t.Errorf("collection %q has indexes %v; the install reported success with fewer than two",
 			long, names)
 	}
-	var hasOwner bool
+	var hasDeclared bool
 	for _, n := range names {
-		if strings.Contains(n, "owner") {
-			hasOwner = true
+		if strings.Contains(n, "btree") {
+			hasDeclared = true
 		}
 	}
-	if !hasOwner {
-		t.Errorf("no owner index on %q, so every grant-filtered read on it is a sequential scan. Got %v",
-			long, names)
+	if !hasDeclared {
+		t.Errorf("the declared index is missing on %q, so the install reported success without "+
+			"creating what the manifest asked for. Got %v", long, names)
 	}
 }
 
@@ -251,8 +275,8 @@ func TestUpdatedAtIsMaintainedWithoutTheWriter(t *testing.T) {
 	var id string
 	var created, firstUpdated time.Time
 	if err := pool.QueryRow(ctx, `INSERT INTO `+table+`
-		(owner_kind, owner_id, author_actor, doc)
-		VALUES ('user', gen_random_uuid(), gen_random_uuid(), '{"a":1}')
+		(id, doc)
+		VALUES (gen_random_uuid(), '{"a":1}')
 		RETURNING id, created_at, updated_at`,
 	).Scan(&id, &created, &firstUpdated); err != nil {
 		t.Fatalf("insert: %v", err)

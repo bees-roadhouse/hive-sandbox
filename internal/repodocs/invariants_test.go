@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -65,4 +66,45 @@ func whatToDo() string {
 			"If you are not, your branch predates one and the merge dropped it: rebase on origin/main\n"+
 			"and take the version of CLAUDE.md with more invariants, not fewer.",
 		minInvariants)
+}
+
+// requiredPhrases are load-bearing sentences that live OUTSIDE the numbered
+// invariant list, so counting invariants does not protect them.
+//
+// This exists because the count check was too narrow. CLAUDE.md was reverted a
+// fourth time by a branch cut before two conventions were added, the invariant
+// count was still 13, and the guard passed while the file lost content. Guarding
+// the section that had been hit three times left the rest of the same file
+// unguarded.
+//
+// Add a phrase here when you add guidance to CLAUDE.md that a stale merge would
+// silently drop. Keep them short and distinctive rather than whole sentences, so
+// ordinary rewording does not trip them.
+var requiredPhrases = []string{
+	"land the reproduction as a failing test",
+	"only looks like enforcement is worse than none",
+	"ask what stops someone who only knows it",
+	"NOTIFY is only a wakeup bell",
+	"never a replay tape",
+}
+
+// TestRequiredGuidanceSurvives fails when a merge drops guidance the numbered
+// list does not cover.
+func TestRequiredGuidanceSurvives(t *testing.T) {
+	const path = "../../CLAUDE.md"
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	text := string(body)
+
+	for _, phrase := range requiredPhrases {
+		if !strings.Contains(text, phrase) {
+			t.Errorf("CLAUDE.md no longer contains %q.\n"+
+				"If you deliberately reworded it, update requiredPhrases in the same commit.\n"+
+				"If you did not, your branch predates it and the merge dropped it: rebase on\n"+
+				"origin/main and keep the version with more guidance, not less.", phrase)
+		}
+	}
 }

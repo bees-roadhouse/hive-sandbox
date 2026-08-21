@@ -2,6 +2,8 @@ package store_test
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -178,3 +180,100 @@ func TestBlockedPartitionIsReportedNotFatal(t *testing.T) {
 		t.Fatalf("unrelated months blocked: %v", blocked)
 	}
 }
+
+// TestPartitionBoundsAreUTCRegardlessOfSessionTimezone.
+//
+// created_at is timestamptz, so a partition bound written as a bare date is
+// resolved in the SESSION's TimeZone. Two hosts with different TimeZone
+// settings would compute different seams for the same month, and a row landing
+// between them goes to the default partition ... which is the one place rows
+// can never be pruned from and cannot be deleted, because events is
+// append-only.
+//
+// Found by a test creating twelve months from a client in America/New_York,
+// where the fifth month collided with rows the first four had already filed.
+//
+// The assertion is behavioural rather than textual on purpose: Postgres renders
+// a stored bound in whatever zone is asking, so "2027-02-28 19:00:00-05" and
+// "2027-03-01 00:00:00+00" are the same instant and a string comparison would
+// fail on a correct implementation.
+func TestPartitionBoundsAreUTCRegardlessOfSessionTimezone(t *testing.T) {
+	s, ctx := testStore(t)
+	w := newWorld(t)
+	alice := w.human("alice")
+
+	// A distinct past month per zone. Sharing one month would make this test
+	// prove nothing: CREATE TABLE IF NOT EXISTS is a no-op once the first
+	// subtest has created it, so every later zone would silently inherit
+	// bounds computed under the first one. Widely separated so that "the
+	// instant before this month" cannot land in a neighbour's partition.
+	//
+	// Past months, because a trigger refuses future-dated events.
+	months := []string{"2024-03", "2024-06", "2024-09"}
+
+	for i, tz := range []string{"UTC", "America/New_York", "Asia/Kolkata"} {
+		month := months[i] + "-01"
+		t.Run(tz, func(t *testing.T) {
+			conn, err := s.Pool().Acquire(ctx)
+			if err != nil {
+				t.Fatalf("acquire: %v", err)
+			}
+			defer conn.Release()
+			if _, err := conn.Exec(ctx, "SET TIME ZONE "+quoteLiteral(tz)); err != nil {
+				t.Fatalf("set tz: %v", err)
+			}
+
+			var name *string
+			if err := conn.QueryRow(ctx,
+				"SELECT ensure_events_partition($1::date)", month).Scan(&name); err != nil {
+				t.Fatalf("ensure: %v", err)
+			}
+			want := "events_" + strings.ReplaceAll(months[i], "-", "_")
+			if name == nil || *name != want {
+				t.Fatalf("partition name %v under TimeZone=%s, want %s", name, tz, want)
+			}
+
+			// The first instant of the UTC month belongs to that month's
+			// partition, and the last instant before it does not. Every session
+			// has to agree, whatever zone it is reporting in.
+			cases := []struct {
+				at   string
+				want string
+			}{
+				{months[i] + "-01 00:00:00+00", want},
+				{months[i] + "-01 00:00:00+00", want},
+			}
+			// The instant one second BEFORE the UTC month start must fall
+			// outside, and there is no neighbouring partition to catch it.
+			var before string
+			if err := conn.QueryRow(ctx,
+				`SELECT to_char(($1::timestamptz - interval '1 second') AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') || '+00'`,
+				months[i]+"-01 00:00:00+00").Scan(&before); err != nil {
+				t.Fatalf("compute boundary: %v", err)
+			}
+			cases[1] = struct {
+				at   string
+				want string
+			}{before, "events_default"}
+			for j, c := range cases {
+				var landed string
+				if err := conn.QueryRow(ctx, `
+					INSERT INTO events (created_at, kind, owner_kind, owner_id, author_actor,
+					                    principal_kind, principal_id)
+					VALUES ($1::timestamptz, $2, 'user', $3, $3, 'user', $3)
+					RETURNING tableoid::regclass::text`,
+					c.at, fmt.Sprintf("tz.%d.%d", i, j), alice).Scan(&landed); err != nil {
+					t.Fatalf("insert at %s: %v", c.at, err)
+				}
+				if landed != c.want {
+					t.Fatalf("under TimeZone=%s a row at %s landed in %q, want %q; "+
+						"the month seam moved with the session zone",
+						tz, c.at, landed, c.want)
+				}
+			}
+		})
+	}
+}
+
+// quoteLiteral is enough for a timezone name; SET does not take a parameter.
+func quoteLiteral(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }

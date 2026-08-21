@@ -130,7 +130,12 @@ npm test
 
 The suite builds the daemon, starts it on an ephemeral port per worker, and
 shuts it down after. Nothing to start by hand and no fixed port to collide with.
-It does not need Postgres.
+
+It **does** need Postgres, as of `/events` ... export
+`HIVE_SANDBOX_TEST_DATABASE_URL` exactly as for the Go tests. Every worker
+creates its own schema on that database and drops it afterwards, and the daemon
+migrates into it. There is no database-free spec: the log-attaching fixture is
+`auto: true` and depends on the daemon, so every test in the suite gets one.
 
 Debugging:
 
@@ -192,8 +197,9 @@ Two jobs in `.github/workflows/ci.yml`:
 - **gate** ... the same steps as `scripts/gate.ps1`, against a Postgres service
   container, with `HIVE_SANDBOX_TEST_DATABASE_URL` set so integration tests
   actually run there.
-- **e2e** ... Playwright. Separate from `gate` on purpose: it downloads a
-  browser, and a lint failure should not wait behind 115 MB.
+- **e2e** ... Playwright, also against a Postgres service container since the
+  daemon serves `/events` off the database. Separate from `gate` on purpose: it
+  downloads a browser, and a lint failure should not wait behind 115 MB.
 
 `golangci-lint` is built from source with the runner's own Go. A prebuilt binary
 compiled against an older Go refuses to load a config targeting a newer one.

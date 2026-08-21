@@ -10,8 +10,17 @@ export interface Daemon {
   port: number;
   /** What `hive-sandbox -version` printed for this build. */
   version: string;
+  /** Bearer token for the bootstrapped root actor. */
+  token: string;
   /** Everything the daemon wrote to stdout and stderr so far. */
   logs(): string;
+}
+
+export interface DaemonOptions {
+  /** Connection string, already pinned to this worker's schema. */
+  databaseURL: string;
+  /** Handed to the daemon as HIVE_SANDBOX_BOOTSTRAP_TOKEN. */
+  token: string;
 }
 
 export interface RunningDaemon extends Daemon {
@@ -51,13 +60,21 @@ async function freePort(): Promise<number> {
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /** Starts the daemon on an ephemeral port and waits until /healthz answers. */
-export async function startDaemon(): Promise<RunningDaemon> {
+export async function startDaemon(options: DaemonOptions): Promise<RunningDaemon> {
   const info = JSON.parse(readFileSync(buildInfoPath, 'utf8')) as BuildInfo;
   const port = await freePort();
   const url = `http://127.0.0.1:${port}`;
 
   const child: ChildProcess = spawn(info.binaryPath, ['-addr', `127.0.0.1:${port}`], {
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      HIVE_SANDBOX_DATABASE_URL: options.databaseURL,
+      // D19.1: the root actor and its first credential arrive out of band.
+      // There is no API path that could create either.
+      HIVE_SANDBOX_BOOTSTRAP_HANDLE: 'e2e-root',
+      HIVE_SANDBOX_BOOTSTRAP_TOKEN: options.token,
+    },
   });
 
   // Held in an object so the closures below and the waiting loop see the same
@@ -117,6 +134,7 @@ export async function startDaemon(): Promise<RunningDaemon> {
     url,
     port,
     version: info.version,
+    token: options.token,
     logs: () => state.output,
     stop,
   };

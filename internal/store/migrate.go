@@ -221,7 +221,11 @@ func EnsureEventPartitions(ctx context.Context, db DB, monthsAhead int) (blocked
 	for i := 0; i <= monthsAhead; i++ {
 		var name *string
 		if err := db.QueryRow(ctx,
-			`SELECT ensure_events_partition((date_trunc('month', now()) + make_interval(months => $1))::date)`,
+			// UTC throughout: the partition boundaries are midnight UTC, so the
+			// month has to be chosen in UTC too or a host east of Greenwich asks
+			// for the wrong one on the first of the month.
+			`SELECT ensure_events_partition(
+			     (date_trunc('month', now() AT TIME ZONE 'UTC') + make_interval(months => $1))::date)`,
 			i).Scan(&name); err != nil {
 			return blocked, fmt.Errorf("ensure events partition +%d: %w", i, err)
 		}

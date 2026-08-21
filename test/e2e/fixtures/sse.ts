@@ -1,6 +1,17 @@
 import type { Page } from '@playwright/test';
 
 /**
+ * Name of the counter collectSSE bumps in the page on every `onopen`.
+ *
+ * A live-delivery spec has to write its events AFTER the subscription exists:
+ * a fresh stream starts at the head of the log, so anything written between
+ * calling collectSSE and the browser actually connecting is correctly never
+ * delivered, and the spec times out looking like a bug in the daemon. Ask
+ * waitForSSEOpen first.
+ */
+const OPEN_COUNTER = '__hiveSSEOpenCount';
+
+/**
  * SSE testing seam.
  *
  * This is why Playwright is the runner here rather than plain Go HTTP tests: a
@@ -79,6 +90,7 @@ export async function collectSSE(page: Page, url: string, options: CollectOption
     until: options.until ?? null,
     count: options.count ?? null,
     timeoutMs: options.timeoutMs ?? 15_000,
+    openCounter: OPEN_COUNTER,
   };
 
   return page.evaluate(
@@ -100,6 +112,9 @@ export async function collectSSE(page: Page, url: string, options: CollectOption
 
         const onEvent = (raw: Event) => {
           const event = raw as MessageEvent<string>;
+          if (event.lastEventId !== '') {
+            (window as unknown as Record<string, string>).__hiveLastID = event.lastEventId;
+          }
           got.push({ id: event.lastEventId, type: event.type, data: event.data });
           if (opts.until !== null && event.type === opts.until) {
             finish();
@@ -110,6 +125,11 @@ export async function collectSSE(page: Page, url: string, options: CollectOption
           }
         };
 
+        source.addEventListener('open', () => {
+          const w = window as unknown as Record<string, number>;
+          w[opts.openCounter] = (w[opts.openCounter] ?? 0) + 1;
+        });
+
         source.addEventListener('message', onEvent);
         for (const type of opts.types) {
           source.addEventListener(type, onEvent);
@@ -117,4 +137,29 @@ export async function collectSSE(page: Page, url: string, options: CollectOption
       }),
     args,
   );
+}
+
+/**
+ * Resolve once the page has opened `count` SSE connections.
+ *
+ * Pair it with collectSSE whenever the spec writes the events it expects to
+ * receive: without it the write races the subscription, and a fresh stream
+ * starts at the head of the log rather than replaying, so the race is silent.
+ *
+ * It also counts RECONNECTS, which is how a spec can wait for the browser to
+ * come back on its own after the stream drops.
+ */
+export async function waitForSSEOpen(page: Page, count = 1, timeoutMs = 15_000): Promise<void> {
+  await page.waitForFunction(
+    ([name, want]) => ((window as unknown as Record<string, number>)[name as string] ?? 0) >= (want as number),
+    [OPEN_COUNTER, count] as const,
+    { timeout: timeoutMs },
+  );
+}
+
+/** Forget how many connections have been opened, before a fresh subscription. */
+export async function resetSSEOpenCount(page: Page): Promise<void> {
+  await page.evaluate((name) => {
+    delete (window as unknown as Record<string, number>)[name];
+  }, OPEN_COUNTER);
 }

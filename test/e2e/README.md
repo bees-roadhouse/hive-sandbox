@@ -25,8 +25,19 @@ The daemon starts itself. There is no prep step, no port to remember, and no
 process when the worker ends, and a failed test gets the daemon's own log
 attached to its report.
 
-Postgres is **not** wired in here. Go integration tests own the database
-(`internal/testdb`); these tests own the HTTP and SSE surface.
+Postgres **is** wired in here, as of `/events`. The daemon serves its event
+stream off the database, so the browser specs need one; set
+`HIVE_SANDBOX_TEST_DATABASE_URL` the same way the Go tests do.
+
+Each worker gets its own schema, created before the daemon starts and dropped
+when the worker ends, and the daemon migrates into it. That isolation is not
+tidiness: these specs assert on what a stream did **not** deliver, and one stray
+event from another worker would look exactly like a broken visibility filter.
+
+Events are written straight to Postgres by the spec rather than through the
+daemon. The design claim is that the events table is the transport and NOTIFY is
+only a wakeup bell, so a test that publishes through the daemon proves the
+daemon can talk to itself and nothing more.
 
 ## Writing an SSE spec
 

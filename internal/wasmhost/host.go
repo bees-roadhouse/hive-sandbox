@@ -15,6 +15,12 @@ import (
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
 
+// wasmPageBytes is the WebAssembly page size. Used where a memory CEILING has
+// to be turned into bytes, which is only the pinned reservation: everywhere
+// else the pool measures what an instance actually holds rather than what it is
+// allowed to.
+const wasmPageBytes = 64 * 1024
+
 // Config tunes the runtime. The zero value is usable: Defaults fills it.
 type Config struct {
 	// CacheDir persists wazero's compilation cache across restarts. Empty means
@@ -40,7 +46,21 @@ type Config struct {
 	// PoolMemoryBudget bounds the pool by SUMMED wasm memory of idle instances,
 	// in bytes, rather than by instance count. Memory dominates the per-instance
 	// footprint, so counting instances measures the wrong thing.
+	//
+	// Reserved memory (pinned instances) is subtracted from this, so it is the
+	// total the host will hold, not the total on top of pinning.
 	PoolMemoryBudget uint64
+
+	// ReservedMemoryBudget caps what ResidencyPinned instances may hold in
+	// total (D9.3). Pinned memory is unevictable by declaration, so without a
+	// separate ceiling a few pinned stream nodes would quietly consume the
+	// whole pool and warmth would collapse without anything looking wrong.
+	ReservedMemoryBudget uint64
+
+	// Limiter bounds LIVE instances. Nil means unlimited, which is fine for
+	// tests and wrong for the daemon: the pool bounds idle memory only, so
+	// without a limiter N concurrent calls is N live instances with no ceiling.
+	Limiter Limiter
 
 	// IdleTTL evicts an instance that has sat unused this long.
 	IdleTTL time.Duration
@@ -77,6 +97,15 @@ func (c Config) Defaults() Config {
 	}
 	if c.PoolMemoryBudget == 0 {
 		c.PoolMemoryBudget = 512 * 1024 * 1024
+	}
+	if c.ReservedMemoryBudget == 0 {
+		// A quarter of the pool. Pinning is a declared capability an AI-built
+		// app cannot grant itself (D9.3), so the ceiling exists to bound
+		// first-party mistakes rather than adversarial ones.
+		c.ReservedMemoryBudget = c.PoolMemoryBudget / 4
+	}
+	if c.Limiter == nil {
+		c.Limiter = unlimited{}
 	}
 	if c.IdleTTL == 0 {
 		c.IdleTTL = 5 * time.Minute
@@ -121,6 +150,22 @@ const (
 	TerminationOff
 )
 
+// Residency is how an instance relates to the pool (D9.3).
+type Residency uint8
+
+const (
+	// ResidencyPooled is the default and covers everything except one case:
+	// disposable, checkpointed, evictable, host-portable.
+	ResidencyPooled Residency = iota
+
+	// ResidencyPinned is a `guest_pinned` stream node: a long-running guest
+	// call holding rolling state it cannot serialize. Memory-reserved,
+	// unevictable, host-affine, and never in the idle LRU. It is a declared
+	// capability precisely because it gives up every property that makes guests
+	// cheap, so an AI-built app cannot grant itself one.
+	ResidencyPinned
+)
+
 // Module identifies one version of one guest. Hash is the content address of
 // the wasm bytes and is the only field the caches key on: App and Version are
 // for logs and metrics, the rest comes from the manifest.
@@ -131,6 +176,7 @@ type Module struct {
 	MemoryPages  uint32
 	Capabilities CapabilitySet
 	Termination  Termination
+	Residency    Residency
 }
 
 func (m Module) validate() error {
@@ -213,7 +259,7 @@ func New(ctx context.Context, cfg Config, deps Deps) (*Host, error) {
 		cfg:       cfg,
 		deps:      deps.withStubs(),
 		cache:     cache,
-		pool:      newPool(cfg.PoolMemoryBudget, cfg.IdleTTL),
+		pool:      newPool(cfg.PoolMemoryBudget, cfg.ReservedMemoryBudget, cfg.IdleTTL),
 		tiers:     make(map[tierKey]*tier, len(cfg.MemoryTiers)),
 		sweepDone: make(chan struct{}),
 	}
@@ -351,15 +397,22 @@ type Stats struct {
 	IdleInstances int
 	IdleBytes     uint64
 	BudgetBytes   uint64
+	// ReservedBytes is memory held by pinned instances. It is already
+	// subtracted from what the idle set may hold, so IdleBytes plus
+	// ReservedBytes is what the host is actually holding.
+	ReservedBytes uint64
 	Tiers         int
 }
 
 func (h *Host) Stats() Stats {
-	idle, bytes := h.pool.stats()
+	idle, bytes, reserved := h.pool.stats()
 	h.mu.Lock()
 	tiers := len(h.tiers)
 	h.mu.Unlock()
-	return Stats{IdleInstances: idle, IdleBytes: bytes, BudgetBytes: h.cfg.PoolMemoryBudget, Tiers: tiers}
+	return Stats{
+		IdleInstances: idle, IdleBytes: bytes, ReservedBytes: reserved,
+		BudgetBytes: h.cfg.PoolMemoryBudget, Tiers: tiers,
+	}
 }
 
 // guestWriter routes a guest's stdout or stderr into the daemon log with app

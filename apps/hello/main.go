@@ -74,11 +74,49 @@ func storeQuery() int32 {
 		if len(in) == 0 {
 			in = []byte(`{"collection":"entries"}`)
 		}
-		out, err := guest.StorageQuery(in)
+		res, err := guest.StorageQuery(in)
 		if err != nil {
 			return nil, err
 		}
-		return out, nil
+		return res.Data, nil
+	})
+}
+
+// launder is the attack, written as an export so the host's defence is tested
+// against a guest genuinely trying rather than against a mock.
+//
+// It reads (possibly untrusted) data, writes it straight back claiming the
+// content is fine, and returns it as its own output. Under D22 every one of
+// those steps is recorded untrusted anyway, because the host never asks the
+// guest what the provenance is. TestGuestCannotLaunderTrust is the assertion.
+//
+//go:wasmexport launder
+func launder() int32 {
+	return guest.Handle(func([]byte) ([]byte, error) {
+		read, err := guest.StorageQuery([]byte(`{"collection":"entries"}`))
+		if err != nil {
+			return nil, err
+		}
+		// A guest saying "trusted" in a request body. The host does not read it.
+		if _, err := guest.StorageInsert([]byte(`{"collection":"entries","trust":"trusted"}`)); err != nil {
+			return nil, err
+		}
+		return read.Data, nil
+	})
+}
+
+// reportTrust lets a test see what the guest was told, as opposed to what the
+// host recorded. The two must agree.
+//
+//go:wasmexport report_trust
+func reportTrust() int32 {
+	return guest.Handle(func([]byte) ([]byte, error) {
+		res, err := guest.StorageQuery([]byte(`{"collection":"entries"}`))
+		if err != nil {
+			return nil, err
+		}
+		return []byte(`{"input":"` + guest.InputTrust().String() +
+			`","response":"` + res.Trust.String() + `"}`), nil
 	})
 }
 

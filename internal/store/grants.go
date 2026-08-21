@@ -10,15 +10,35 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/bees-roadhouse/hive-sandbox/internal/identity"
 )
 
-// PrincipalKind is who can own and be granted to. An AI is never a principal
-// (D13.4): it authors, its principal owns.
-type PrincipalKind string
+// PrincipalKind, Credential and Owner are ALIASES, not copies. The definitions
+// live in internal/identity because internal/wasmhost needs the same three
+// fields to pin the same credential on every guest call, and two structurally
+// identical types in two packages is a conversion function waiting to be
+// written and then waiting to be wrong.
+//
+// Aliases rather than named types on purpose: every existing use of
+// store.Credential keeps compiling, and store.Credential IS
+// identity.Credential rather than merely resembling it.
+type (
+	// PrincipalKind is who can own and be granted to. An AI is never a
+	// principal (D13.4): it authors, its principal owns.
+	PrincipalKind = identity.PrincipalKind
+
+	// Credential is the pair D17.4 makes non-negotiable: who acted, and whose
+	// authority they acted under.
+	Credential = identity.Credential
+
+	// Owner is the principal a row belongs to.
+	Owner = identity.Owner
+)
 
 const (
-	PrincipalUser PrincipalKind = "user"
-	PrincipalOrg  PrincipalKind = "org"
+	PrincipalUser = identity.PrincipalUser
+	PrincipalOrg  = identity.PrincipalOrg
 )
 
 // SubjectKind is what a grant is written against (D18.1). Allowlist only ...
@@ -74,16 +94,6 @@ func (r Reason) Allowed() bool { return r != Deny }
 // this ... the difference is an existence oracle.
 var ErrDenied = errors.New("denied")
 
-// Credential is the pair D17.4 makes non-negotiable: who acted, and whose
-// authority they acted under. "Nate did this" and "an AI acting for Nate did
-// this" must be distinguishable on every request, so both travel together and
-// the predicate re-checks that they agree.
-type Credential struct {
-	ActorID       uuid.UUID
-	PrincipalKind PrincipalKind
-	PrincipalID   uuid.UUID
-}
-
 // Subject identifies what a grant is written against. Name is empty for
 // install and entity subjects; for tool, route and collection, ID is the
 // install id and Name qualifies within it.
@@ -100,6 +110,7 @@ func (s Subject) name() any {
 	return s.Name
 }
 
+<<<<<<< HEAD
 // Owner is the principal a row belongs to. Ownership is per-row and it is what
 // keeps an org admin out of a member's personal entries (D18.2).
 //
@@ -110,6 +121,8 @@ type Owner struct {
 	ID   uuid.UUID
 }
 
+=======
+>>>>>>> 50d94dc (feat(wasmhost): trust in the ABI, plus four fixes from Augie's review)
 // Guard answers "may this actor do this" and is the only thing in the platform
 // allowed to. It holds no policy of its own: every decision comes from
 // access_decision(), the SQL function migration one installs.

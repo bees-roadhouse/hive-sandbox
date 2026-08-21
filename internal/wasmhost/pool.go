@@ -3,9 +3,11 @@ package wasmhost
 import (
 	"container/list"
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tetratelabs/wazero/api"
 )
 
@@ -24,11 +26,18 @@ import (
 // is single digits, so the pool fragments by a small constant.
 type instanceKey struct {
 	moduleHash string
-	principal  PrincipalID
+	principal  uuid.UUID
 	// tier, because an instance belongs to the runtime that made it. Two
 	// runtimes differ in memory ceiling and in whether termination checks are
 	// compiled in, so their instances are not interchangeable.
 	tier tierKey
+	// caps, because the link-time capability check used to run only on a pool
+	// miss. With capabilities out of the key, warming the host with storage
+	// granted and then calling with it revoked handed back the warm instance
+	// and the guest kept its access. The check is now unconditional on the call
+	// path as well; this is the half that makes a warm instance unusable by a
+	// call that does not carry the identical grant.
+	caps uint32
 }
 
 type instance struct {
@@ -53,12 +62,18 @@ type instance struct {
 // instanceOverheadBytes is what wazero allocates per instance beyond the
 // guest's linear memory: tables, globals, the module instance itself.
 //
-// Measured at ~10 KB against 128 KB of linear memory (BenchmarkInstanceFootprint,
-// docs/wasmhost-benchmarks.md), which confirms the premise that memory
-// dominates and a count-bounded pool would measure the wrong thing. It is
-// counted anyway so a 512MB budget means 512MB rather than 512MB plus eight
-// percent.
-const instanceOverheadBytes = 16 << 10
+// Measured by BenchmarkInstanceFootprint at 10 KB to 20 KB across runs and
+// machines, against 128 KB of linear memory: memory dominates somewhere between
+// 6:1 and 13:1, which is the premise the pool rests on and the reason a
+// count-bounded pool would measure the wrong thing. The spread is heap
+// accounting noise, so the range is the honest figure rather than any one run.
+//
+// The constant sits deliberately ABOVE the top of that range. Over-counting
+// means the pool holds slightly fewer instances than it could; under-counting
+// means the host quietly overcommits the box. An earlier 16 KB was chosen
+// against a footprint benchmark that subtracted this same constant from its own
+// measurement and therefore reported the overhead 16 KB too low.
+const instanceOverheadBytes = 32 << 10
 
 // memBytes reports the instance's current wasm memory size.
 func (i *instance) memBytes() uint64 {
@@ -84,23 +99,85 @@ func (i *instance) close(ctx context.Context) {
 // count-bounded pool measures the wrong thing.
 //
 // Eviction and kill are the same primitive: Module.Close.
+// There are two budgets, not one, and D9.3 is why. A `guest_pinned` stream node
+// holds a long-running guest call with rolling state it cannot serialize, so it
+// is unevictable by declaration. Charging it to the same budget as the idle set
+// would let eviction pressure from ordinary traffic try to close it, and would
+// let reserved memory and evictable memory each promise the operator the whole
+// box.
+//
+// So reserved memory is subtracted from what the evictable pool may hold:
+// `evictable budget = budget - reserved`. Pinning memory takes it away from
+// warmth, visibly, which is the honest accounting and the reason an AI-built
+// app cannot grant itself this (D9.3).
 type pool struct {
-	mu     sync.Mutex
-	idle   map[instanceKey][]*instance
-	lru    *list.List // front = most recently used
-	bytes  uint64
-	budget uint64
-	ttl    time.Duration
-	closed bool
+	mu       sync.Mutex
+	idle     map[instanceKey][]*instance
+	lru      *list.List // front = most recently used
+	bytes    uint64
+	budget   uint64
+	reserved uint64
+	// reservedBudget caps what pinned instances may hold in total. It is a
+	// ceiling on the ceiling: pinning cannot consume the entire pool.
+	reservedBudget uint64
+	ttl            time.Duration
+	closed         bool
 }
 
-func newPool(budget uint64, ttl time.Duration) *pool {
+func newPool(budget, reservedBudget uint64, ttl time.Duration) *pool {
 	return &pool{
-		idle:   make(map[instanceKey][]*instance),
-		lru:    list.New(),
-		budget: budget,
-		ttl:    ttl,
+		idle:           make(map[instanceKey][]*instance),
+		lru:            list.New(),
+		budget:         budget,
+		reservedBudget: reservedBudget,
+		ttl:            ttl,
 	}
+}
+
+// evictableBudgetLocked is what the idle set may hold right now. Reserved
+// memory is already spent.
+func (p *pool) evictableBudgetLocked() uint64 {
+	if p.reserved >= p.budget {
+		return 0
+	}
+	return p.budget - p.reserved
+}
+
+// reserve charges a pinned instance against the reserved budget, or refuses.
+func (p *pool) reserve(ctx context.Context, bytes uint64) error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return ErrClosed
+	}
+	if p.reservedBudget > 0 && p.reserved+bytes > p.reservedBudget {
+		held, cap := p.reserved, p.reservedBudget
+		p.mu.Unlock()
+		return fmt.Errorf("%w: pinned instances hold %d of %d reserved bytes, this one needs %d",
+			ErrAtCapacity, held, cap, bytes)
+	}
+	p.reserved += bytes
+
+	// Pinning shrinks what warmth may hold, so make room now rather than
+	// discovering the overdraft on the next release.
+	evicted := p.evictLocked()
+	p.mu.Unlock()
+
+	for _, e := range evicted {
+		e.close(ctx)
+	}
+	return nil
+}
+
+// unreserve returns a pinned instance's memory to the evictable budget.
+func (p *pool) unreserve(bytes uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if bytes > p.reserved {
+		p.reserved = 0
+		return
+	}
+	p.reserved -= bytes
 }
 
 // acquire takes a warm instance out of the pool, or returns nil if there is
@@ -164,7 +241,7 @@ func (p *pool) release(ctx context.Context, inst *instance) {
 // would stall every other call in the process.
 func (p *pool) evictLocked() []*instance {
 	var evicted []*instance
-	for p.bytes > p.budget {
+	for p.bytes > p.evictableBudgetLocked() {
 		back := p.lru.Back()
 		if back == nil {
 			break
@@ -226,10 +303,10 @@ func (p *pool) closeAll(ctx context.Context) {
 	}
 }
 
-func (p *pool) stats() (int, uint64) {
+func (p *pool) stats() (idle int, idleBytes, reserved uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.lru.Len(), p.bytes
+	return p.lru.Len(), p.bytes, p.reserved
 }
 
 // remove takes an instance out of the LRU list and the byte total, leaving the

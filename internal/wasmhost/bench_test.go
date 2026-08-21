@@ -41,7 +41,7 @@ func benchModule(b *testing.B) ([]byte, Module) {
 }
 
 func benchCaller() Caller {
-	return Caller{AuthorActor: "actor:pia", OwnerPrincipal: "user:nate", InstallID: "install:1"}
+	return testCallerFor(principNate)
 }
 
 // minimalNoop is a hand-written module exporting one memory and one function
@@ -81,7 +81,7 @@ func BenchmarkRuntimeFloor(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			inst, err := h.instantiate(ctx, t, compiled, mod, instanceKey{hash, "user:nate", t.key})
+			inst, err := h.instantiate(ctx, t, compiled, mod, instanceKey{moduleHash: hash, principal: principNate, tier: t.key, caps: mod.Capabilities.bits()})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -145,7 +145,7 @@ func BenchmarkInstantiate(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	key := instanceKey{moduleHash: mod.Hash, principal: "user:nate", tier: t.key}
+	key := instanceKey{moduleHash: mod.Hash, principal: principNate, tier: t.key, caps: mod.Capabilities.bits()}
 
 	b.ReportAllocs()
 	for b.Loop() {
@@ -176,7 +176,7 @@ func BenchmarkInstanceFootprint(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	key := instanceKey{moduleHash: mod.Hash, principal: "user:nate", tier: t.key}
+	key := instanceKey{moduleHash: mod.Hash, principal: principNate, tier: t.key, caps: mod.Capabilities.bits()}
 
 	var heapPer, wasmPer float64
 	for b.Loop() {
@@ -198,7 +198,13 @@ func BenchmarkInstanceFootprint(b *testing.B) {
 			}); err != nil {
 				b.Fatal(err)
 			}
-			wasmBytes += inst.memBytes()
+			// The RAW linear memory, not memBytes(): that adds
+			// instanceOverheadBytes, so subtracting it from the heap delta
+			// below would report realOverhead minus 16384. It did, and the
+			// answer came out negative while the doc quoted "~10 KB".
+			if mem := inst.mod.Memory(); mem != nil {
+				wasmBytes += uint64(mem.Size())
+			}
 			held = append(held, inst)
 		}
 
@@ -213,6 +219,11 @@ func BenchmarkInstanceFootprint(b *testing.B) {
 	b.ReportMetric(heapPer, "heap_bytes/instance")
 	b.ReportMetric(wasmPer, "wasm_bytes/instance")
 	b.ReportMetric(heapPer-wasmPer, "overhead_bytes/instance")
+	// The ratio the pool design rests on, reported rather than derived by hand
+	// in a doc. That is how the first version of this number went wrong.
+	if heapPer > wasmPer {
+		b.ReportMetric(wasmPer/(heapPer-wasmPer), "memory:overhead_ratio")
+	}
 }
 
 // BenchmarkTermination is number three: the real cost of WithCloseOnContextDone.
@@ -273,8 +284,8 @@ func BenchmarkHostCall(b *testing.B) {
 	ctx := context.Background()
 	cfg := Config{Logger: quietLogger()}
 	h, err := New(ctx, cfg, Deps{Storage: fakeStorage{
-		query: func(context.Context, Request) (json.RawMessage, error) {
-			return json.RawMessage(`{"rows":[]}`), nil
+		query: func(context.Context, Request) (Response, error) {
+			return Trusted(json.RawMessage(`{"rows":[]}`)), nil
 		},
 	}})
 	if err != nil {

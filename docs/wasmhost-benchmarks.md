@@ -37,15 +37,29 @@ Compilation at 47 ms is 570x an instantiation, which is what the single-flight
 and the on-disk cache exist for. A restart with a cold cache pays it once per
 distinct module; a restart with a warm one does not pay it at all.
 
-### 2. Per-instance bookkeeping: ~10 KB against 131 KB of linear memory
+### 2. Per-instance bookkeeping: 10-20 KB against 131 KB of linear memory
 
 | | bytes per instance |
 |---|---|
 | wasm linear memory | 131,072 (2 pages) |
-| everything else wazero allocates | ~10,000 |
+| everything else wazero allocates | 10,000-20,000 |
 
-**Memory dominates, 13 to 1.** Bounding the pool by summed wasm memory rather
-than by instance count is measuring the right thing, and Andi's call holds.
+**Memory dominates, somewhere between 6:1 and 13:1.** Bounding the pool by
+summed wasm memory rather than by instance count is measuring the right thing,
+and Andi's call holds.
+
+> **Correction.** The first version of this section said "~10 KB" and "13 to 1"
+> as if they were one measurement. They were not: `BenchmarkInstanceFootprint`
+> subtracted `instanceOverheadBytes` from its own result, because `memBytes()`
+> already adds that constant, so it reported `realOverhead - 16384` and went
+> negative. The figures above are the honest range across runs and machines; the
+> spread is heap-accounting noise, and reporting one run as if it were the answer
+> is what produced the error in the first place. The benchmark now reports the
+> ratio itself rather than leaving it to be derived by hand in a document.
+>
+> Consequence: `instanceOverheadBytes` was raised from 16 KB to **32 KB**, above
+> the top of the measured range. Over-counting costs a few idle instances;
+> under-counting silently overcommits the box.
 
 Two things worth knowing beyond the ratio:
 
@@ -70,12 +84,28 @@ On the real guest:
 
 | call | off | on | ratio |
 |---|---|---|---|
-| `noop` | 2.23 us | 4.57 us | 2.1x |
-| `hello` (JSON in, JSON out, 2 ABI crossings) | 10.6 us | 43.6 us | **4.1x** |
-| 2M-iteration compute loop | 2.40 ms | 44.2 ms | **18.4x** |
+| `noop` | 2.95 us | 2.98 us | **1.0x** |
+| `hello` (JSON in, JSON out, 2 ABI crossings) | 9.98 us | 44.8 us | **4.5x** |
+| 2M-iteration compute loop | 2.41 ms | 42.2 ms | **17.4x** |
 
-wazero describes this as "a bit of extra cost." On a tight loop it is 18x,
+wazero describes this as "a bit of extra cost." On a tight loop it is 17x,
 because the check lands on the loop back-edge and the body is six instructions.
+
+> **Correction, and it changed the code.** The `noop` row used to read 2.23 us
+> against 4.57 us, and Augie was right that the 2.3 us gap was not wazero: it was
+> a **watchdog goroutine spawned on every call**, which the runtime floor row
+> exposes as the control (wazero's own per-call cost is 250 ns, not 2,300).
+>
+> The watchdog is now a `context.AfterFunc` callback, which registers and spawns
+> nothing unless the deadline actually fires. `noop` is a dead heat, so the
+> per-call cost of enabling termination is now genuinely zero.
+>
+> The 4.5x on `hello` survived that fix unchanged, which is the useful part: it
+> is not per-call overhead at all, it is the checks instrumenting guest code, and
+> `hello` runs a lot of guest code (TinyGo's JSON decode). The runtime floor
+> measures a module whose body is one instruction, so it can only ever see setup
+> cost. **Per-module termination is still the right design and is now justified
+> by a number that measures the thing it names.**
 
 **So the answer to "measure before enabling it globally" is: do not enable it
 globally, and do not disable it globally either.** It is now `Module.Termination`,
@@ -136,11 +166,18 @@ memory in production.
 
 | setting | value | why |
 |---|---|---|
-| `PoolMemoryBudget` | 512 MB | ~3,500 idle instances at 147 KB each |
+| `PoolMemoryBudget` | 512 MB | ~3,200 idle instances at 163 KB each |
+| `ReservedMemoryBudget` | a quarter of the pool | pinned memory is unevictable, so it needs its own ceiling (D9.3) |
 | `IdleTTL` | 5 min | instantiation is 83 us, so re-warming is cheap; holding memory is not |
 | `MemoryTiers` | 256 / 1024 / 4096 pages | actual use is 2 pages, so the smallest tier already has 128x headroom |
-| `DefaultTermination` | on | see 3 |
+| `instanceOverheadBytes` | 32 KB | above the top of the measured 10-20 KB range; see the correction in 2 |
+| `DefaultTermination` | on | see 3, and it now costs nothing per call |
 | guest build | `-scheduler=none`, no `-opt` | see 4, and `scripts/guest-build.md` |
+
+Two of these came from numbers that were wrong the first time, and both errors
+had the same shape: a figure derived by hand in prose rather than reported by
+the code that measured it. The benchmarks now emit the ratio and the overhead
+directly.
 
 ## Caveats
 

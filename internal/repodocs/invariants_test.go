@@ -100,6 +100,8 @@ var requiredPhrases = []string{
 	"verdict on the pair",
 	"Check that the package built",
 	"the contradiction was in the instrument",
+	"Check which refusal",
+	"you have found the second kind",
 }
 
 // TestRequiredGuidanceSurvives fails when a merge drops guidance the numbered

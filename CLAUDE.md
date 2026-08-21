@@ -82,18 +82,27 @@ even if the tests pass.
     dimension its correctness depends on, or the reuse skips the check the first
     caller passed.
 
-    **Five times here**, in five subsystems that share no code: a memoization
+    **Seven times here**, in seven subsystems that share no code: a memoization
     cache without the principal, a warm guest instance without the capability
     set, a client cache whose presence was read as permission, an HTTP transport
     pooling a connection opened under a loose egress rule for a request under a
-    strict one, and a per-app schema **name** derived from the app alone when the
-    schema belongs to an *install* ... so two owners of the same app collided on
-    a unique index, and would have shared one schema and each other's documents
-    if that index had not existed.
+    strict one, a per-app schema **name** derived from the app alone when the
+    schema belongs to an *install*, an install slug truncated past the point
+    where its digest still separated two of them, and an MCP tool **name** ...
+    `journal.journal.add` ... that carries the app and not the owner, so with two
+    active installs of one app a call reached whichever row came back first.
 
     The transport one was found only by making the rule travel with the dial; the
     schema one only by building on it. Reading did not reveal either. **When you
     key anything, write down what the key omits and why that is safe.**
+
+    **Then ask what happens when two keys collide, because that is the difference
+    between the fifth and the seventh.** The schema collision hit a unique index
+    and failed loudly. The tool name has no index behind it, so it silently picks
+    one and the audit trail records the wrong install honestly ... nothing looks
+    wrong afterwards. A collision that fails closed is a bug report; a collision
+    that resolves to *something* is a data leak with no symptom. **If the answer
+    is "it just picks one", you have found the second kind.**
 
 ## Born-green gate
 
@@ -195,7 +204,7 @@ test/                  integration tests, including Playwright-driven HTTP/SSE
      well written. Ask what size makes the loop take its other path.
 - **Ask what the instrument measured before believing it.** The general form,
   and every detector below is an instance of it: **the instrument answered a
-  narrower question than the one you are about to report.** Six, each earned
+  narrower question than the one you are about to report.** Seven, each earned
   here by nearly shipping the thing it catches:
   - **Check the platform.** Green on your machine is a claim about your machine.
     A test that passed three times on Windows failed deterministically on Linux,
@@ -223,8 +232,19 @@ test/                  integration tests, including Playwright-driven HTTP/SSE
     clause standing and vice versa. A pass came back "five uncaught", which reads
     as five worthless tests and actually meant the redundancy was real.
     **"Uncaught" is a verdict on the pair, not on the test.**
+  - **Check which refusal.** Asserting that a bad input *was refused* asserts
+    almost nothing, because malformed inputs are over-determined ... they are
+    usually refusable several ways at once, and the test cannot tell you which
+    one it exercised. A 69-level fixture proving a 64-level depth bound would be
+    refused by the parser too. A 261-descriptor fixture proving a 256 count bound
+    proves nothing if the generator repeated a digest, because dedupe drops it
+    under the bound and the parse succeeds. **Assert the message, and assert the
+    fixture is big enough to reach the bound before relying on it.** Three
+    reproductions here passed by hitting a foreign key, an unknown-tool error and
+    a parse error rather than the rule under test; the message assertion caught
+    all three. Refusal is the cheapest thing to get accidentally right.
 - **Some instruments cannot express the distinction the question needs, and no
-  amount of careful reading fixes that.** The six above are people over-reading
+  amount of careful reading fixes that.** The seven above are people over-reading
   an instrument. This one is different: the SSE test reader silently discarded an
   all-empty block, so "no frame arrived" covered three unrelated causes ... the
   handler returned, the branch was starved, or a frame was written the parser

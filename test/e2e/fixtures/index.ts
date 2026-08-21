@@ -1,39 +1,68 @@
+import { randomBytes } from 'node:crypto';
+
 import { test as base } from '@playwright/test';
 
 import { type Daemon, startDaemon } from './daemon';
-import { type SSEStub, startSSEStub } from './sse-stub';
+import { createSchema, EventWriter, type Schema } from './db';
 
-export { collectSSE, openSameOriginPage, type CollectOptions, type SSEEvent } from './sse';
+export {
+  collectSSE,
+  openSameOriginPage,
+  resetSSEOpenCount,
+  waitForSSEOpen,
+  type CollectOptions,
+  type SSEEvent,
+} from './sse';
 export type { Daemon } from './daemon';
-export type { SSEStub } from './sse-stub';
+export { EventWriter } from './db';
 
 interface WorkerFixtures {
   /**
+   * A Postgres schema of this worker's own. The daemon migrates into it, so
+   * workers never see each other's events ... which matters because these specs
+   * assert on what a stream did NOT deliver.
+   */
+  schema: Schema;
+
+  /**
    * A running daemon on an ephemeral port, one per worker, torn down when the
    * worker ends. Worker-scoped on purpose: booting per test would dominate the
-   * runtime and nothing in the suite mutates daemon state yet. The day a spec
-   * needs a daemon of its own, give it a test-scoped fixture rather than making
-   * every spec pay for a restart.
+   * runtime. The day a spec needs a daemon of its own, give it a test-scoped
+   * fixture rather than making every spec pay for a restart.
    */
   daemon: Daemon;
 }
 
 interface TestFixtures {
   /**
-   * Throwaway SSE server; see fixtures/sse-stub.ts. Delete along with it.
-   *
-   * Test-scoped, not worker-scoped: it counts connections and reconnects, and a
-   * shared counter would make assertions depend on test order.
+   * Appends events straight to Postgres, the way any other writer would. The
+   * daemon is the thing under test, so the events it streams should not come
+   * from the daemon.
    */
-  sseStub: SSEStub;
+  events: EventWriter;
   /** Auto-used: attaches the daemon's own log to any test that failed. */
   daemonLogs: void;
 }
 
 export const test = base.extend<TestFixtures, WorkerFixtures>({
-  daemon: [
+  schema: [
     async ({}, use) => {
-      const daemon = await startDaemon();
+      const schema = await createSchema();
+      try {
+        await use(schema);
+      } finally {
+        await schema.drop();
+      }
+    },
+    { scope: 'worker' },
+  ],
+
+  daemon: [
+    async ({ schema }, use) => {
+      const daemon = await startDaemon({
+        databaseURL: schema.url,
+        token: `e2e-${randomBytes(16).toString('hex')}`,
+      });
       try {
         await use(daemon);
       } finally {
@@ -43,12 +72,14 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
     { scope: 'worker' },
   ],
 
-  sseStub: async ({}, use) => {
-    const stub = await startSSEStub();
+  events: async ({ schema, daemon }, use) => {
+    // Depends on daemon so the root actor exists: the daemon bootstraps it.
+    void daemon;
+    const writer = await EventWriter.connect(schema);
     try {
-      await use(stub);
+      await use(writer);
     } finally {
-      await stub.close();
+      await writer.close();
     }
   },
 

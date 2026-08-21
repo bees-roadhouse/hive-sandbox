@@ -812,6 +812,9 @@ CREATE TABLE entities (
     author_actor uuid NOT NULL REFERENCES actors (id),
 
     trust        text NOT NULL DEFAULT 'trusted' CHECK (trust IN ('trusted', 'untrusted')),
+    -- Which operation first weakened the invocation that wrote this row.
+    -- Diagnostic only; see events.tainted_by.
+    tainted_by   text,
     -- D17.12: cause_depth rides everything a run produces, not just mentions,
     -- or it cannot propagate and the loop guard has nothing to count.
     cause_depth  int NOT NULL DEFAULT 0 CHECK (cause_depth >= 0),
@@ -878,6 +881,11 @@ CREATE TABLE events (
 
     body           jsonb NOT NULL DEFAULT '{}',
     trust          text NOT NULL DEFAULT 'trusted' CHECK (trust IN ('trusted', 'untrusted')),
+    -- Which operation FIRST weakened the invocation that produced this row.
+    -- Diagnostic only: nothing branches on it, and nothing should. Without it,
+    -- an untrusted row says it is untrusted and the answer to "why did this
+    -- lose egress" lives in a log somebody has to still have.
+    tainted_by     text,
     cause_depth    int NOT NULL DEFAULT 0 CHECK (cause_depth >= 0),
     run_id         uuid,
 
@@ -911,9 +919,19 @@ CREATE TABLE events_default PARTITION OF events DEFAULT;
 CREATE FUNCTION ensure_events_partition(p_month date) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
-    lo   date := date_trunc('month', p_month)::date;
-    hi   date := (date_trunc('month', p_month) + interval '1 month')::date;
-    name text := format('events_%s', to_char(lo, 'YYYY_MM'));
+    -- Boundaries are pinned to midnight UTC, not to a date.
+    --
+    -- created_at is timestamptz, so a partition bound written as a bare date is
+    -- resolved in the SESSION's TimeZone. Two hosts with different TimeZone
+    -- settings would then compute different boundaries for the same month, and
+    -- a row landing either side of the seam goes to the default partition,
+    -- which is the one place rows can never be pruned from. Found by a test
+    -- that created twelve months from a client in America/New_York and had the
+    -- fifth one collide with rows the first four had already filed.
+    m    timestamp   := date_trunc('month', p_month::timestamp);
+    lo   timestamptz := m AT TIME ZONE 'UTC';
+    hi   timestamptz := (m + interval '1 month') AT TIME ZONE 'UTC';
+    name text := format('events_%s', to_char(m, 'YYYY_MM'));
     blocking bigint;
 BEGIN
     -- IF NOT EXISTS rather than a to_regclass probe followed by CREATE: the
@@ -1724,4 +1742,99 @@ BEGIN
 
     RETURN NEXT;
 END;
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- Event visibility.
+--
+-- An event that names a grantable subject follows that subject, so a revoked
+-- grant stops replay (D4.13). An event that names none ... a run changing
+-- state, a daemon lifecycle note ... falls back to its own owner, because there
+-- is nothing to write a grant against.
+--
+-- Both of these read the events row THEMSELVES rather than taking its owner as
+-- a parameter, and they are set-returning rather than per-row for the same
+-- reason: there is no signature a caller can pass a mismatched owner through,
+-- and no query shape a future caller can compose wrongly. The caller supplies a
+-- cursor and a credential, and nothing else.
+--
+-- The earlier draft took p_owner_kind / p_owner_id and argued it was safe
+-- because the caller reads them off the row it is filtering. Probably true, and
+-- exactly the shape that erodes.
+-- ---------------------------------------------------------------------------
+
+CREATE FUNCTION event_row_reason(
+    p_subject_kind   text,
+    p_subject_id     uuid,
+    p_subject_name   text,
+    p_owner_kind     text,
+    p_owner_id       uuid,
+    p_principal_kind text,
+    p_principal_id   uuid,
+    p_actor_id       uuid,
+    p_now            timestamptz
+) RETURNS text
+LANGUAGE plpgsql STABLE PARALLEL SAFE AS $fn$
+BEGIN
+    IF p_subject_kind IS NOT NULL AND p_subject_id IS NOT NULL THEN
+        RETURN access_reason(p_subject_kind, p_subject_id, p_subject_name,
+                             p_principal_kind, p_principal_id, p_actor_id, 'read', p_now);
+    END IF;
+    IF acting_kind(p_actor_id, p_principal_kind, p_principal_id) IS NULL THEN
+        RETURN NULL;
+    END IF;
+    IF p_owner_kind = p_principal_kind AND p_owner_id = p_principal_id THEN
+        RETURN 'owner';
+    END IF;
+    RETURN NULL;
+END;
+$fn$;
+
+COMMENT ON FUNCTION event_row_reason IS
+'Internal to visible_events and visible_event_ids. Do not call directly: the
+owner parameters are only safe because those two read them off the row being
+filtered in the same query.';
+
+-- Replay: everything after the cursor this credential may see, right now.
+--
+-- p_since prunes partitions and must be at or before p_after_at. Filtering with
+-- CURRENT permissions rather than permissions as of the event is D4.13, and it
+-- is free here because access_reason is evaluated at query time.
+CREATE FUNCTION visible_events(
+    p_since          timestamptz,
+    p_after_at       timestamptz,
+    p_after_id       bigint,
+    p_principal_kind text,
+    p_principal_id   uuid,
+    p_actor_id       uuid,
+    p_limit          int
+) RETURNS SETOF events
+LANGUAGE sql STABLE AS $fn$
+    SELECT e.*
+      FROM events e
+     WHERE e.created_at >= p_since
+       AND (e.created_at, e.id) > (p_after_at, p_after_id)
+       AND event_row_reason(e.subject_kind, e.subject_id, e.subject_name,
+                            e.owner_kind, e.owner_id,
+                            p_principal_kind, p_principal_id, p_actor_id, now()) IS NOT NULL
+     ORDER BY e.created_at, e.id
+     LIMIT p_limit;
+$fn$;
+
+-- The live path: one shared reader receives everything and the host filters per
+-- subscriber after receipt (D4.9), through the same rule the replay path uses.
+CREATE FUNCTION visible_event_ids(
+    p_ids            bigint[],
+    p_created_ats    timestamptz[],
+    p_principal_kind text,
+    p_principal_id   uuid,
+    p_actor_id       uuid
+) RETURNS SETOF bigint
+LANGUAGE sql STABLE AS $fn$
+    SELECT e.id
+      FROM unnest(p_ids, p_created_ats) AS c(id, created_at)
+      JOIN events e ON e.created_at = c.created_at AND e.id = c.id
+     WHERE event_row_reason(e.subject_kind, e.subject_id, e.subject_name,
+                            e.owner_kind, e.owner_id,
+                            p_principal_kind, p_principal_id, p_actor_id, now()) IS NOT NULL;
 $fn$;

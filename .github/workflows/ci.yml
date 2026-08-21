@@ -84,6 +84,27 @@ jobs:
   # suite drives the daemon's HTTP and SSE surface, not Postgres.
   e2e:
     runs-on: ubuntu-latest
+    # The daemon serves /events off Postgres, so the browser specs need one.
+    # This job deliberately had no database until the daemon needed one.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: hive
+          POSTGRES_PASSWORD: hive
+          POSTGRES_DB: hive_sandbox_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U hive"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Each Playwright worker creates its own schema on this database and
+      # drops it afterwards, so workers cannot see each other's events. That
+      # matters here more than in the Go tests: these specs assert on what a
+      # stream did NOT deliver, and a stray event would look like a filter bug.
+      HIVE_SANDBOX_TEST_DATABASE_URL: postgres://hive:hive@localhost:5432/hive_sandbox_test
     defaults:
       run:
         working-directory: test/e2e

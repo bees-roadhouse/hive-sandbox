@@ -17,10 +17,13 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/bees-roadhouse/hive-sandbox/internal/bus"
 	"github.com/bees-roadhouse/hive-sandbox/internal/egress"
+	"github.com/bees-roadhouse/hive-sandbox/internal/store"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
@@ -31,12 +34,24 @@ type config struct {
 	serveAPI     bool
 	runWorkflows bool
 
+	databaseURL string
+	migrate     bool
+
 	runEgressProxy     bool
 	egressAddr         string
 	egressAllow        stringList
 	egressAllowPrivate bool
 	egressDNS          stringList
 }
+
+// needsDatabase reports whether the enabled roles read or write platform state.
+//
+// The egress proxy deliberately does not: it runs inside a harness container
+// beside the run it is fencing, with no reason to reach Postgres and no
+// credentials to reach it with. Requiring a connection string there would make
+// every run depend on the database being up in order to be *denied* network
+// access, which is backwards.
+func (c config) needsDatabase() bool { return c.serveAPI || c.runWorkflows }
 
 // stringList collects a repeatable flag.
 type stringList []string
@@ -67,6 +82,9 @@ func run() error {
 	flag.StringVar(&cfg.addr, "addr", ":7979", "listen address for the HTTP surface")
 	flag.BoolVar(&cfg.serveAPI, "serve-api", true, "serve REST, MCP and SSE")
 	flag.BoolVar(&cfg.runWorkflows, "run-workflows", true, "claim and execute workflow steps")
+	flag.StringVar(&cfg.databaseURL, "database-url", os.Getenv("HIVE_SANDBOX_DATABASE_URL"),
+		"Postgres connection string (or HIVE_SANDBOX_DATABASE_URL)")
+	flag.BoolVar(&cfg.migrate, "migrate", true, "apply pending migrations at boot")
 	flag.BoolVar(&cfg.runEgressProxy, "run-egress-proxy", false,
 		"run the allowlisting egress proxy for a harness run (D12.6)")
 	flag.StringVar(&cfg.egressAddr, "egress-addr", ":3128", "listen address for the egress proxy")
@@ -94,6 +112,9 @@ func run() error {
 	if !cfg.serveAPI && !cfg.runWorkflows && !cfg.runEgressProxy {
 		return errors.New("no role enabled: pass -serve-api, -run-workflows, -run-egress-proxy, or a combination")
 	}
+	if cfg.needsDatabase() && cfg.databaseURL == "" {
+		return errors.New("no database: pass -database-url or set HIVE_SANDBOX_DATABASE_URL")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -102,6 +123,35 @@ func run() error {
 		"serve_api", cfg.serveAPI,
 		"run_workflows", cfg.runWorkflows,
 		"run_egress_proxy", cfg.runEgressProxy)
+
+	var (
+		st      *store.Store
+		eventer *bus.Bus
+		wg      sync.WaitGroup
+	)
+	defer wg.Wait()
+
+	if cfg.needsDatabase() {
+		var err error
+		st, err = store.Open(ctx, cfg.databaseURL)
+		if err != nil {
+			return err
+		}
+		defer st.Close()
+
+		if err := prepare(ctx, st, cfg); err != nil {
+			return err
+		}
+
+		eventer = bus.New(st.Pool(), bus.Config{Logger: slog.Default()})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := eventer.Run(ctx); err != nil {
+				slog.Error("bus stopped", "err", err)
+			}
+		}()
+	}
 
 	var servers []*http.Server
 	errCh := make(chan error, 2)
@@ -118,8 +168,10 @@ func run() error {
 	if cfg.serveAPI {
 		apiSrv := &http.Server{
 			Addr:              cfg.addr,
-			Handler:           newMux(),
+			Handler:           newMux(st, eventer),
 			ReadHeaderTimeout: 10 * time.Second,
+			// Deliberately no WriteTimeout: an SSE response is meant to stay
+			// open. The stream sets its own per-write deadline instead.
 		}
 		servers = append(servers, apiSrv)
 		go listen(apiSrv, "api", cfg.addr, errCh)
@@ -149,6 +201,32 @@ func run() error {
 		}
 	}
 	return shutdownErr
+}
+
+// prepare brings the schema up to date and seeds root, in that order.
+func prepare(ctx context.Context, st *store.Store, cfg config) error {
+	if cfg.migrate {
+		applied, err := store.Migrate(ctx, st.Pool())
+		if err != nil {
+			return err
+		}
+		if len(applied) > 0 {
+			slog.Info("migrated", "versions", applied)
+		}
+	}
+
+	// A blocked month is degraded, not down: writes still land in the DEFAULT
+	// partition, so this logs and carries on rather than failing every boot.
+	blocked, err := store.EnsureEventPartitions(ctx, st.Pool(), 2)
+	if err != nil {
+		return err
+	}
+	if len(blocked) > 0 {
+		slog.Warn("event partitions blocked; rows in the default partition are in the way",
+			"months", blocked)
+	}
+
+	return bootstrapFromEnv(ctx, st)
 }
 
 func listen(srv *http.Server, role, addr string, errCh chan<- error) {
@@ -188,7 +266,45 @@ func egressServer(cfg config) (*http.Server, error) {
 	return proxy.Server(cfg.egressAddr), nil
 }
 
-func newMux() *http.ServeMux {
+// bootstrapFromEnv seeds the root actor out of band (D19.1). No API path
+// creates the first actor, so config and environment are the only ways in.
+//
+// HIVE_SANDBOX_BOOTSTRAP_TOKEN is how an operator gets a first credential
+// without one existing to authenticate the request that would create it. It is
+// idempotent, it cannot mint a second root (the schema caps that) and it cannot
+// mint a second org (Bootstrap caps that).
+func bootstrapFromEnv(ctx context.Context, st *store.Store) error {
+	handle := strings.TrimSpace(os.Getenv("HIVE_SANDBOX_BOOTSTRAP_HANDLE"))
+	if handle == "" {
+		return nil
+	}
+
+	org := strings.TrimSpace(os.Getenv("HIVE_SANDBOX_BOOTSTRAP_ORG"))
+	res, err := st.BootstrapInTx(ctx, store.BootstrapConfig{
+		RootHandle: handle,
+		RootName:   handle,
+		OrgHandle:  org,
+		OrgName:    org,
+	})
+	if err != nil {
+		return err
+	}
+	if res.Created {
+		slog.Info("bootstrapped", "root", res.RootActorID, "org", res.OrgActorID)
+	}
+
+	token := os.Getenv("HIVE_SANDBOX_BOOTSTRAP_TOKEN")
+	if token == "" {
+		return nil
+	}
+	if err := store.EnsureBootstrapCredential(ctx, st.Pool(), res.RootActorID, token); err != nil {
+		return err
+	}
+	slog.Info("bootstrap credential present", "actor", res.RootActorID)
+	return nil
+}
+
+func newMux(st *store.Store, eventer *bus.Bus) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// Liveness only. Readiness needs Postgres and the bus, so it lands with them.
@@ -198,6 +314,10 @@ func newMux() *http.ServeMux {
 		// to do about it and nothing worth logging on a liveness probe.
 		_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`+"\n", version)
 	})
+
+	if st != nil && eventer != nil {
+		mux.Handle("GET /events", eventer.SSEHandler(st.Guard(), bus.BearerAuth(st.Pool()), bus.SSEOptions{}))
+	}
 
 	return mux
 }

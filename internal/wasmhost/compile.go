@@ -104,23 +104,23 @@ func (c *moduleCache) verify(mod wazero.CompiledModule, hash string, caps Capabi
 //
 // It compiles through the same cache the call path uses, so an install pays for
 // a compile the first call would have paid for anyway.
-func (h *Host) ModuleExports(ctx context.Context, mod Module, src ModuleSource) ([]string, error) {
+func (h *Host) ModuleExports(ctx context.Context, mod Module, src ModuleSource) (Exports, error) {
 	if err := mod.validate(); err != nil {
-		return nil, err
+		return Exports{}, err
 	}
 	t, err := h.tierFor(ctx, mod)
 	if err != nil {
-		return nil, err
+		return Exports{}, err
 	}
 	compiled, err := t.modules.get(ctx, mod.Hash, src)
 	if err != nil {
-		return nil, err
+		return Exports{}, err
 	}
 	// The capability and WASI checks too: a module that cannot link is not
 	// installable, and finding that out here beats finding it out on the first
 	// call, for the same reason the export check exists at all.
 	if err := t.modules.verify(compiled, mod.Hash, mod.Capabilities); err != nil {
-		return nil, fmt.Errorf("app %s (%s): %w", mod.App, mod.Version, err)
+		return Exports{}, fmt.Errorf("app %s (%s): %w", mod.App, mod.Version, err)
 	}
 
 	names := make([]string, 0, len(compiled.ExportedFunctions()))
@@ -130,8 +130,51 @@ func (h *Host) ModuleExports(ctx context.Context, mod Module, src ModuleSource) 
 	// Sorted, because a registry content-addresses what it installs and map
 	// iteration order would make that quietly untrue.
 	sort.Strings(names)
-	return names, nil
+	return Exports{moduleHash: mod.Hash, names: names}, nil
 }
+
+// Exports is what a module actually contains, bound to the module it came from.
+//
+// A bare []string would be evidence detached from the thing it is evidence
+// about. The registry's whole job is checking a manifest's claims against its
+// module, and it cannot do that if a caller can hand it one module's hash and
+// another module's exports ... the check would run, pass, and mean nothing.
+//
+// This is the Sealed lesson from internal/blob, which learned it the hard way:
+// AddRef took a bare Hash, so knowing a hash was enough to get a reference. The
+// fix was a type a caller could not simply write down. Same here ... moduleHash
+// is unexported and set only by ModuleExports, so an Exports value can only
+// have come from compiling those exact bytes.
+type Exports struct {
+	moduleHash string
+	names      []string
+}
+
+// ModuleHash is the module these exports were read from.
+func (e Exports) ModuleHash() string { return e.moduleHash }
+
+// Names returns the exported function names, sorted. A copy, because a caller
+// that could sort or truncate the slice in place could change what a later
+// check sees.
+func (e Exports) Names() []string {
+	out := make([]string, len(e.names))
+	copy(out, e.names)
+	return out
+}
+
+// Has reports whether the module exports a name.
+func (e Exports) Has(name string) bool {
+	for _, n := range e.names {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// IsZero reports whether this is the empty value, which is what an app with no
+// module has.
+func (e Exports) IsZero() bool { return e.moduleHash == "" && len(e.names) == 0 }
 
 // get returns the CompiledModule for hash, compiling it on first use. Callers
 // that arrive while a compile is in flight wait for it rather than starting a

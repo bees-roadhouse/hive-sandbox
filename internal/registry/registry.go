@@ -29,6 +29,7 @@ import (
 	"strings"
 
 	"github.com/bees-roadhouse/hive-sandbox/internal/manifest"
+	"github.com/bees-roadhouse/hive-sandbox/internal/wasmhost"
 )
 
 // Errors an install can fail with. Values rather than strings, so a caller can
@@ -60,22 +61,17 @@ const reactorInit = "_initialize"
 //
 // The reverse ... a declared function that does not exist ... is the one that
 // becomes a runtime failure, so it is the one refused here.
-func CheckExports(s manifest.Surface, exports []string) error {
-	have := make(map[string]bool, len(exports))
-	for _, e := range exports {
-		have[e] = true
-	}
-
+func CheckExports(s manifest.Surface, exports wasmhost.Exports) error {
 	// A tool tier app has exactly one function and still needs the entrypoint,
 	// because it is instantiated the same way everything else is.
-	if len(s.Functions) > 0 && !have[reactorInit] {
+	if len(s.Functions) > 0 && !exports.Has(reactorInit) {
 		return fmt.Errorf("%w: %s exports no %s; build with -buildmode=c-shared",
 			ErrNotReactor, s.App, reactorInit)
 	}
 
 	var missing []string
 	for _, fn := range s.Functions {
-		if !have[fn] {
+		if !exports.Has(fn) {
 			missing = append(missing, fn)
 		}
 	}
@@ -87,8 +83,9 @@ func CheckExports(s manifest.Surface, exports []string) error {
 	// Name what IS there. An AI reading this error is usually one rename away,
 	// and "add_entry is missing" plus a list it can compare against is a fix
 	// where a bare refusal is a guess.
-	present := make([]string, 0, len(exports))
-	for _, e := range exports {
+	names := exports.Names()
+	present := make([]string, 0, len(names))
+	for _, e := range names {
 		if !strings.HasPrefix(e, "_") {
 			present = append(present, e)
 		}
@@ -154,19 +151,27 @@ type Prepared struct {
 
 // Prepare runs every check that does not need a database.
 //
-// exports is what the module actually contains, or nil for a manifest that
-// declares no functions. That case is real and worth naming: an app whose
-// collections are all `crud: true` needs no wasm at all, because generated
-// operations run host-side. It is installable with a manifest and nothing else,
-// which is the cheapest possible first rung for the builder loop (D24).
-func Prepare(m *manifest.Manifest, moduleHash string, exports []string) (Prepared, error) {
+// exports comes from wasmhost.ModuleExports and carries the hash of the module
+// it was read from, so **the module hash is not a separate parameter**. It used
+// to be, with nothing tying the two together ... this package's doc says the
+// registry is where a claim meets its evidence, and the evidence was a
+// parameter a caller could pair with any hash it liked. The check would run,
+// pass, and mean nothing. Same lesson as blob's Sealed, and cheaper to fix with
+// one caller than with ten.
+//
+// The zero Exports is how an app with no module says so, and that case is real:
+// an app whose collections are all `crud: true` needs no wasm at all, because
+// generated operations run host-side. It is installable with a manifest and
+// nothing else, which is the cheapest possible first rung for the builder loop
+// (D24).
+func Prepare(m *manifest.Manifest, exports wasmhost.Exports) (Prepared, error) {
 	if err := m.Validate(); err != nil {
 		return Prepared{}, err
 	}
 
 	surface := m.Derive()
 
-	if len(surface.Functions) > 0 && moduleHash == "" {
+	if len(surface.Functions) > 0 && exports.IsZero() {
 		return Prepared{}, fmt.Errorf("%w: %s declares %d", ErrNoModule, m.Name, len(surface.Functions))
 	}
 	if len(surface.Functions) > 0 {
@@ -183,7 +188,7 @@ func Prepare(m *manifest.Manifest, moduleHash string, exports []string) (Prepare
 	return Prepared{
 		Manifest: m, Surface: surface,
 		SurfaceHash: hash, DeriveVersion: manifest.DeriveVersion,
-		ModuleHash: moduleHash,
+		ModuleHash: exports.ModuleHash(),
 	}, nil
 }
 

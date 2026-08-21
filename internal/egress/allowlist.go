@@ -34,6 +34,15 @@ type Rule struct {
 	// wildcard is set for "*.example.com" forms.
 	wildcard bool
 
+	// allowPrivate lets THIS rule reach a non-public address.
+	//
+	// Per rule, not per allowlist. The global flag it replaces meant that
+	// allowing one LAN printer widened the SSRF guard for every other entry,
+	// so a run that legitimately needed one private host also got permission
+	// to follow api.example.com to 169.254.169.254. The narrowest scope that
+	// does the job is the rule that asked for it.
+	allowPrivate bool
+
 	// ip is set when Host parsed as an IP literal, so an explicit address entry
 	// can be matched without a DNS round trip.
 	ip net.IP
@@ -86,7 +95,25 @@ func ParseAllowlist(entries []string) (*Allowlist, error) {
 	return list, nil
 }
 
+// PrivatePrefix marks an entry as permitted to resolve to a non-public address.
+//
+//	private:printer.home.example.com
+//
+// Spelled out rather than inferred, because "this name is allowed to point
+// inside the network" is exactly the sentence someone should have to write
+// down.
+const PrivatePrefix = "private:"
+
 func parseRule(entry string) (Rule, error) {
+	var allowPrivate bool
+	if rest, ok := strings.CutPrefix(entry, PrivatePrefix); ok {
+		allowPrivate = true
+		entry = strings.TrimSpace(rest)
+		if entry == "" {
+			return Rule{}, fmt.Errorf("no host after the %q prefix", PrivatePrefix)
+		}
+	}
+
 	host := entry
 	var ports []int
 
@@ -112,7 +139,7 @@ func parseRule(entry string) (Rule, error) {
 		return Rule{}, errors.New("no host")
 	}
 
-	rule := Rule{Ports: ports}
+	rule := Rule{Ports: ports, allowPrivate: allowPrivate}
 
 	switch {
 	case host == "*":
@@ -134,6 +161,13 @@ func parseRule(entry string) (Rule, error) {
 	default:
 		rule.Host = host
 		rule.ip = net.ParseIP(host)
+		// Naming a private address literally IS the opt-in. Writing
+		// 192.168.1.50 in an allowlist and having it silently never match was
+		// the other half of this bug: the entry looked effective and was inert,
+		// which is the worst kind of configuration.
+		if rule.ip != nil && isPrivate(rule.ip) {
+			rule.allowPrivate = true
+		}
 	}
 
 	return rule, nil
@@ -146,10 +180,20 @@ func (a *Allowlist) Rules() []Rule { return a.rules }
 func (a *Allowlist) Empty() bool { return a == nil || len(a.rules) == 0 }
 
 // Permits reports whether host:port is allowed by name. It says nothing about
-// where the name resolves; [CheckAddr] is the other half.
+// where the name resolves; [Allowlist.PermitsAddr] is the other half.
 func (a *Allowlist) Permits(host string, port int) bool {
+	_, ok := a.Match(host, port)
+	return ok
+}
+
+// Match returns the rule that permits host:port, if any.
+//
+// The rule matters to the second check: whether a resolved address may be
+// dialled is a question about the entry that allowed the name, not about the
+// allowlist as a whole.
+func (a *Allowlist) Match(host string, port int) (Rule, bool) {
 	if a == nil {
-		return false
+		return Rule{}, false
 	}
 
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
@@ -161,10 +205,10 @@ func (a *Allowlist) Permits(host string, port int) bool {
 			continue
 		}
 		if rule.matchesHost(host) {
-			return true
+			return rule, true
 		}
 	}
-	return false
+	return Rule{}, false
 }
 
 func (r Rule) permitsPort(port int) bool {
@@ -213,23 +257,30 @@ type DeniedError struct {
 
 func (e *DeniedError) Error() string { return e.Reason }
 
-// PermitsAddr reports whether a resolved address may be dialled.
+// PermitsAddr reports whether a resolved address may be dialled under a rule.
 //
-// Separate from [Permits] because the two failures are different: a name that
-// is not on the list is a misconfiguration, and a name on the list that resolves
-// somewhere private is an attack or an accident that looks like one.
-func (a *Allowlist) PermitsAddr(ip net.IP) error {
+// Separate from [Allowlist.Permits] because the two failures are different: a
+// name that is not on the list is a misconfiguration, and a name on the list
+// that resolves somewhere private is an attack or an accident that looks like
+// one.
+//
+// It takes the matching rule rather than consulting a list-wide flag. Under the
+// old shape, allowing one LAN host widened the guard for every entry, so a run
+// that needed a printer also got permission to follow a public name to the
+// metadata service.
+func (a *Allowlist) PermitsAddr(rule Rule, ip net.IP) error {
 	if a == nil {
 		return &DeniedError{Reason: "no allowlist configured"}
 	}
-	if a.AllowPrivateDestinations {
+	if !isPrivate(ip) {
 		return nil
 	}
-
-	if isPrivate(ip) {
-		return &DeniedError{Reason: fmt.Sprintf("destination %s is not a public address", ip)}
+	// The blunt instrument stays, for a deployment that genuinely wants it,
+	// and is now the exception rather than the mechanism.
+	if a.AllowPrivateDestinations || rule.allowPrivate {
+		return nil
 	}
-	return nil
+	return &DeniedError{Reason: fmt.Sprintf("destination %s is not a public address", ip)}
 }
 
 // isPrivate covers everything a run has no business reaching by resolving a

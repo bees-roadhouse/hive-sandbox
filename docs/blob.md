@@ -1,0 +1,149 @@
+# Blob layer
+
+The one content-addressed store for every byte in the platform (D11): uploads,
+screenshots, compiled guest modules, guest source, harness transcripts, stream
+spools, oversized workflow step outputs. One store with classes, not a module
+store beside a blob store.
+
+This document covers what has landed: **the driver seam and the disk driver**.
+The reference layer is the next piece, and the last section says what it owes.
+
+## The address has no owner in it
+
+A blob is addressed by `<hh>/<sha256>`. Two tenants uploading identical bytes
+get one object.
+
+**Ownership, permission and trust are properties of a reference, not of bytes**
+(invariant 3, D17.1). The merged schema says the same thing structurally:
+`blobs` is keyed by `sha256` alone; `blob_refs` carries `owner_kind`,
+`owner_id`, `author_actor` and `trust`.
+
+This is worth stating loudly because the other design is the natural one, and
+the arguments for it are good. Putting the owner in the key appears to buy:
+
+- **Safe deletion**, since "does anything still reference these bytes" becomes
+  answerable per tenant. Not needed: the refcount is live rows in `blob_refs`
+  for that hash across **all** owners, which is what `blob_refs_hash_idx`
+  exists for. Scoping that query to one tenant is the thing that would make it
+  wrong.
+- **A guest that learns another tenant's hash addressing nothing** rather than
+  something forbidden — absence beats denial, no oracle, no timing signal.
+  That property is real and worth keeping, and it comes from `host.blob.read`
+  resolving through the **caller's refs** rather than the global hash space. It
+  does not come from the physical key.
+
+The cost of the owner-in-key design is that dedup becomes per tenant. For a
+household re-importing a photo library that is the entire transfer, twice.
+
+So: **global bytes, per-reference everything else.**
+
+## The split that makes crashes recoverable
+
+**Postgres is the authority on what exists. The driver is the authority on what
+the bytes are.** Neither is asked the other's question.
+
+A driver never consults a database and never decides who may read anything. It
+stores, returns and deletes bytes at a content address. That is what lets the
+crash window between "bytes written" and "row live" fail toward reclaimable
+litter instead of a live row pointing at nothing.
+
+## Verification happens once
+
+`Upload.Seal` hashes every byte and refuses to publish anything that does not
+match a declared hash. After it succeeds, the digest is a fact about the object.
+
+**A ranged read is not hash-verified and cannot be.** A range is a slice and the
+digest is over the whole object. Verification is an ingest-completion property,
+never re-established per read. Code that "verifies" a partial read is either
+hashing the wrong thing or reading the whole object to check a slice of it.
+
+The declared hash is a hint, never trusted. Every client keeps a
+content-addressed cache (D6.2), so it has already hashed the file before
+deciding to upload; handing that over first makes a dedup hit cost zero bytes
+and sends the bytes straight to their final address. The driver still hashes
+everything and `Seal` returns `*DigestMismatch` on disagreement.
+
+## Delivery: why scriptable types can never be redirected
+
+`PlanDelivery` returns proxy or redirect, and it is the only place that decides.
+
+Serving user-supplied HTML safely needs `X-Content-Type-Options: nosniff`.
+**S3 has no response-header override for nosniff.** It can override
+content-type and content-disposition; it cannot add that one. So a signed URL
+*structurally cannot* carry the header that stops a browser sniffing bytes into
+script.
+
+Therefore anything a browser can execute is proxied by the host, which sets its
+own headers. The list in `ScriptableMIME` is deliberately generous and includes
+`image/svg+xml`, `application/pdf` and everything ending in `+xml`. An
+unparseable type counts as scriptable: absence of information is not permission.
+
+The disk driver cannot presign at all, so today everything is proxied. The rule
+exists now so that turning on Garage is a config change rather than a security
+review.
+
+## Ranges
+
+`Range.Clamp` resolves a request against a known size:
+
+- A zero range is the whole object.
+- A zero length means "to the end", like a `Range` header with no end position.
+- A window past the end is truncated, not refused.
+- An offset **at or past** the end is `ErrRangeNotSatisfiable` — a 416, not an
+  empty 206.
+
+**Never emit a multi-range request.** A store answering one returns 200 with the
+entire body, not 206 with parts, so a downloader that asks for several ranges at
+once and expects partial content gets the whole object and no error to notice it
+by. Ask for one range at a time.
+
+Two more downloader rules that belong with it, for whoever writes that half:
+**do not key stale-URL retry on 403** (an expired signed URL is not reliably a
+403, and a real permission failure is not reliably retryable), and **do not
+expect the store to verify partials**, per the section above.
+
+## Durability classes
+
+Captured at ingest and recorded on the blobs row. **Evict and delete are
+different operations**: evicting drops bytes the host can rebuild, deleting
+drops bytes that are gone.
+
+| Class | Meaning | Evictable |
+| --- | --- | --- |
+| `derived` | regenerable from another blob plus a recipe: a thumbnail, a transcode | yes |
+| `build` | a compiled artifact, regenerable from pinned source | yes |
+| `capture` | a screenshot of a page that has changed, a transcript, a fetched document | **no** |
+| `original` | the only copy of something a person gave us | **no** |
+
+A class alone is not enough to evict: the row must also carry a source hash and
+a recipe, which the schema enforces with a CHECK constraint. Otherwise the host
+drops bytes believing it can get them back and then cannot say from what.
+
+## The disk driver
+
+`<root>/<hh>/<sha256>`, with in-progress uploads under `<root>/tmp` so publish
+is a rename within one filesystem and therefore atomic. `fsync` before the
+rename, because otherwise a crash can leave a correctly named file whose
+contents were never flushed — and content addressing makes that look valid
+forever.
+
+`SweepExpiredUploads` reclaims abandoned temp files and **returns errors rather
+than swallowing them**. A sweeper that reclaims nothing while reporting success
+is how a disk fills up quietly. Its cutoff must be older than the longest
+legitimate idle period: a guest append can span workflow steps.
+
+Published objects are never swept by the driver. Whether those may go is a
+question about refs.
+
+## What this does not include yet
+
+The **reference layer**: the `blobs` and `blob_refs` rows, reserve-then-publish
+around a driver write, and `host.blob.read` resolving through the caller's refs.
+
+Until it lands, the headline invariant — **no blob exists without a ref, and
+whatever produced it writes one, host-internal producers included** — is
+documented and not enforced. The driver deliberately cannot enforce it: it
+knows nothing about owners, which is the whole point.
+
+Also not built: the S3/Garage driver (the seam is shaped for it, `Caps.Presign`
+is the switch), and the client-side downloader whose rules are recorded above.

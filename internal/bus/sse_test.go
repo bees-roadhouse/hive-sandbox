@@ -3,6 +3,7 @@ package bus_test
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -22,34 +23,53 @@ type frame struct {
 	data  string
 }
 
-// readFrames parses SSE blocks off a live response body until it has n or the
-// deadline passes. Deliberately hand-rolled and strict: the browser-side
-// behaviour is covered by Playwright, and what is wanted here is to see exactly
-// which fields the server wrote.
-func readFrames(t *testing.T, body *bufio.Reader, n int, within time.Duration) []frame {
+// frameStream owns the ONE goroutine allowed to touch a response body, and
+// buffers what it parses so a slow assertion cannot lose frames.
+//
+// The shape it replaces spawned a goroutine per read and abandoned it on the
+// timeout path, still blocked in ReadString on the SHARED reader. The first
+// read that timed out anywhere in a test left a zombie eating frames off that
+// body for the rest of the run, and every later read raced it. Nothing
+// errored; the symptom was an assertion elsewhere failing on the wrong frame
+// and passing on retry, which is the least debuggable shape a test has.
+//
+// Deliberately hand-rolled and strict: browser behaviour is covered by
+// Playwright, and what is wanted here is to see exactly which fields the
+// server wrote.
+type frameStream struct {
+	t  *testing.T
+	ch chan frame
+}
+
+func newFrameStream(t *testing.T, body *bufio.Reader) *frameStream {
 	t.Helper()
 
-	type result struct {
-		frames []frame
-		err    error
-	}
-	ch := make(chan result, 1)
+	f := &frameStream{t: t, ch: make(chan frame, 256)}
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+
 	go func() {
-		var out []frame
+		defer close(f.ch)
 		var cur frame
-		for len(out) < n {
+		for {
 			line, err := body.ReadString('\n')
 			if err != nil {
-				ch <- result{out, err}
 				return
 			}
 			line = strings.TrimRight(line, "\r\n")
 			switch {
 			case line == "":
-				if cur != (frame{}) {
-					out = append(out, cur)
-					cur = frame{}
+				if cur == (frame{}) {
+					continue
 				}
+				select {
+				case f.ch <- cur:
+				case <-done:
+					// The test is over. Returning rather than blocking on a
+					// full buffer is what keeps this from outliving the run.
+					return
+				}
+				cur = frame{}
 			case strings.HasPrefix(line, ":"):
 				// comment / keepalive
 			case strings.HasPrefix(line, "id: "):
@@ -63,14 +83,81 @@ func readFrames(t *testing.T, body *bufio.Reader, n int, within time.Duration) [
 				cur.data += strings.TrimPrefix(line, "data: ")
 			}
 		}
-		ch <- result{out, nil}
 	}()
+	return f
+}
 
+// next returns the next frame of any kind, including a checkpoint.
+func (f *frameStream) next(within time.Duration) (frame, bool) {
+	f.t.Helper()
 	select {
-	case r := <-ch:
-		return r.frames
+	case fr, ok := <-f.ch:
+		return fr, ok
 	case <-time.After(within):
-		return nil
+		return frame{}, false
+	}
+}
+
+// nextEvent returns the next frame carrying an event name, skipping
+// checkpoints.
+//
+// Skipping is not tidiness. Checkpoints fire on the KeepAlive tick and events
+// arrive on the poll interval; the two are independent timers and nothing
+// orders them. A test that asserts on the FIRST frame is asserting that the
+// poll won a race it was never promised, and on a loaded runner it loses and
+// the failure reads `event name ""`.
+func (f *frameStream) nextEvent(within time.Duration) (frame, bool) {
+	f.t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return frame{}, false
+		}
+		fr, ok := f.next(remaining)
+		if !ok {
+			return frame{}, false
+		}
+		if fr.event != "" {
+			return fr, true
+		}
+	}
+}
+
+func (f *frameStream) mustEvent(within time.Duration) frame {
+	f.t.Helper()
+	fr, ok := f.nextEvent(within)
+	if !ok {
+		f.t.Fatal("no event frame arrived")
+	}
+	return fr
+}
+
+func (f *frameStream) mustNext(within time.Duration) frame {
+	f.t.Helper()
+	fr, ok := f.next(within)
+	if !ok {
+		f.t.Fatal("no frame arrived")
+	}
+	return fr
+}
+
+// waitClosed reports whether the SERVER ended the stream within d, and fails if
+// a frame arrives first.
+//
+// Distinct from silence on purpose. A stream that has merely gone quiet is
+// still open and still spending the authority it opened with, so "no events
+// arrived" is not the property a revocation test wants to assert.
+func (f *frameStream) waitClosed(d time.Duration) bool {
+	f.t.Helper()
+	select {
+	case fr, ok := <-f.ch:
+		if ok {
+			f.t.Fatalf("the stream was still delivering: %+v", fr)
+		}
+		return true
+	case <-time.After(d):
+		return false
 	}
 }
 
@@ -88,7 +175,7 @@ func (h *harness) sseServer(t *testing.T, b *bus.Bus, opts bus.SSEOptions) (stri
 	return srv.URL, token
 }
 
-func openStream(t *testing.T, url, token, lastEventID string) (*bufio.Reader, func()) {
+func openStream(t *testing.T, url, token, lastEventID string) (*frameStream, func()) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -120,7 +207,7 @@ func openStream(t *testing.T, url, token, lastEventID string) (*bufio.Reader, fu
 		cancel()
 		t.Fatalf("content-type %q", ct)
 	}
-	return bufio.NewReader(res.Body), func() { cancel(); res.Body.Close() }
+	return newFrameStream(t, bufio.NewReader(res.Body)), func() { cancel(); res.Body.Close() }
 }
 
 func TestSSERequiresACredential(t *testing.T) {
@@ -146,9 +233,9 @@ func TestSSERequiresACredential(t *testing.T) {
 
 	// And the same URL works with a real one, so the 401 is about the
 	// credential rather than about the route.
-	body, closeStream := openStream(t, url+"?access_token="+token, "", "")
+	stream, closeStream := openStream(t, url+"?access_token="+token, "", "")
 	closeStream()
-	_ = body
+	_ = stream
 }
 
 // TestSSECheckpointsOnlySettledEvents is the rule that makes a resume point
@@ -163,21 +250,21 @@ func TestSSECheckpointsOnlySettledEvents(t *testing.T) {
 	b := h.run(bus.Config{PollInterval: 100 * time.Millisecond, Overlap: overlap})
 	url, token := h.sseServer(t, b, bus.SSEOptions{KeepAlive: 500 * time.Millisecond})
 
-	body, closeStream := openStream(t, url, token, "")
+	stream, closeStream := openStream(t, url, token, "")
 	defer closeStream()
 
 	// Fresh: inside the overlap window, so not safe to checkpoint at.
+	//
+	// nextEvent rather than the first frame: a checkpoint can beat the poll
+	// here and it does not mean the rule broke.
 	fresh := h.append("journal.entry.created", h.owner)
-	frames := readFrames(t, body, 1, 10*time.Second)
-	if len(frames) != 1 {
-		t.Fatalf("got %d frames, want 1", len(frames))
+	first := stream.mustEvent(10 * time.Second)
+	if first.event != "journal.entry.created" {
+		t.Fatalf("event name %q", first.event)
 	}
-	if frames[0].event != "journal.entry.created" {
-		t.Fatalf("event name %q", frames[0].event)
-	}
-	if frames[0].id != "" {
+	if first.id != "" {
 		t.Fatalf("a fresh event carried id %q; a client checkpointing there could skip a late commit",
-			frames[0].id)
+			first.id)
 	}
 
 	// Once the watermark passes it, a keepalive advances the resume point
@@ -192,16 +279,13 @@ func TestSSECheckpointsOnlySettledEvents(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	next := readFrames(t, body, 1, 10*time.Second)
-	if len(next) != 1 {
-		t.Fatalf("no frame after the watermark advanced")
-	}
-	checkpoint = next[0].id
+	next := stream.mustNext(10 * time.Second)
+	checkpoint = next.id
 	if checkpoint == "" {
 		t.Fatal("nothing advanced the client's resume point once the watermark moved past the event")
 	}
-	if next[0].data != "" {
-		t.Fatalf("the checkpoint frame carried data %q; it must not dispatch an event", next[0].data)
+	if next.data != "" {
+		t.Fatalf("the checkpoint frame carried data %q; it must not dispatch an event", next.data)
 	}
 	c, err := store.ParseCursor(checkpoint)
 	if err != nil {
@@ -221,15 +305,13 @@ func TestSSEResumesFromLastEventID(t *testing.T) {
 	second := h.append("second", h.owner)
 	third := h.append("third", h.owner)
 
-	body, closeStream := openStream(t, url, token, first.Cursor().String())
+	stream, closeStream := openStream(t, url, token, first.Cursor().String())
 	defer closeStream()
 
-	frames := readFrames(t, body, 2, 10*time.Second)
-	if len(frames) != 2 {
-		t.Fatalf("resume delivered %d frames, want 2", len(frames))
-	}
-	if frames[0].event != "second" || frames[1].event != "third" {
-		t.Fatalf("resume delivered %q then %q, want second then third", frames[0].event, frames[1].event)
+	a := stream.mustEvent(10 * time.Second)
+	b2 := stream.mustEvent(10 * time.Second)
+	if a.event != "second" || b2.event != "third" {
+		t.Fatalf("resume delivered %q then %q, want second then third", a.event, b2.event)
 	}
 	_ = second
 	_ = third
@@ -245,12 +327,11 @@ func TestSSEAcceptsABareIDCursor(t *testing.T) {
 	first := h.append("first", h.owner)
 	h.append("second", h.owner)
 
-	body, closeStream := openStream(t, url, token, strconv.FormatInt(first.ID, 10))
+	stream, closeStream := openStream(t, url, token, strconv.FormatInt(first.ID, 10))
 	defer closeStream()
 
-	frames := readFrames(t, body, 1, 10*time.Second)
-	if len(frames) != 1 || frames[0].event != "second" {
-		t.Fatalf("bare-id resume delivered %+v", frames)
+	if got := stream.mustEvent(10 * time.Second); got.event != "second" {
+		t.Fatalf("bare-id resume delivered %+v", got)
 	}
 }
 
@@ -272,19 +353,16 @@ func TestSSEStreamIsPerActorFiltered(t *testing.T) {
 		t.Fatalf("issue for bob: %v", err)
 	}
 
-	body, closeStream := openStream(t, srv.URL, bobToken, "")
+	stream, closeStream := openStream(t, srv.URL, bobToken, "")
 	defer closeStream()
 
 	h.append("alice.private", h.owner)
 	h.append("alice.private.again", h.owner)
 	h.append("bob.visible", bobOwner)
 
-	frames := readFrames(t, body, 1, 10*time.Second)
-	if len(frames) != 1 {
-		t.Fatalf("bob's stream delivered %d frames", len(frames))
-	}
-	if frames[0].event != "bob.visible" {
-		t.Fatalf("bob's stream delivered %q; the filter is not per-actor", frames[0].event)
+	got := stream.mustEvent(10 * time.Second)
+	if got.event != "bob.visible" {
+		t.Fatalf("bob's stream delivered %q; the filter is not per-actor", got.event)
 	}
 }
 
@@ -302,17 +380,185 @@ func TestSSEResyncsRatherThanTruncating(t *testing.T) {
 		_ = i
 	}
 
-	body, closeStream := openStream(t, url, token, first.Cursor().String())
+	stream, closeStream := openStream(t, url, token, first.Cursor().String())
 	defer closeStream()
 
-	frames := readFrames(t, body, 1, 10*time.Second)
-	if len(frames) != 1 {
-		t.Fatalf("got %d frames", len(frames))
+	got := stream.mustEvent(10 * time.Second)
+	if got.event != "resync" {
+		t.Fatalf("past MaxReplay the stream sent %q rather than a resync", got.event)
 	}
-	if frames[0].event != "resync" {
-		t.Fatalf("past MaxReplay the stream sent %q rather than a resync", frames[0].event)
-	}
-	if frames[0].data == "" {
+	if got.data == "" {
 		t.Fatal("the resync carried no restart point")
+	}
+
+	// And the restart point is the settled watermark, never store.Head.
+	//
+	// Head is wrong twice over. It is the newest row in the table, so it sits
+	// inside the overlap window and a client resuming there skips every
+	// transaction that took a lower id and commits later ... the exact hazard
+	// the checkpointing rule exists to prevent, routed around. And it is
+	// unfiltered, so putting it on the wire tells any authenticated client the
+	// timestamp AND row id of an event it may have no right to know exists.
+	//
+	// The watermark carries no row id at all, which is what makes the id
+	// assertion below sharp: nothing can leak through a field that is empty by
+	// construction.
+	var payload struct {
+		From string `json:"from"`
+	}
+	if err := json.Unmarshal([]byte(got.data), &payload); err != nil {
+		t.Fatalf("resync payload %q: %v", got.data, err)
+	}
+	from, err := store.ParseCursor(payload.From)
+	if err != nil {
+		t.Fatalf("resync restart point %q does not parse: %v", payload.From, err)
+	}
+	if from.ID != 0 {
+		t.Fatalf("the resync disclosed row id %d; a restart point must carry the watermark, not a row", from.ID)
+	}
+	if settled := b.Settled(); settled.IsZero() || from.At.After(settled) {
+		t.Fatalf("resync restart point %v ran ahead of the watermark %v", from.At, settled)
+	}
+}
+
+// revoke invalidates a token the way "log out everywhere" would.
+func (h *harness) revoke(token string) {
+	h.t.Helper()
+	tag, err := h.pool.Exec(h.ctx,
+		"UPDATE credentials SET revoked_at = now() WHERE token_sha256 = $1", store.HashToken(token))
+	if err != nil {
+		h.t.Fatalf("revoke: %v", err)
+	}
+	if tag.RowsAffected() != 1 {
+		h.t.Fatalf("revoke touched %d rows; the test is not revoking what it thinks it is", tag.RowsAffected())
+	}
+}
+
+// TestSSEStopsDeliveringWhenTheCredentialIsRevoked is the delivery half of the
+// rule: no event reaches a client on a credential nobody has re-confirmed
+// inside AuthRecheck.
+//
+// Grants were always re-evaluated per batch through now() in the predicate. The
+// credential itself was resolved once, at connect, and then lived as a value in
+// a loop that can run for hours ... so revoking a token, expiring it, or
+// disabling the actor left an established stream delivering. A browser hides
+// that by reconnecting every couple of seconds; curl does not reconnect at all.
+func TestSSEStopsDeliveringWhenTheCredentialIsRevoked(t *testing.T) {
+	h := newHarness(t)
+	b := h.run(bus.Config{PollInterval: 100 * time.Millisecond, Overlap: 500 * time.Millisecond})
+	// KeepAlive an hour so the recheck cannot happen on the keepalive tick.
+	// This test is specifically about the batch path, and the two knobs being
+	// separate is what lets it say so.
+	url, token := h.sseServer(t, b, bus.SSEOptions{
+		KeepAlive: time.Hour, AuthRecheck: 200 * time.Millisecond,
+	})
+
+	stream, closeStream := openStream(t, url, token, "")
+	defer closeStream()
+
+	// Live first, so the silence afterwards is about the credential rather than
+	// about a stream that never worked.
+	h.append("before", h.owner)
+	if got := stream.mustEvent(10 * time.Second); got.event != "before" {
+		t.Fatalf("delivered %q before revocation", got.event)
+	}
+
+	h.revoke(token)
+	time.Sleep(300 * time.Millisecond)
+
+	// Appended AFTER the revoke: what is under test is that the grants the
+	// stream held at connect stop being spendable, not that a buffered frame
+	// was dropped.
+	h.append("after", h.owner)
+
+	if !stream.waitClosed(10 * time.Second) {
+		t.Fatal("a revoked credential kept its stream open and delivering; log out everywhere does not reach it")
+	}
+}
+
+// TestSSEIdleStreamNoticesRevocation is the other half. A stream with nothing
+// to deliver never reaches the batch path, so the timer is what bounds it.
+func TestSSEIdleStreamNoticesRevocation(t *testing.T) {
+	h := newHarness(t)
+	b := h.run(bus.Config{PollInterval: 100 * time.Millisecond, Overlap: 500 * time.Millisecond})
+	url, token := h.sseServer(t, b, bus.SSEOptions{
+		KeepAlive: 150 * time.Millisecond, AuthRecheck: 200 * time.Millisecond,
+	})
+
+	stream, closeStream := openStream(t, url, token, "")
+	defer closeStream()
+
+	h.revoke(token)
+
+	if !stream.waitClosed(10 * time.Second) {
+		t.Fatal("an idle stream on a revoked credential stayed open; curl holds one of these open indefinitely")
+	}
+}
+
+// TestResyncNeverHandsOutAnEmptyRestartPoint is CI's failure, made
+// deterministic.
+//
+// The tailer's watermark is zero until its first cycle READS a row, so a test
+// that appends and connects immediately is racing that cycle. The first version
+// of the resync fix returned the watermark whether or not it existed, which
+// rendered as an empty `from` ... and a client cannot tell "restart from
+// nothing" apart from "start at head", so the disclosure fix traded a leak for
+// a silent gap on the one path where the client provably has a backlog.
+//
+// Locally the race was won every time and the gate was green. On Linux CI it
+// was lost every time, because a faster machine finishes the appends and
+// connects before the tailer's cycle lands. So the reproduction here removes
+// the race rather than reversing it: a channel nobody notifies plus a poll
+// interval longer than the test means the tailer CANNOT have read anything by
+// the time the stream connects, on any machine at any speed.
+func TestResyncNeverHandsOutAnEmptyRestartPoint(t *testing.T) {
+	h := newHarness(t)
+	b := h.run(bus.Config{
+		// No wakeup bell and no poll inside the test's lifetime. The only thing
+		// that can produce a watermark now is the resync path asking for one.
+		Channel:      "a_channel_nobody_notifies",
+		PollInterval: time.Hour,
+		Overlap:      500 * time.Millisecond,
+	})
+	url, token := h.sseServer(t, b, bus.SSEOptions{KeepAlive: time.Hour, MaxReplay: 3})
+
+	first := h.append("first", h.owner)
+	for range 10 {
+		h.append("filler", h.owner)
+	}
+
+	// The precondition the whole test rests on. If this ever stops holding, the
+	// test is exercising the ordinary path and proving nothing.
+	if settled := b.Settled(); !settled.IsZero() {
+		t.Fatalf("the tailer already has a watermark (%v); this test no longer reproduces anything", settled)
+	}
+
+	stream, closeStream := openStream(t, url, token, first.Cursor().String())
+	defer closeStream()
+
+	got := stream.mustEvent(15 * time.Second)
+	if got.event != "resync" {
+		t.Fatalf("past MaxReplay the stream sent %q rather than a resync", got.event)
+	}
+
+	var payload struct {
+		From string `json:"from"`
+	}
+	if err := json.Unmarshal([]byte(got.data), &payload); err != nil {
+		t.Fatalf("resync payload %q: %v", got.data, err)
+	}
+	if payload.From == "" {
+		t.Fatal("the resync carried an empty restart point; the client will start at head and " +
+			"silently lose the backlog it was told to skip")
+	}
+	from, err := store.ParseCursor(payload.From)
+	if err != nil {
+		t.Fatalf("restart point %q does not parse: %v", payload.From, err)
+	}
+	if from.At.IsZero() {
+		t.Fatalf("restart point %q is the zero time", payload.From)
+	}
+	if from.ID != 0 {
+		t.Fatalf("the resync disclosed row id %d; a restart point carries the watermark, not a row", from.ID)
 	}
 }

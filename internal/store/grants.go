@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // PrincipalKind is who can own and be granted to. An AI is never a principal
@@ -376,50 +378,50 @@ func RevokeGrant(ctx context.Context, db DB, id uuid.UUID) error {
 	return nil
 }
 
-// Unshare removes access on (subject, target), whatever produced it.
-//
-// The two halves are genuinely different operations rather than one with a
-// flag, and conflating them was a bug:
-//
-//   - An INHERITED row is tombstoned. The tombstone keeps its slot in
-//     grants_identity_uq, which is what stops the materializer resurrecting a
-//     deliberately narrowed child on the next write. That is the whole reason
-//     the tombstone exists.
-//   - A DIRECT row is deleted. Tombstoning one occupies the exact slot a
-//     re-share needs, so "unshare, then share again" used to dead-end on a raw
-//     unique-constraint error with no recovery path in the API.
-//
-// A tombstone is invisible to the predicate either way; it is read only by the
-// materializer, so the read path still has exactly one policy.
-func Unshare(ctx context.Context, db DB, subj Subject, target Owner, by uuid.UUID) (tombstoned, deleted int64, err error) {
-	tag, err := db.Exec(ctx, `
-		UPDATE grants
-		   SET revoked_at = now(), revoked_by = $6
-		 WHERE subject_kind = $1 AND subject_id = $2
-		   AND subject_name IS NOT DISTINCT FROM $3
-		   AND target_kind = $4 AND target_id = $5
-		   AND source = 'inherited'
-		   AND revoked_at IS NULL`,
-		string(subj.Kind), subj.ID, subj.name(),
-		string(target.Kind), target.ID, by)
-	if err != nil {
-		return 0, 0, fmt.Errorf("tombstone inherited grants: %w", err)
-	}
-	tombstoned = tag.RowsAffected()
+// ErrWouldDeleteDirectGrant is returned when Unshare would remove a
+// directly-issued grant and the caller did not say it meant to.
+var ErrWouldDeleteDirectGrant = errors.New("unshare would delete a direct grant")
 
-	tag, err = db.Exec(ctx, `
-		DELETE FROM grants
-		 WHERE subject_kind = $1 AND subject_id = $2
-		   AND subject_name IS NOT DISTINCT FROM $3
-		   AND target_kind = $4 AND target_id = $5
-		   AND source = 'direct'
-		   AND revoked_at IS NULL`,
+// UnshareResult reports what actually happened.
+type UnshareResult struct {
+	// Tombstoned counts inherited rows revoked in place. Reversible: re-share
+	// the parent and they re-materialize.
+	Tombstoned int64
+	// Deleted counts directly-issued rows removed. Irreversible, and it
+	// cascades to everything that inherited from them.
+	Deleted int64
+}
+
+// Unshare removes access on (subject, target).
+//
+// Two operations wear one name and they are not equivalent. An INHERITED row is
+// tombstoned, which is what stops the materializer resurrecting a deliberately
+// narrowed child; a DIRECT row is DELETED, because tombstoning one occupies the
+// exact slot a re-share needs.
+//
+// deleteDirect is the caller stating intent. Without it, a subject that has a
+// direct grant returns ErrWouldDeleteDirectGrant and NOTHING is changed, so a
+// caller who reached for "unshare" thinking of the reversible case cannot
+// stumble into the irreversible one. Returning a count they might ignore is not
+// the same thing: attention is not a safety mechanism.
+//
+// The check and the writes are one statement in the database, so nothing can
+// slip between them.
+func Unshare(ctx context.Context, db DB, subj Subject, target Owner, by uuid.UUID, deleteDirect bool) (UnshareResult, error) {
+	var res UnshareResult
+	err := db.QueryRow(ctx,
+		`SELECT tombstoned, deleted FROM unshare($1,$2,$3,$4,$5,$6,$7)`,
 		string(subj.Kind), subj.ID, subj.name(),
-		string(target.Kind), target.ID)
+		string(target.Kind), target.ID, by, deleteDirect,
+	).Scan(&res.Tombstoned, &res.Deleted)
 	if err != nil {
-		return tombstoned, 0, fmt.Errorf("delete direct grants: %w", err)
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && strings.Contains(pgErr.Message, "cannot be undone") {
+			return UnshareResult{}, fmt.Errorf("%w: %s", ErrWouldDeleteDirectGrant, pgErr.Message)
+		}
+		return UnshareResult{}, fmt.Errorf("unshare: %w", err)
 	}
-	return tombstoned, tag.RowsAffected(), nil
+	return res, nil
 }
 
 // MaterializeInherited copies every live, non-override grant from parent to

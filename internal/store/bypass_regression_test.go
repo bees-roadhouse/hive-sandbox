@@ -315,10 +315,10 @@ func TestAICannotActivateItsOwnBuild(t *testing.T) {
 	}
 }
 
-// The standing-grant route is the deliberate exception, and it needs a grant a
-// HUMAN wrote. Without that clause the rule is decorative: an AI acting for the
-// owner already reads owner on the install, so it could mint its own.
-func TestStandingGrantMustBeHumanIssued(t *testing.T) {
+// The standing route is the deliberate exception, and it is an install
+// AUTHORITY rather than a grant (D20). An AI cannot mint one, because only a
+// human may delegate it.
+func TestStandingAuthorityMustBeHumanDelegated(t *testing.T) {
 	w := newWorld(t)
 	nate := w.human("nate")
 	pia := w.ai("pia", "pia", store.PrincipalUser, nate, nate)
@@ -326,50 +326,182 @@ func TestStandingGrantMustBeHumanIssued(t *testing.T) {
 	piaCred := cred(pia, store.PrincipalUser, nate)
 	nateCred := cred(nate, store.PrincipalUser, nate)
 
+	installID := stageBuild(t, w, "extract", pia, nateOwner)
+
+	// Pia acts for the owner, so she may write plenty of things. Not this.
+	if _, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, nateOwner,
+		store.CapabilityActivate, piaCred, "self-service", nil); err == nil {
+		t.Fatal("an AI delegated install authority to itself")
+	}
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, piaCred); err == nil {
+		t.Fatal("an AI activated with no authority")
+	}
+
+	// Nor may a human who does not own the install. Being a person is one of
+	// the two conditions, not the only one: without the ownership test, any
+	// human could delegate activation on anybody's app to themselves.
+	stranger := w.human("stranger")
+	strangerCred := cred(stranger, store.PrincipalUser, stranger)
+	strangerOwner := store.Owner{Kind: store.PrincipalUser, ID: stranger}
+
+	// Staging is the unprivileged half, and unprivileged is not the same as
+	// unscoped: it still writes a row into a principal's own namespace.
+	if _, err := store.StageInstall(w.ctx, w.s.Pool(), store.InstallSpec{
+		BuildID: buildIDOf(t, w, installID), Slug: "squatter",
+		Owner: nateOwner, SchemaName: "app_squatter",
+	}, strangerCred); err == nil {
+		t.Fatal("a stranger staged an install owned by somebody else")
+	}
+	if _, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, strangerOwner,
+		store.CapabilityActivate, strangerCred, "helping myself", nil); err == nil {
+		t.Fatal("a human who does not own the install delegated authority over it")
+	}
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, strangerCred); err == nil {
+		// A human activator is bound to the credential, so this would be a
+		// stranger promoting somebody else's build into somebody else's app.
+		t.Fatal("a stranger activated an install they do not own")
+	}
+
+	// A human delegates it, and the loop rolls builds from then on.
+	if _, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, nateOwner,
+		store.CapabilityActivate, nateCred, "roll rebuilt tools unattended", nil); err != nil {
+		t.Fatalf("human delegation: %v", err)
+	}
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, piaCred); err != nil {
+		t.Fatalf("the loop could not roll a build under a standing authority: %v", err)
+	}
+}
+
+// THE LIVE EDGE the review named. As a `write` grant on the install subject,
+// delegating "may roll a rebuilt tool into this app" also handed the delegate
+// general write on the install through the ordinary predicate: one table
+// carrying two meanings, and invisible to a suite that only ever granted to the
+// owner, where the row is inert.
+//
+// An install authority is a write-path capability in its own table, so it
+// confers no visibility at all. This is the test that says so.
+func TestInstallAuthorityConfersNoVisibility(t *testing.T) {
+	w := newWorld(t)
+	nate := w.human("nate")
+	delegate := w.human("delegate")
+	nateOwner := store.Owner{Kind: store.PrincipalUser, ID: nate}
+	nateCred := cred(nate, store.PrincipalUser, nate)
+	delegateCred := cred(delegate, store.PrincipalUser, delegate)
+	delegateOwner := store.Owner{Kind: store.PrincipalUser, ID: delegate}
+
+	installID := stageBuild(t, w, "extract", nate, nateOwner)
+	install := store.Subject{Kind: store.SubjectInstall, ID: installID}
+
+	if _, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, delegateOwner,
+		store.CapabilityActivate, nateCred, "a trusted delegate rolls builds", nil); err != nil {
+		t.Fatalf("delegate authority: %v", err)
+	}
+
+	g := w.s.Guard()
+	for _, access := range []store.Access{store.AccessRead, store.AccessWrite, store.AccessCall} {
+		if r := reasonOf(w.ctx, t, g, delegateCred, install, access); r != store.Deny {
+			t.Fatalf("holding an install authority granted %s on the install (%q)", access, r)
+		}
+	}
+
+	// And nothing inside the app either.
+	entity := store.Subject{Kind: store.SubjectEntity,
+		ID: w.entity(installID, "entries", "e", nateOwner, nate)}
+	if r := reasonOf(w.ctx, t, g, delegateCred, entity, store.AccessRead); r != store.Deny {
+		t.Fatalf("holding an install authority granted read on the app's data (%q)", r)
+	}
+	ids, err := g.VisibleEntityIDs(w.ctx, delegateCred, store.AccessRead, "", 100)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("a delegate listed %d rows in an app it may only activate", len(ids))
+	}
+
+	// The capability itself still works, which is the point of separating them.
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, delegateCred); err != nil {
+		t.Fatalf("the delegate could not activate: %v", err)
+	}
+}
+
+func TestRevokedInstallAuthorityStopsActivating(t *testing.T) {
+	w := newWorld(t)
+	nate := w.human("nate")
+	pia := w.ai("pia", "pia", store.PrincipalUser, nate, nate)
+	nateOwner := store.Owner{Kind: store.PrincipalUser, ID: nate}
+	nateCred := cred(nate, store.PrincipalUser, nate)
+	piaCred := cred(pia, store.PrincipalUser, nate)
+
+	installID := stageBuild(t, w, "extract", pia, nateOwner)
+	authorityID, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, nateOwner,
+		store.CapabilityActivate, nateCred, "roll builds", nil)
+	if err != nil {
+		t.Fatalf("delegate: %v", err)
+	}
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, piaCred); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	if err := store.RevokeInstallAuthority(w.ctx, w.s.Pool(), authorityID, nate); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if _, err := w.s.Pool().Exec(w.ctx,
+		"UPDATE installs SET state = 'disabled', activation_authority_id = NULL WHERE id = $1",
+		installID); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, piaCred); err == nil {
+		t.Fatal("a revoked authority still activated")
+	}
+}
+
+// Same rule as grants: an UPDATE must not walk around the issue policy.
+func TestInstallAuthorityIsImmutableExceptRevocation(t *testing.T) {
+	w := newWorld(t)
+	nate := w.human("nate")
+	stranger := w.human("stranger")
+	nateOwner := store.Owner{Kind: store.PrincipalUser, ID: nate}
+	nateCred := cred(nate, store.PrincipalUser, nate)
+
+	installID := stageBuild(t, w, "extract", nate, nateOwner)
+	id, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, nateOwner,
+		store.CapabilityActivate, nateCred, "roll builds", nil)
+	if err != nil {
+		t.Fatalf("delegate: %v", err)
+	}
+
+	if _, err := w.s.Pool().Exec(w.ctx,
+		"UPDATE install_authorities SET holder_id = $2 WHERE id = $1", id, stranger); err == nil {
+		t.Fatal("an install authority was retargeted by UPDATE")
+	}
+	if err := store.RevokeInstallAuthority(w.ctx, w.s.Pool(), id, nate); err != nil {
+		t.Fatalf("revocation was refused: %v", err)
+	}
+}
+
+// stageBuild registers a build authored by author and stages a disabled install
+// of it for owner.
+func stageBuild(t *testing.T, w *world, slug string, author uuid.UUID, owner store.Owner) uuid.UUID {
+	t.Helper()
 	var buildID uuid.UUID
 	if err := w.s.Pool().QueryRow(w.ctx, `
 		INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
 		                        author_actor, owner_kind, owner_id, visibility, trust, status)
-		VALUES ('extract', 'tool', 'host', '{}', repeat('c', 64), $1, 'user', $2, 'private', 'local', 'registered')
-		RETURNING id`, pia, nate).Scan(&buildID); err != nil {
+		VALUES ($1, 'tool', 'host', '{}', md5(random()::text) || md5($1),
+		        $2, $3, $4, 'private', 'local', 'registered')
+		RETURNING id`, slug, author, string(owner.Kind), owner.ID).Scan(&buildID); err != nil {
 		t.Fatalf("register build: %v", err)
 	}
 	installID, err := store.StageInstall(w.ctx, w.s.Pool(), store.InstallSpec{
-		BuildID: buildID, Slug: "extract", Owner: nateOwner, SchemaName: "app_extract",
-	}, piaCred)
+		BuildID:    buildID,
+		Slug:       slug,
+		Owner:      owner,
+		SchemaName: "app_" + slug + "_" + buildID.String()[:8],
+	}, cred(author, owner.Kind, owner.ID))
 	if err != nil {
-		t.Fatalf("stage: %v", err)
+		t.Fatalf("stage install: %v", err)
 	}
-
-	// Pia writes her own standing grant. She is allowed to: she acts for the
-	// owner. It must not be enough to activate.
-	if _, err := store.WriteGrant(w.ctx, w.s.Pool(), store.GrantSpec{
-		Subject: store.Subject{Kind: store.SubjectInstall, ID: installID},
-		Target:  store.Owner{Kind: store.PrincipalUser, ID: nate},
-		Access:  store.AccessWrite, Source: store.SourceDirect, By: piaCred,
-	}); err != nil {
-		t.Fatalf("ai self-grant: %v", err)
-	}
-	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, piaCred); err == nil {
-		t.Fatal("an AI activated using a standing grant it wrote itself")
-	}
-
-	// The same grant written by a human is the standing decision D19.4 means.
-	if _, err := w.s.Pool().Exec(w.ctx,
-		"DELETE FROM grants WHERE subject_kind = 'install' AND subject_id = $1", installID); err != nil {
-		t.Fatalf("clear grants: %v", err)
-	}
-	if _, err := store.WriteGrant(w.ctx, w.s.Pool(), store.GrantSpec{
-		Subject: store.Subject{Kind: store.SubjectInstall, ID: installID},
-		Target:  store.Owner{Kind: store.PrincipalUser, ID: nate},
-		Access:  store.AccessWrite, Source: store.SourceDirect, By: nateCred,
-		Reason: "standing permission to roll rebuilt tools",
-	}); err != nil {
-		t.Fatalf("human standing grant: %v", err)
-	}
-	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, piaCred); err != nil {
-		t.Fatalf("the loop could not roll a build under a human standing grant: %v", err)
-	}
+	return installID
 }
 
 // --- break-glass on one tool killed every tool on the install ---------------
@@ -618,4 +750,14 @@ func countOrgMembers(ctx context.Context, t *testing.T, s *store.Store) int {
 		t.Fatalf("count members: %v", err)
 	}
 	return n
+}
+
+func buildIDOf(t *testing.T, w *world, installID uuid.UUID) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := w.s.Pool().QueryRow(w.ctx,
+		"SELECT build_id FROM installs WHERE id = $1", installID).Scan(&id); err != nil {
+		t.Fatalf("read build id: %v", err)
+	}
+	return id
 }

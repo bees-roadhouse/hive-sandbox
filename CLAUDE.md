@@ -124,3 +124,16 @@ test/                  integration tests, including Playwright-driven HTTP/SSE
 - Claim work with `FOR UPDATE SKIP LOCKED` plus a lease expiry and a heartbeat.
 - Comments explain WHY when it is non-obvious. Not what the code already says.
 - Simple over clever. Three similar lines beat a premature abstraction.
+- **When a review reproduces a defect, land the reproduction as a failing test
+  BEFORE writing the fix.** Not afterwards as a regression test ... first, as the
+  thing the fix has to satisfy. This caught a supervisor deadlock where the
+  reviewer's suggested fix was necessary and insufficient: applied on its own it
+  still hung, because a second mutex path nobody had looked at was the real
+  cause. The fix would have shipped looking correct. A reproduction you have not
+  run is a hypothesis.
+- **A type that only looks like enforcement is worse than none.** `AddRef` was
+  changed to take a `Sealed` rather than a bare hash, which reads as a fix ...
+  except `Sealed` was a plain struct, so `Sealed{Hash: stolenHash}` satisfied the
+  new signature and changed nothing. It carries an unexported marker now. If a
+  type is standing in for a capability, make sure a caller cannot simply write
+  one down.

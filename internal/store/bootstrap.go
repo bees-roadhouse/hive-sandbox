@@ -30,19 +30,31 @@ type BootstrapResult struct {
 	Created     bool
 }
 
-// ErrAlreadyBootstrapped is returned when a root actor already exists and the
-// supplied config names a different one. Re-running with the same handle is a
-// no-op, so a restart is safe.
+// ErrAlreadyBootstrapped is returned when the supplied config does not match
+// what the database was already bootstrapped as. Re-running with the same
+// config is a no-op, so a restart is safe.
 var ErrAlreadyBootstrapped = errors.New("already bootstrapped")
 
-// Bootstrap seeds the root actor out of band (D19.1).
+// Bootstrap seeds the root actor and its org out of band (D19.1).
 //
 // This function must never be reachable from an HTTP handler, an MCP tool, a
 // workflow step or a guest. It takes no Credential precisely because there is
 // nobody to authenticate yet: it is the one write in the platform that is not
-// authorized. The schema caps it at a single row through the actors_single_root
-// unique index, so a second root is refused by the database rather than by
-// trusting this code to be called correctly.
+// authorized. Exactly one caller exists, in cmd/hive-sandbox, reading config
+// and environment at startup.
+//
+// Two caps, and only the first is enforced by the schema:
+//
+//   - The ROOT is capped at one row by actors_single_root, so a second root is
+//     refused by the database rather than by trusting this code.
+//   - The ORG is capped HERE. Nothing in the schema stops a caller creating org
+//     after org by passing the existing root handle with a new OrgHandle, so
+//     this refuses any org beyond the one it seeded.
+//
+// Use BootstrapInTx unless you are already in a transaction. The three writes
+// have to be atomic: a failure between the org insert and the admin seat used
+// to leave an org with no members that a later call skipped over and never
+// repaired.
 func Bootstrap(ctx context.Context, db DB, cfg BootstrapConfig) (BootstrapResult, error) {
 	var res BootstrapResult
 
@@ -62,7 +74,7 @@ func Bootstrap(ctx context.Context, db DB, cfg BootstrapConfig) (BootstrapResult
 		}
 	case errors.Is(err, pgx.ErrNoRows):
 		// A human actor is its own principal, and the CHECK is immediate, so
-		// the id is chosen here rather than by the default.
+		// the id is chosen here rather than by the column default.
 		rootID := uuid.New()
 		if _, insErr := db.Exec(ctx, `
 			INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
@@ -80,28 +92,48 @@ func Bootstrap(ctx context.Context, db DB, cfg BootstrapConfig) (BootstrapResult
 		return res, nil
 	}
 
-	err = db.QueryRow(ctx,
-		"SELECT id FROM actors WHERE handle = $1 AND kind = 'org'", cfg.OrgHandle).Scan(&res.OrgActorID)
+	// The org this bootstrap seeded, if any. Asking "did I make one" rather
+	// than "does this handle exist" is what caps it: the second form lets a
+	// caller create one org per call, forever, with no credential.
+	err = db.QueryRow(ctx, `
+		SELECT id, handle FROM actors
+		 WHERE kind = 'org' AND created_by_actor = $1
+		 ORDER BY created_at LIMIT 1`, res.RootActorID).Scan(&res.OrgActorID, &existingHandle)
 	switch {
 	case err == nil:
-		return res, nil
-	case errors.Is(err, pgx.ErrNoRows):
-		orgID := uuid.New()
-		if _, insErr := db.Exec(ctx, `
-			INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-			VALUES ($1, 'org', $2, $3, 'org', $1, $4)`,
-			orgID, cfg.OrgHandle, cfg.OrgName, res.RootActorID); insErr != nil {
-			return res, fmt.Errorf("create root org: %w", insErr)
+		if existingHandle != cfg.OrgHandle {
+			return res, fmt.Errorf("%w with org %q, config names %q",
+				ErrAlreadyBootstrapped, existingHandle, cfg.OrgHandle)
 		}
-		if _, seatErr := db.Exec(ctx,
-			"INSERT INTO org_members (org_id, user_id, role, added_by_actor) VALUES ($1, $2, 'admin', $2)",
-			orgID, res.RootActorID); seatErr != nil {
-			return res, fmt.Errorf("seat root as org admin: %w", seatErr)
-		}
-		res.OrgActorID = orgID
-		res.Created = true
 		return res, nil
-	default:
+	case !errors.Is(err, pgx.ErrNoRows):
 		return res, fmt.Errorf("look up root org: %w", err)
 	}
+
+	orgID := uuid.New()
+	if _, insErr := db.Exec(ctx, `
+		INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
+		VALUES ($1, 'org', $2, $3, 'org', $1, $4)`,
+		orgID, cfg.OrgHandle, cfg.OrgName, res.RootActorID); insErr != nil {
+		return res, fmt.Errorf("create root org: %w", insErr)
+	}
+	if _, seatErr := db.Exec(ctx,
+		"INSERT INTO org_members (org_id, user_id, role, added_by_actor) VALUES ($1, $2, 'admin', $2)",
+		orgID, res.RootActorID); seatErr != nil {
+		return res, fmt.Errorf("seat root as org admin: %w", seatErr)
+	}
+	res.OrgActorID = orgID
+	res.Created = true
+	return res, nil
+}
+
+// BootstrapInTx runs Bootstrap atomically. This is the form the daemon uses.
+func (s *Store) BootstrapInTx(ctx context.Context, cfg BootstrapConfig) (BootstrapResult, error) {
+	var res BootstrapResult
+	err := s.InTx(ctx, func(tx pgx.Tx) error {
+		var txErr error
+		res, txErr = Bootstrap(ctx, tx, cfg)
+		return txErr
+	})
+	return res, err
 }

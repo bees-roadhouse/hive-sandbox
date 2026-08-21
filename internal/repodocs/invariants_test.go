@@ -86,6 +86,8 @@ var requiredPhrases = []string{
 	"ask what stops someone who only knows it",
 	"NOTIFY is only a wakeup bell",
 	"never a replay tape",
+	"which way it can go wrong",
+	"Its fixture is too small to reach the failure",
 }
 
 // TestRequiredGuidanceSurvives fails when a merge drops guidance the numbered

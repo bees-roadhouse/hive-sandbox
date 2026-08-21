@@ -451,7 +451,7 @@ func TestRunRejectsInvalidSpecs(t *testing.T) {
 		{"no workspace", func(s *harness.RunSpec) { s.WorkspaceDir = "" }, "WorkspaceDir"},
 		{"unknown runtime", func(s *harness.RunSpec) { s.Runtime = "gpt" }, "runtime"},
 		{"uncapped memory", func(s *harness.RunSpec) { s.Limits.MemoryBytes = 0 }, "MemoryBytes"},
-		{"proxied without a proxy", func(s *harness.RunSpec) { s.Network = harness.NetworkProxied }, "ProxyURL"},
+		{"proxied without an allowlist", func(s *harness.RunSpec) { s.Network = harness.NetworkProxied }, "EgressAllow"},
 		{"daemon without a socket", func(s *harness.RunSpec) { s.Network = harness.NetworkDaemon }, "DaemonSocket"},
 	}
 

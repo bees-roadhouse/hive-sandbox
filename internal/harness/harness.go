@@ -77,10 +77,15 @@ const (
 	// route to it. Verified on rootless Podman 6.0.2.
 	NetworkDaemon NetworkMode = "daemon"
 
-	// NetworkProxied puts the container on an internal (no-egress) Podman
-	// network shared with an allowlisting egress proxy, and points the CLI at
-	// it. Requires ProxyURL; a spec that asks for it without one is an error
-	// rather than a silent fall back to open egress.
+	// NetworkProxied puts the container on a per-run internal Podman network
+	// shared with an allowlisting egress proxy, and points the CLI at it.
+	//
+	// The harness gets no route out. The proxy sits on the internal network AND
+	// on a normal one, so it is the only thing in the run that can reach
+	// anything, and it reaches only what RunSpec.EgressAllow lists. Requires a
+	// non-empty allowlist: a spec that asks for proxied egress without one is
+	// an error rather than a silent fall back to open egress. Wanting no egress
+	// at all is [NetworkNone], and saying so is free.
 	NetworkProxied NetworkMode = "proxied"
 )
 
@@ -119,8 +124,13 @@ func (l Limits) validate() error {
 // RunSpec describes one agent run. It is the whole input: the supervisor reads
 // no ambient configuration and the container inherits no host state.
 type RunSpec struct {
-	// RunID identifies the run and names the container. Caller-assigned so the
-	// caller can record it before anything is spawned.
+	// RunID identifies the run and names the container, the proxy and the
+	// run's network. Caller-assigned so the caller can record it before
+	// anything is spawned.
+	//
+	// It must be unique. Two live runs sharing an id share a network and a
+	// proxy, which means each one gets the union of both allowlists and either
+	// one's teardown kills the other.
 	RunID string
 
 	Runtime Runtime
@@ -157,11 +167,18 @@ type RunSpec struct {
 	// when Network is NetworkDaemon.
 	DaemonSocket string
 
-	// ProxyURL is the egress proxy, required when Network is NetworkProxied.
-	ProxyURL string
+	// EgressAllow is the run's allowlist, one `host[:port]` per entry, with
+	// `*.example.com` permitted. Required when Network is NetworkProxied, and
+	// meaningless otherwise.
+	//
+	// Scoped per run rather than per deployment because D12.10 asks for the
+	// narrowest scope that does the job, and "which hosts does this build need"
+	// is a different answer for every run.
+	EgressAllow []string
 
-	// ProxyNetwork is the Podman network shared with the proxy.
-	ProxyNetwork string
+	// EgressAllowPrivate lets the run reach RFC1918, loopback and link-local
+	// destinations. Off by default; this is the SSRF and DNS-rebinding control.
+	EgressAllowPrivate bool
 
 	Limits Limits
 
@@ -186,6 +203,30 @@ func (s RunSpec) ImageRef() string {
 // its run without consulting the database.
 func (s RunSpec) ContainerName() string {
 	return "hive-sandbox-run-" + s.RunID
+}
+
+// ProxyContainerName is the run's egress proxy.
+func (s RunSpec) ProxyContainerName() string {
+	return "hive-sandbox-proxy-" + s.RunID
+}
+
+// EgressNetworkName is the run's private internal network.
+//
+// Derived from the run id rather than configured: two runs sharing a network
+// could reach each other's proxy, which would quietly widen both allowlists to
+// the union.
+func (s RunSpec) EgressNetworkName() string {
+	return "hive-sandbox-egress-" + s.RunID
+}
+
+// ProxyPort is fixed. The proxy is only ever addressed from inside the run's
+// own network, so there is nothing to avoid colliding with.
+const ProxyPort = 3128
+
+// ProxyURL is how the harness addresses its proxy, by container name over the
+// run's internal network.
+func (s RunSpec) ProxyURL() string {
+	return fmt.Sprintf("http://%s:%d", s.ProxyContainerName(), ProxyPort)
 }
 
 func (s RunSpec) validate() error {
@@ -216,13 +257,10 @@ func (s RunSpec) validate() error {
 		}
 	case NetworkProxied:
 		// Fail closed. The alternative ... quietly running with open egress
-		// because the proxy was not configured ... is the failure mode this
+		// because the allowlist was not configured ... is the failure mode this
 		// whole design exists to prevent.
-		if s.ProxyURL == "" {
-			return errors.New("spec: NetworkProxied requires ProxyURL; refusing to run with unrestricted egress")
-		}
-		if s.ProxyNetwork == "" {
-			return errors.New("spec: NetworkProxied requires ProxyNetwork")
+		if len(s.EgressAllow) == 0 {
+			return errors.New("spec: NetworkProxied requires a non-empty EgressAllow; use NetworkNone for no egress")
 		}
 	default:
 		return fmt.Errorf("spec: unknown network mode %q", s.Network)

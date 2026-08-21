@@ -15,6 +15,10 @@ services:
     container_name: hive-sandbox-postgres
     restart: unless-stopped
     environment:
+      # Placeholder credentials for a throwaway local database. This repo is
+      # public: nothing here is a real secret, and the port binding below is
+      # loopback-only so nothing off this machine can reach it. Real
+      # credentials never live in the repo.
       POSTGRES_USER: hive_sandbox
       POSTGRES_PASSWORD: hive_sandbox
       POSTGRES_DB: hive_sandbox

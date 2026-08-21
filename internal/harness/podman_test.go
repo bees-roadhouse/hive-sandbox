@@ -127,35 +127,51 @@ func TestPodmanRunArgsNetworkModes(t *testing.T) {
 		}
 	})
 
-	t.Run("proxied routes through the proxy only", func(t *testing.T) {
+	t.Run("proxied routes through the run's own proxy only", func(t *testing.T) {
 		t.Parallel()
 
-		args := argsFor(t, func(s *harness.RunSpec) {
-			s.Network = harness.NetworkProxied
-			s.ProxyURL = "http://egress:3128"
-			s.ProxyNetwork = "hive-sandbox-egress"
-		})
+		spec := testSpec(t, "run-args")
+		spec.Network = harness.NetworkProxied
+		spec.EgressAllow = []string{"api.anthropic.com"}
 
-		if !hasPair(args, "--network", "hive-sandbox-egress") {
-			t.Errorf("proxied run not attached to the proxy network: %v", args)
+		args, err := harness.PodmanRunArgs(spec, nil)
+		if err != nil {
+			t.Fatalf("PodmanRunArgs: %v", err)
 		}
+
+		// A network named after the run. Two runs sharing one would quietly
+		// widen both allowlists to the union.
+		if !hasPair(args, "--network", spec.EgressNetworkName()) {
+			t.Errorf("proxied run not attached to its own network: %v", args)
+		}
+		if strings.Contains(spec.EgressNetworkName(), spec.RunID) == false {
+			t.Error("the egress network name does not carry the run id")
+		}
+
 		envs := valuesOf(args, "--env")
-		for _, want := range []string{"HTTPS_PROXY=http://egress:3128", "HTTP_PROXY=http://egress:3128"} {
+		proxyURL := spec.ProxyURL()
+		// Both cases: Go's net/http reads the upper-case forms, curl and most
+		// CLIs read the lower-case ones, and an agent shells out to both.
+		for _, want := range []string{
+			"HTTPS_PROXY=" + proxyURL,
+			"HTTP_PROXY=" + proxyURL,
+			"https_proxy=" + proxyURL,
+			"http_proxy=" + proxyURL,
+		} {
 			if !slices.Contains(envs, want) {
 				t.Errorf("missing %s in %v", want, envs)
 			}
 		}
 	})
 
-	t.Run("proxied without a proxy is refused", func(t *testing.T) {
+	t.Run("proxied without an allowlist is refused", func(t *testing.T) {
 		t.Parallel()
 
 		spec := testSpec(t, "run-args")
 		spec.Network = harness.NetworkProxied
-		spec.ProxyNetwork = "hive-sandbox-egress"
 
-		// Fail closed. Falling back to open egress because the proxy was not
-		// configured is the failure this design exists to prevent.
+		// Fail closed. Falling back to open egress because the allowlist was
+		// not configured is the failure this design exists to prevent.
 		if _, err := harness.PodmanRunArgs(spec, nil); err == nil {
 			t.Fatal("expected an error, got nil")
 		}

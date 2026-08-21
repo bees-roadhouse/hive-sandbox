@@ -26,3 +26,4 @@ test/e2e/.playwright/
 # ARGs in docker/harness/Containerfile. Revisit when harness images get a
 # registry (harnesses.md open question 2).
 docker/harness/digests.json
+docker/egress/digest.json

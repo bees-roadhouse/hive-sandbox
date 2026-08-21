@@ -1,0 +1,58 @@
+# The allowlisting egress proxy a harness run reaches the internet through
+# (D12.6, D23).
+#
+# It is the same hive-sandbox binary running its -run-egress-proxy role, so
+# there is one codebase and one place the allowlist logic lives. The proxy sits
+# on a per-run internal Podman network: the harness has no route out except
+# through it, and it answers one question per request.
+#
+# Built by scripts/egress-build.ps1 (or .sh) from the repo root, because the
+# build stage needs the whole module.
+
+FROM docker.io/library/golang:1.26-bookworm AS build
+
+WORKDIR /src
+
+# Module files first so a source-only change does not redownload the module
+# cache.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ARG VERSION=dev
+# CGO_ENABLED=0 for a static binary that runs on a distroless base, and because
+# the host is CGo-free on purpose. Setting it explicitly rather than relying on
+# the absence of a C toolchain, which is the kind of thing that changes when a
+# base image does.
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags "-s -w -X main.version=${VERSION}" \
+    -o /out/hive-sandbox ./cmd/hive-sandbox
+
+# --- runtime -----------------------------------------------------------------
+# Distroless static: no shell, no package manager, nothing to pivot to if the
+# proxy is ever compromised. It needs ca-certificates for nothing itself ... it
+# tunnels TLS rather than terminating it ... but the base carries them for the
+# plain-HTTP forward path's own dials.
+FROM gcr.io/distroless/static-debian12:nonroot AS proxy
+
+COPY --from=build /out/hive-sandbox /usr/local/bin/hive-sandbox
+
+# nonroot in the distroless base.
+USER 65532:65532
+
+EXPOSE 3128
+
+LABEL org.beesroadhouse.hive-sandbox.component=egress-proxy
+
+# Only the proxy role. An egress proxy that also served the API would be a way
+# around the isolation it exists to enforce.
+#
+# The allowlist arrives at run time as HIVE_SANDBOX_EGRESS_ALLOW. There is no
+# default, and no allowlist means deny everything.
+ENTRYPOINT ["/usr/local/bin/hive-sandbox", \
+            "-serve-api=false", \
+            "-run-workflows=false", \
+            "-run-egress-proxy", \
+            "-egress-addr=:3128"]

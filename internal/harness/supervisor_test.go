@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -222,7 +223,7 @@ func TestRunSurvivesProcessDyingUnderneath(t *testing.T) {
 			return nil
 		}
 		once.Do(func() {
-			pid := helperPID(t, ev.Text)
+			pid := helperPID(t, ev.Text, "pid")
 			proc, err := os.FindProcess(pid)
 			if err != nil {
 				t.Errorf("find helper process %d: %v", pid, err)
@@ -401,11 +402,29 @@ func TestRunIsNotHeldOpenByAGrandchild(t *testing.T) {
 	spec := testSpec(t, "run-grandchild")
 	spec.Deadline = 60 * time.Second
 
+	var (
+		mu     sync.Mutex
+		events []harness.Event
+	)
+
 	started := time.Now()
-	res, err := sup.Run(t.Context(), spec, nil)
+	res, err := sup.Run(t.Context(), spec, collect(&events, &mu))
 	elapsed := time.Since(started)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
+	}
+
+	// Reap it. The supervisor correctly does not wait on a grandchild, which
+	// means nothing else will clean it up ... CI flags the leftover as an
+	// orphan process at job teardown.
+	mu.Lock()
+	lines := make([]harness.Event, len(events))
+	copy(lines, events)
+	mu.Unlock()
+	for _, ev := range lines {
+		if strings.Contains(ev.Text, "grandchild_pid") {
+			killPID(t, helperPID(t, ev.Text, "grandchild_pid"))
+		}
 	}
 
 	if res.State != harness.StateSucceeded {

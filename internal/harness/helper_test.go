@@ -81,11 +81,17 @@ func runHelper(mode string) int {
 			fmt.Fprintln(os.Stderr, "start grandchild:", err)
 			return 1
 		}
-		fmt.Println(`{"type":"system","subtype":"init","session_id":"sess-gc"}`)
+		// The parent reports the pid, not the grandchild: written before the
+		// parent exits, so the drain is guaranteed to see it. The grandchild
+		// racing its own announcement against the forced pipe close would be a
+		// flake, and a grandchild nobody can find is an orphan on the runner.
+		fmt.Printf("{\"type\":\"system\",\"subtype\":\"init\",\"grandchild_pid\":%d}\n", child.Process.Pid)
 		return 0
 
 	case "sleeper":
-		time.Sleep(2 * time.Minute)
+		// Must outlive the supervisor's drain grace comfortably. The test kills
+		// it; this is only a backstop.
+		time.Sleep(60 * time.Second)
 		return 0
 
 	default:
@@ -100,18 +106,29 @@ const (
 	helperLongLineBytes  = 2 << 20
 )
 
-// helperPID pulls the pid out of the announce-and-hang line.
-func helperPID(t *testing.T, line string) int {
+// helperPID pulls a pid out of a helper's announcement line.
+func helperPID(t *testing.T, line, key string) int {
 	t.Helper()
 
-	_, rest, ok := strings.Cut(line, `"pid":`)
+	_, rest, ok := strings.Cut(line, `"`+key+`":`)
 	if !ok {
-		t.Fatalf("no pid in %q", line)
+		t.Fatalf("no %s in %q", key, line)
 	}
-	digits := strings.TrimRight(rest, "}")
+	digits := strings.TrimRight(strings.TrimSpace(rest), "}")
 	pid, err := strconv.Atoi(strings.TrimSpace(digits))
 	if err != nil {
-		t.Fatalf("parse pid from %q: %v", line, err)
+		t.Fatalf("parse %s from %q: %v", key, line, err)
 	}
 	return pid
+}
+
+// killPID reaps a helper process. Best effort: it may already be gone.
+func killPID(t *testing.T, pid int) {
+	t.Helper()
+
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return
+	}
+	_ = proc.Kill()
 }

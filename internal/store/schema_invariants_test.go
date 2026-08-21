@@ -15,7 +15,7 @@ import (
 
 func TestBlobCannotGoLiveWithoutARef(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
+	alice := w.human("alice")
 	hash := strings.Repeat("a", 64)
 
 	// A reservation with no ref is fine: that is the crash window D6.5 designs
@@ -38,7 +38,7 @@ func TestBlobCannotGoLiveWithoutARef(t *testing.T) {
 	if err := w.s.InTx(w.ctx, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(w.ctx, `
 			INSERT INTO blob_refs (sha256, owner_kind, owner_id, author_actor, source_kind, source_id, trust)
-			VALUES ($1, 'user', $2, $2, 'upload', 'u1', 'trusted')`, hash, nate); err != nil {
+			VALUES ($1, 'user', $2, $2, 'upload', 'u1', 'trusted')`, hash, alice); err != nil {
 			return err
 		}
 		_, err := tx.Exec(w.ctx,
@@ -50,7 +50,7 @@ func TestBlobCannotGoLiveWithoutARef(t *testing.T) {
 
 	if _, err := w.s.Pool().Exec(w.ctx, `
 		INSERT INTO blob_refs (sha256, owner_kind, owner_id, author_actor, source_kind, source_id, trust)
-		VALUES ($1, 'user', $2, $2, 'screenshot', 's1', 'untrusted')`, hash, nate); err != nil {
+		VALUES ($1, 'user', $2, $2, 'screenshot', 's1', 'untrusted')`, hash, alice); err != nil {
 		t.Fatalf("second ref with different trust: %v", err)
 	}
 
@@ -62,7 +62,7 @@ func TestBlobCannotGoLiveWithoutARef(t *testing.T) {
 
 func TestCaptureClassCannotBeEvicted(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
+	alice := w.human("alice")
 	hash := strings.Repeat("c", 64)
 
 	if err := w.s.InTx(w.ctx, func(tx pgx.Tx) error {
@@ -73,7 +73,7 @@ func TestCaptureClassCannotBeEvicted(t *testing.T) {
 		}
 		_, err := tx.Exec(w.ctx, `
 			INSERT INTO blob_refs (sha256, owner_kind, owner_id, author_actor, source_kind, source_id, trust)
-			VALUES ($1, 'user', $2, $2, 'screenshot', 's1', 'untrusted')`, hash, nate)
+			VALUES ($1, 'user', $2, $2, 'screenshot', 's1', 'untrusted')`, hash, alice)
 		return err
 	}); err != nil {
 		t.Fatalf("insert capture: %v", err)
@@ -89,14 +89,14 @@ func TestCaptureClassCannotBeEvicted(t *testing.T) {
 
 func TestEventsAreAppendOnlyAndOriginDedupes(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
+	alice := w.human("alice")
 
 	insert := func(origin, originID any) error {
 		_, err := w.s.Pool().Exec(w.ctx, `
 			INSERT INTO events (kind, owner_kind, owner_id, author_actor,
 			                    principal_kind, principal_id, origin, origin_id)
 			VALUES ('journal.entry.created', 'user', $1, $1, 'user', $1, $2, $3)`,
-			nate, origin, originID)
+			alice, origin, originID)
 		return err
 	}
 
@@ -110,10 +110,10 @@ func TestEventsAreAppendOnlyAndOriginDedupes(t *testing.T) {
 	// D4.12: bridged events dedupe globally on (origin, origin_id). A unique
 	// constraint on the partitioned table would only be unique per month, which
 	// is why this rides a side table.
-	if err := insert("house-hive", "e-1"); err != nil {
+	if err := insert("acme-hive", "e-1"); err != nil {
 		t.Fatalf("insert bridged event: %v", err)
 	}
-	if err := insert("house-hive", "e-1"); err == nil {
+	if err := insert("acme-hive", "e-1"); err == nil {
 		t.Fatal("a duplicate (origin, origin_id) was accepted")
 	}
 	if err := insert("cloud-hive", "e-1"); err != nil {
@@ -130,13 +130,13 @@ func TestEventsAreAppendOnlyAndOriginDedupes(t *testing.T) {
 
 func TestWorkflowDefinitionsAreImmutable(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
+	alice := w.human("alice")
 
 	var id uuid.UUID
 	if err := w.s.Pool().QueryRow(w.ctx, `
 		INSERT INTO workflow_defs (name, spec, content_hash, owner_kind, owner_id, author_actor)
 		VALUES ('mention-notify', '{"steps":[]}', $1, 'user', $2, $2)
-		RETURNING id`, strings.Repeat("d", 64), nate).Scan(&id); err != nil {
+		RETURNING id`, strings.Repeat("d", 64), alice).Scan(&id); err != nil {
 		t.Fatalf("insert def: %v", err)
 	}
 
@@ -156,19 +156,19 @@ func TestWorkflowDefinitionsAreImmutable(t *testing.T) {
 
 func TestAgentRunIsAtMostOnceEverywhere(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
+	alice := w.human("alice")
 
 	var defID, runID uuid.UUID
 	if err := w.s.Pool().QueryRow(w.ctx, `
 		INSERT INTO workflow_defs (name, spec, content_hash, owner_kind, owner_id, author_actor)
 		VALUES ('x', '{}', $1, 'user', $2, $2) RETURNING id`,
-		strings.Repeat("e", 64), nate).Scan(&defID); err != nil {
+		strings.Repeat("e", 64), alice).Scan(&defID); err != nil {
 		t.Fatalf("def: %v", err)
 	}
 	if err := w.s.Pool().QueryRow(w.ctx, `
 		INSERT INTO workflow_runs (def_id, definition_hash, actor_id, owner_kind, owner_id)
 		VALUES ($1, $2, $3, 'user', $3) RETURNING id`,
-		defID, strings.Repeat("e", 64), nate).Scan(&runID); err != nil {
+		defID, strings.Repeat("e", 64), alice).Scan(&runID); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 
@@ -199,13 +199,13 @@ func TestAgentRunIsAtMostOnceEverywhere(t *testing.T) {
 
 func TestUntrustedRunHasNoEgress(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
+	alice := w.human("alice")
 
 	var defID uuid.UUID
 	if err := w.s.Pool().QueryRow(w.ctx, `
 		INSERT INTO workflow_defs (name, spec, content_hash, owner_kind, owner_id, author_actor)
 		VALUES ('x', '{}', $1, 'user', $2, $2) RETURNING id`,
-		strings.Repeat("f", 64), nate).Scan(&defID); err != nil {
+		strings.Repeat("f", 64), alice).Scan(&defID); err != nil {
 		t.Fatalf("def: %v", err)
 	}
 
@@ -214,7 +214,7 @@ func TestUntrustedRunHasNoEgress(t *testing.T) {
 	if _, err := w.s.Pool().Exec(w.ctx, `
 		INSERT INTO workflow_runs (def_id, definition_hash, actor_id, owner_kind, owner_id, trust, egress_allowed)
 		VALUES ($1, $2, $3, 'user', $3, 'untrusted', true)`,
-		defID, strings.Repeat("f", 64), nate); err == nil {
+		defID, strings.Repeat("f", 64), alice); err == nil {
 		t.Fatal("an untrusted run was given egress")
 	}
 }
@@ -223,7 +223,7 @@ func TestBootstrapCapsTheRootAtOne(t *testing.T) {
 	s, ctx := testStore(t)
 
 	first, err := store.Bootstrap(ctx, s.Pool(), store.BootstrapConfig{
-		RootHandle: "nate", RootName: "Nate", OrgHandle: "roadhouse", OrgName: "Bee's Roadhouse",
+		RootHandle: "alice", RootName: "Alice", OrgHandle: "acme-co", OrgName: "Bee's Acme Co",
 	})
 	if err != nil {
 		t.Fatalf("bootstrap: %v", err)
@@ -234,7 +234,7 @@ func TestBootstrapCapsTheRootAtOne(t *testing.T) {
 
 	// Restart-safe.
 	again, err := store.Bootstrap(ctx, s.Pool(), store.BootstrapConfig{
-		RootHandle: "nate", RootName: "Nate", OrgHandle: "roadhouse", OrgName: "Bee's Roadhouse",
+		RootHandle: "alice", RootName: "Alice", OrgHandle: "acme-co", OrgName: "Bee's Acme Co",
 	})
 	if err != nil {
 		t.Fatalf("second bootstrap: %v", err)

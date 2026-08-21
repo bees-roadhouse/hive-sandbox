@@ -55,7 +55,7 @@ func helloModule(t *testing.T, caps ...Capability) Module {
 }
 
 func testCaller() Caller {
-	return Caller{AuthorActor: "actor:pia", OwnerPrincipal: "user:nate", InstallID: "install:1"}
+	return Caller{AuthorActor: "actor:ava", OwnerPrincipal: "user:alice", InstallID: "install:1"}
 }
 
 func quietLogger() *slog.Logger {
@@ -112,7 +112,7 @@ func forEachEngine(t *testing.T, body func(t *testing.T, cfg Config)) {
 func TestConformanceHelloRoundTrip(t *testing.T) {
 	forEachEngine(t, func(t *testing.T, cfg Config) {
 		h := newTestHost(t, cfg, Deps{})
-		res, err := call(t, h, "hello", `{"name":"Nate"}`)
+		res, err := call(t, h, "hello", `{"name":"Alice"}`)
 		if err != nil {
 			t.Fatalf("call: %v", err)
 		}
@@ -123,8 +123,8 @@ func TestConformanceHelloRoundTrip(t *testing.T) {
 		if err := json.Unmarshal(res.Output, &out); err != nil {
 			t.Fatalf("output %q: %v", res.Output, err)
 		}
-		if out.Message != "hello, Nate" {
-			t.Errorf("message = %q, want %q", out.Message, "hello, Nate")
+		if out.Message != "hello, Alice" {
+			t.Errorf("message = %q, want %q", out.Message, "hello, Alice")
 		}
 		if out.ABI != ABIVersion {
 			t.Errorf("abi = %d, want %d", out.ABI, ABIVersion)
@@ -199,7 +199,7 @@ func TestConformanceStorageCapabilityRoundTrip(t *testing.T) {
 			t.Errorf("output = %s", res.Output)
 		}
 		// Identity is the host's, never the guest's (invariants 1 and 2).
-		if got.Caller.AuthorActor != "actor:pia" || got.Caller.OwnerPrincipal != "user:nate" {
+		if got.Caller.AuthorActor != "actor:ava" || got.Caller.OwnerPrincipal != "user:alice" {
 			t.Errorf("caller = %+v, want the credential's pair", got.Caller)
 		}
 		if got.App != "hello" {
@@ -350,7 +350,7 @@ func TestPoolIsolatesByPrincipal(t *testing.T) {
 		t.Helper()
 		res, err := h.Call(t.Context(), CallRequest{
 			Module: helloModule(t), Source: BytesSource(wasm),
-			Function: "hello", Caller: Caller{AuthorActor: "actor:pia", OwnerPrincipal: principal, InstallID: "i"},
+			Function: "hello", Caller: Caller{AuthorActor: "actor:ava", OwnerPrincipal: principal, InstallID: "i"},
 		})
 		if err != nil {
 			t.Fatalf("call as %s: %v", principal, err)
@@ -358,11 +358,11 @@ func TestPoolIsolatesByPrincipal(t *testing.T) {
 		return res
 	}
 
-	callAs("user:nate")
-	if res := callAs("user:maggie"); res.Warm {
+	callAs("user:alice")
+	if res := callAs("user:bob"); res.Warm {
 		t.Error("a second principal was handed the first principal's warm instance")
 	}
-	if res := callAs("user:nate"); !res.Warm {
+	if res := callAs("user:alice"); !res.Warm {
 		t.Error("the first principal lost its own warm instance")
 	}
 }
@@ -443,8 +443,8 @@ func TestCredentialMustPinBothHalves(t *testing.T) {
 		name   string
 		caller Caller
 	}{
-		{"no actor", Caller{OwnerPrincipal: "user:nate"}},
-		{"no principal", Caller{AuthorActor: "actor:pia"}},
+		{"no actor", Caller{OwnerPrincipal: "user:alice"}},
+		{"no principal", Caller{AuthorActor: "actor:ava"}},
 		{"neither", Caller{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

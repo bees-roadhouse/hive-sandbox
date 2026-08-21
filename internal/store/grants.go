@@ -75,7 +75,7 @@ func (r Reason) Allowed() bool { return r != Deny }
 var ErrDenied = errors.New("denied")
 
 // Credential is the pair D17.4 makes non-negotiable: who acted, and whose
-// authority they acted under. "Nate did this" and "an AI acting for Nate did
+// authority they acted under. "Alice did this" and "an AI acting for Alice did
 // this" must be distinguishable on every request, so both travel together and
 // the predicate re-checks that they agree.
 type Credential struct {

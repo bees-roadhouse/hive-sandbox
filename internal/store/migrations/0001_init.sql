@@ -5,8 +5,8 @@
 -- Rules this file encodes, and which the database (not the application) is
 -- responsible for holding:
 --
---   * Every content row carries owner_kind + owner_id AND author_actor. "Nate
---     did this" and "an AI acting for Nate did this" are different facts (D17.4).
+--   * Every content row carries owner_kind + owner_id AND author_actor. "Alice
+--     did this" and "an AI acting for Alice did this" are different facts (D17.4).
 --   * Ownership, permission and trust are properties of a REFERENCE. blobs hold
 --     bytes and nothing else; blob_refs hold owner, refcount and trust (D17.1).
 --   * Revoking a grant deletes it, and inherited children go with it by foreign
@@ -267,7 +267,7 @@ BEGIN
     -- legitimately holds a credential of (actor = them, principal = the org),
     -- and presenting that pair read as "the principal issuing for itself",
     -- which let any member mint a credential naming ANOTHER member as
-    -- author_actor. That forges "Nate did this", which is the one distinction
+    -- author_actor. That forges "Alice did this", which is the one distinction
     -- invariant 2 exists to preserve.
     IF NEW.principal_kind = 'user' AND NEW.principal_id = NEW.issued_by_actor THEN
         RETURN NEW;
@@ -532,7 +532,7 @@ CREATE TABLE app_builds (
     tested_at     timestamptz,
 
     -- D17.13: author_kind (user|org) cannot represent "Colette built this for
-    -- Nate." Same author/owner split as every other content row.
+    -- Alice." Same author/owner split as every other content row.
     author_actor  uuid NOT NULL REFERENCES actors (id),
     owner_kind    text NOT NULL CHECK (owner_kind IN ('user', 'org')),
     owner_id      uuid NOT NULL REFERENCES actors (id),

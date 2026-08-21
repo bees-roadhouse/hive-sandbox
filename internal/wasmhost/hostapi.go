@@ -21,8 +21,8 @@ type ActorID string
 // never appears here; ownership is always a user or an org (D13.4).
 type PrincipalID string
 
-// Caller pins both halves of the credential. "Nate did this" and "an AI acting
-// for Nate did this" must be distinguishable on every request, which is
+// Caller pins both halves of the credential. "Alice did this" and "an AI acting
+// for Alice did this" must be distinguishable on every request, which is
 // invariant 2 and the reason this is a pair rather than one actor field.
 //
 // These types live here only until internal/store lands; they belong in a

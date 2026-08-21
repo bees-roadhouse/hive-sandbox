@@ -147,9 +147,9 @@ func TestAccessReasonMatchesTheModel(t *testing.T) {
 	w.member(o1, h[2], "member", h[1])
 
 	ais := []uuid.UUID{
-		w.ai("ai0", "pia", store.PrincipalUser, h[0], h[0]),
-		w.ai("ai1", "apis", store.PrincipalOrg, o0, h[0]),
-		w.ai("ai2", "melli", store.PrincipalUser, h[2], h[2]),
+		w.ai("ai0", "ava", store.PrincipalUser, h[0], h[0]),
+		w.ai("ai1", "orb", store.PrincipalOrg, o0, h[0]),
+		w.ai("ai2", "nova", store.PrincipalUser, h[2], h[2]),
 	}
 
 	model := &modelWorld{
@@ -365,16 +365,16 @@ func TestAccessReasonMatchesTheModel(t *testing.T) {
 func TestPredicateInvariantsHoldOverRandomGrants(t *testing.T) {
 	w := newWorld(t)
 
-	nate := w.human("nate")
-	maggie := w.human("maggie")
-	house := w.org("house", nate)
-	w.member(house, maggie, "member", nate)
-	pia := w.ai("pia", "pia", store.PrincipalUser, nate, nate)
+	alice := w.human("alice")
+	bob := w.human("bob")
+	acme := w.org("acme", alice)
+	w.member(acme, bob, "member", alice)
+	ava := w.ai("ava", "ava", store.PrincipalUser, alice, alice)
 
 	owners := []store.Owner{
-		{Kind: store.PrincipalUser, ID: nate},
-		{Kind: store.PrincipalUser, ID: maggie},
-		{Kind: store.PrincipalOrg, ID: house},
+		{Kind: store.PrincipalUser, ID: alice},
+		{Kind: store.PrincipalUser, ID: bob},
+		{Kind: store.PrincipalOrg, ID: acme},
 	}
 
 	type rowRec struct {
@@ -383,9 +383,9 @@ func TestPredicateInvariantsHoldOverRandomGrants(t *testing.T) {
 	}
 	var rows []rowRec
 	for i, own := range owners {
-		inst := w.install(fmt.Sprintf("app%d", i), own, nate)
+		inst := w.install(fmt.Sprintf("app%d", i), own, alice)
 		for j := range 2 {
-			id := w.entity(inst, "entries", fmt.Sprintf("e%d-%d", i, j), own, nate)
+			id := w.entity(inst, "entries", fmt.Sprintf("e%d-%d", i, j), own, alice)
 			rows = append(rows, rowRec{subj: store.Subject{Kind: store.SubjectEntity, ID: id}, owner: own})
 		}
 	}
@@ -408,22 +408,22 @@ func TestPredicateInvariantsHoldOverRandomGrants(t *testing.T) {
 		}
 		_, _ = store.WriteGrant(w.ctx, w.s.Pool(), store.GrantSpec{
 			Subject: row.subj, Target: target, Access: access, Source: source,
-			By: cred(nate, store.PrincipalUser, nate), ExpiresAt: expires,
+			By: cred(alice, store.PrincipalUser, alice), ExpiresAt: expires,
 		})
 	}
 
 	g := w.s.Guard()
-	nateCred := cred(nate, store.PrincipalUser, nate)
-	piaCred := cred(pia, store.PrincipalUser, nate)
+	aliceCred := cred(alice, store.PrincipalUser, alice)
+	avaCred := cred(ava, store.PrincipalUser, alice)
 
 	for _, row := range rows {
 		for _, access := range []store.Access{store.AccessRead, store.AccessWrite, store.AccessCall} {
 			// An AI never gains authority its principal lacks. Every reason
-			// Pia gets, Nate must also get.
-			piaReason := reasonOf(w.ctx, t, g, piaCred, row.subj, access)
-			nateReason := reasonOf(w.ctx, t, g, nateCred, row.subj, access)
+			// Ava gets, Alice must also get.
+			piaReason := reasonOf(w.ctx, t, g, avaCred, row.subj, access)
+			nateReason := reasonOf(w.ctx, t, g, aliceCred, row.subj, access)
 			if piaReason.Allowed() && !nateReason.Allowed() {
-				t.Fatalf("row %s access %s: pia allowed (%q) where her principal is denied",
+				t.Fatalf("row %s access %s: ava allowed (%q) where her principal is denied",
 					row.subj.ID, access, piaReason)
 			}
 			// And she never reaches an override, whatever rows exist.

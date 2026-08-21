@@ -41,7 +41,7 @@ func benchModule(b *testing.B) ([]byte, Module) {
 }
 
 func benchCaller() Caller {
-	return Caller{AuthorActor: "actor:pia", OwnerPrincipal: "user:nate", InstallID: "install:1"}
+	return Caller{AuthorActor: "actor:ava", OwnerPrincipal: "user:alice", InstallID: "install:1"}
 }
 
 // minimalNoop is a hand-written module exporting one memory and one function
@@ -81,7 +81,7 @@ func BenchmarkRuntimeFloor(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			inst, err := h.instantiate(ctx, t, compiled, mod, instanceKey{hash, "user:nate", t.key})
+			inst, err := h.instantiate(ctx, t, compiled, mod, instanceKey{hash, "user:alice", t.key})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -145,7 +145,7 @@ func BenchmarkInstantiate(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	key := instanceKey{moduleHash: mod.Hash, principal: "user:nate", tier: t.key}
+	key := instanceKey{moduleHash: mod.Hash, principal: "user:alice", tier: t.key}
 
 	b.ReportAllocs()
 	for b.Loop() {
@@ -176,7 +176,7 @@ func BenchmarkInstanceFootprint(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	key := instanceKey{moduleHash: mod.Hash, principal: "user:nate", tier: t.key}
+	key := instanceKey{moduleHash: mod.Hash, principal: "user:alice", tier: t.key}
 
 	var heapPer, wasmPer float64
 	for b.Loop() {

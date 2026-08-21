@@ -86,10 +86,30 @@ func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// sharedCacheDir is one on-disk compilation cache for the whole test binary.
+//
+// Every host used to get its own in-memory cache, so every test recompiled the
+// 930 KB reference guest from scratch at ~47 ms a time. Across the suite that
+// was most of the package's runtime, and it was measuring nothing: compilation
+// is covered once, deliberately, by TestCompilationCacheSurvivesRestart.
+//
+// It also means the tests exercise the on-disk cache path that the daemon
+// actually runs, rather than only the in-memory one.
+var sharedCacheDir = sync.OnceValue(func() string {
+	dir, err := os.MkdirTemp("", "wasmhost-cache")
+	if err != nil {
+		return "" // fall back to per-host in-memory caches
+	}
+	return dir
+})
+
 func newTestHost(t *testing.T, cfg Config, deps Deps) *Host {
 	t.Helper()
 	if cfg.Logger == nil {
 		cfg.Logger = quietLogger()
+	}
+	if cfg.CacheDir == "" {
+		cfg.CacheDir = sharedCacheDir()
 	}
 	h, err := New(t.Context(), cfg, deps)
 	if err != nil {
@@ -124,10 +144,23 @@ var engines = []struct {
 	{"interpreter", true},
 }
 
+// The interpreter half is skipped under -short, and only under -short.
+//
+// It is roughly 60x slower than the compiler and it is most of this package's
+// runtime, which is the shape that makes a developer stop running the gate. But
+// moving it to CI only would be worse: compiler-versus-interpreter divergence is
+// a known wazero issue class rather than a hypothetical, and a correctness check
+// you cannot reproduce locally is one you discover by having CI fail at you.
+//
+// So the full run stays the default and the gate runs everything. -short is an
+// explicit choice at the call site for the inner loop.
 func forEachEngine(t *testing.T, body func(t *testing.T, cfg Config)) {
 	t.Helper()
 	for _, e := range engines {
 		t.Run(e.name, func(t *testing.T) {
+			if e.interpreter && testing.Short() {
+				t.Skip("-short: skipping the interpreter half of the conformance canary; the gate runs it")
+			}
 			body(t, Config{Interpreter: e.interpreter, Logger: quietLogger()})
 		})
 	}

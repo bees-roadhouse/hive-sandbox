@@ -189,8 +189,13 @@ func (m *Manifest) Validate() error {
 		// so two apps differing only past the limit would quietly share a
 		// schema. Caught here, where the fix is renaming an app, rather than at
 		// CREATE SCHEMA, where it does not look like an error at all.
-		errs = append(errs, fmt.Errorf("%w: %q is %d characters; %q needs %d or fewer",
-			ErrName, m.Name, len(m.Name), SchemaName(m.Name), maxAppName))
+		// The shape rather than a fabricated example: the real schema name
+		// depends on an owner this manifest does not know about, and printing a
+		// made-up one would show a string that will never exist.
+		errs = append(errs, fmt.Errorf(
+			"%w: %q is %d characters; %d or fewer, because the schema name is %s<name>_<8 hex of owner> "+
+				"and Postgres truncates at %d",
+			ErrName, m.Name, len(m.Name), maxAppName, schemaPrefix, MaxIdentifier()))
 	}
 	if m.Version < 1 {
 		errs = append(errs, fmt.Errorf("%w: %d", ErrVersion, m.Version))

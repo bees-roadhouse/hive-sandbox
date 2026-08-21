@@ -101,9 +101,9 @@ func TestValidateBoundsTheDerivedSchemaName(t *testing.T) {
 	if err := m.Validate(); err != nil {
 		t.Fatalf("a name that fits was rejected: %v", err)
 	}
-	if len(SchemaName(m.Name)) > maxIdentifier {
+	if len(SchemaName(m.Name, "user", "an-owner-id")) > maxIdentifier {
 		t.Fatalf("SchemaName is %d characters, over the %d limit",
-			len(SchemaName(m.Name)), maxIdentifier)
+			len(SchemaName(m.Name, "user", "an-owner-id")), maxIdentifier)
 	}
 
 	m.Name = strings.Repeat("a", maxAppName+1)
@@ -111,8 +111,11 @@ func TestValidateBoundsTheDerivedSchemaName(t *testing.T) {
 	if !errors.Is(err, ErrName) {
 		t.Fatalf("err = %v, want ErrName", err)
 	}
-	if !strings.Contains(err.Error(), SchemaName(m.Name)) {
-		t.Errorf("the error should show the schema name that would not fit: %v", err)
+	// The message shows the SHAPE, because the real name depends on an owner a
+	// manifest does not know. A fabricated example would be a string that never
+	// exists anywhere.
+	if !strings.Contains(err.Error(), "owner") {
+		t.Errorf("the error should explain that the owner suffix needs room: %v", err)
 	}
 }
 
@@ -163,12 +166,12 @@ func TestSchemaPlanDerivesStructureNotSyntax(t *testing.T) {
 		t.Fatalf("Validate: %v", err)
 	}
 
-	plan, err := m.SchemaPlan()
+	plan, err := m.SchemaPlan("user", "an-owner-id")
 	if err != nil {
 		t.Fatalf("SchemaPlan: %v", err)
 	}
-	if plan.Schema != "app_journal" {
-		t.Errorf("schema = %q, want app_journal", plan.Schema)
+	if !strings.HasPrefix(plan.Schema, "app_journal_") {
+		t.Errorf("schema = %q, want an owner-scoped app_journal_*", plan.Schema)
 	}
 	if len(plan.Collections) != 2 {
 		t.Fatalf("collections = %d, want 2", len(plan.Collections))
@@ -200,7 +203,7 @@ func TestSchemaPlanIsEmptyForATool(t *testing.T) {
 		Kind: KindTool, Name: "extract", Version: 1,
 		Functions: []Function{{Name: "run"}},
 	}
-	plan, err := m.SchemaPlan()
+	plan, err := m.SchemaPlan("user", "an-owner-id")
 	if err != nil {
 		t.Fatalf("SchemaPlan: %v", err)
 	}

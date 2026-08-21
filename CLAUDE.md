@@ -31,8 +31,13 @@ even if the tests pass.
    and "an AI acting for Nate did this" must be distinguishable on every request.
 3. **Ownership, permission and trust are properties of a REFERENCE, not of
    bytes.** Content addressing proves two blobs are identical and says nothing
-   about who owns them, who may read them, or whether they can be trusted. This
-   exact mistake has been made four times.
+   about who owns them, who may read them, or whether they can be trusted.
+   **This exact mistake has now been made five times**, the fifth inside the
+   package written to give this invariant teeth: a method took a bare hash,
+   confirmed only that the row existed globally, and handed the caller a
+   reference ... so a content address became a read capability, and a stranger
+   who merely knew a hash could read the bytes. **When a method accepts a hash,
+   ask what stops someone who only knows it.**
 4. **The events table is the transport; NOTIFY is only a wakeup bell carrying an
    id.** Every consumer must stay correct if every notification is dropped. Never
    tail with a naive `WHERE id > last` ... ids are assigned before commit, so use

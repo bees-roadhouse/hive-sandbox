@@ -289,6 +289,28 @@ func eventsEmit(ptr unsafe.Pointer, size int32) uint64
 
 // Storage verbs. One call is one transaction. The host resolves who is asking
 // from the credential, so a request body carries data and never identity.
+//
+// # "blob" is reserved in a document body
+//
+// The host maintains blob references for you: it walks each document it is
+// handed and writes, moves or releases them on the same transaction as the
+// write. It recognises a descriptor by the key alone, at any depth and inside
+// arrays:
+//
+//	{"cover": {"blob": "<64 hex>", "size": 20481, "mime": "image/jpeg"}}
+//
+// A "blob" key whose value is not a 64-character hex digest FAILS THE WRITE,
+// naming the JSON path. It is not ignored, because ignoring it would let one
+// mistyped character in a digest quietly turn a descriptor into an ordinary
+// string field ... and the bytes it named would then be collected out from
+// under a live document.
+//
+// Use any other key for a checksum or a content address you are only recording.
+// "sha256", "digest" and "checksum" are ordinary fields; only "blob" is claimed.
+//
+// A document may only name blobs its own principal already holds a reference
+// to. Naming somebody else's returns the same not-found as naming a digest that
+// was never stored. See docs/blob.md.
 
 func StorageInsert(req []byte) (Response, error) {
 	req = orEmpty(req)

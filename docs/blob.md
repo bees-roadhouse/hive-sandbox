@@ -166,6 +166,49 @@ two halves of one rule.
 
 ### Collection
 
+**`blob` is a reserved key in every document body. If you are writing an app,
+this is the one rule here you need before you hit it.**
+
+A document may name blobs, and the host maintains the references for you: it
+walks each document handed to `host.storage.insert`, `update` and `delete`, and
+writes, moves or releases `blob_refs` rows on the same transaction as the
+document. That is a requirement rather than a convenience — without it either
+blobs leak forever or a delete collects bytes out from under a live document.
+
+The host recognises a descriptor by the key alone:
+
+```json
+{
+  "title": "a day out",
+  "cover": { "blob": "<64 hex>", "size": 20481, "mime": "image/jpeg" },
+  "attachments": [ { "note": "receipt", "file": { "blob": "<64 hex>", "size": 812 } } ]
+}
+```
+
+Nesting and arrays are walked, so a descriptor anywhere in the document counts.
+
+**A `blob` key whose value is not a 64-character hex digest fails the write**,
+with a message naming the JSON path. It is not ignored, and that asymmetry is
+deliberate: ignoring it would mean a single mistyped character in a digest
+silently stops being a descriptor and becomes an ordinary string field, so the
+bytes it names lose their reference and are collected later, with nothing
+connecting the corruption to the write that caused it. Failing loudly on the
+call that caused it is the cheaper mistake by a wide margin.
+
+So: **use any other key for a checksum, a content address you are merely
+recording, or anything else that happens to be a hex string.** `sha256`,
+`digest`, `checksum` are all ordinary fields. Only `blob` is claimed.
+
+Two more rules that follow from ownership living on the reference (see above):
+
+- A document can only name blobs **its own principal already holds a live
+  reference to**. Naming somebody else's returns the same "not found" as naming
+  a digest that was never stored — the two are indistinguishable on purpose,
+  because telling them apart would let a caller probe the hash space.
+- A reference the host writes for you can never be **more** trusted than the
+  write that created it or the reference you already held. A document written
+  during an untrusted invocation holds its blobs untrusted.
+
 `Unreferenced` lists live blobs with no live reference **across every owner**.
 Scoping that count per tenant is precisely what would let one owner's last
 release unlink bytes another still holds — the failure the owner-in-the-key

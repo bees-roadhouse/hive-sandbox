@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"sort"
 
 	"github.com/bees-roadhouse/hive-sandbox/internal/blob"
@@ -26,7 +27,9 @@ const (
 // RESERVED in a document body.
 //
 // It is the wire name Descriptor.MarshalJSON emits, so an app that stores a
-// descriptor stores this key whether or not it meant to.
+// descriptor stores this key whether or not it meant to. An app that uses it for
+// anything else gets its write refused, naming the path ... see the reserved-key
+// rule in docs/blob.md, which is where an app author reads it.
 const descriptorKey = "blob"
 
 // descriptorsIn returns every blob a document names, sorted and deduplicated.
@@ -45,9 +48,16 @@ const descriptorKey = "blob"
 //   - Matching too much is loud and immediate. The write fails with a status
 //     the caller sees, on the call that caused it.
 //
-// So this matches on a parsable hash under "blob" alone. The cost is that an
-// app cannot store an unrelated 64-hex string under that key, which is why the
-// key is documented as reserved rather than merely used.
+// So this matches on the presence of "blob" alone, and a value under it that is
+// not a 64-character hex digest is REFUSED rather than ignored. Ignoring it
+// would put the false-negative back: a typo in a digest would stop being a
+// descriptor and start being an ordinary field, silently, which is the exact
+// direction that loses bytes. Refusing keeps the loud-and-immediate property
+// and turns the reserved word into something an app author learns the first
+// time rather than the hard way.
+//
+// The refusal names the JSON path, because "blob is reserved" is not actionable
+// without knowing which one.
 //
 // Sorted because map iteration is not ordered, and the order decides which of
 // several failures a caller is told about first. A caller retrying a failed
@@ -73,34 +83,52 @@ func descriptorsIn(doc json.RawMessage) ([]blob.Hash, error) {
 		seen = make(map[blob.Hash]bool)
 	)
 
-	var walk func(node any, depth int) error
-	walk = func(node any, depth int) error {
+	var walk func(node any, path string, depth int) error
+	walk = func(node any, path string, depth int) error {
 		if depth > maxDescriptorDepth {
 			return wasmhost.Errorf(wasmhost.StatusInvalid,
-				"document nests deeper than %d levels", maxDescriptorDepth)
+				"%s: document nests deeper than %d levels", path, maxDescriptorDepth)
 		}
 		switch v := node.(type) {
 		case map[string]any:
-			if h, ok := descriptorHash(v); ok && !seen[h] {
-				if len(out) >= maxDescriptorsPerDoc {
+			if raw, present := v[descriptorKey]; present {
+				h, err := descriptorHash(raw)
+				if err != nil {
 					return wasmhost.Errorf(wasmhost.StatusInvalid,
-						"document names more than %d blobs", maxDescriptorsPerDoc)
+						"%s.%s: %q is reserved for blob descriptors and must be a "+
+							"64-character hex digest (%v)",
+						path, descriptorKey, descriptorKey, err)
 				}
-				seen[h] = true
-				out = append(out, h)
+				if !seen[h] {
+					if len(out) >= maxDescriptorsPerDoc {
+						return wasmhost.Errorf(wasmhost.StatusInvalid,
+							"document names more than %d blobs", maxDescriptorsPerDoc)
+					}
+					seen[h] = true
+					out = append(out, h)
+				}
 			}
 			// Keep descending even through an object that already matched. A
 			// well-formed descriptor holds only scalars so this costs nothing,
 			// and stopping would let a nested descriptor hide inside a
 			// malformed one.
-			for _, child := range v {
-				if err := walk(child, depth+1); err != nil {
+			// Sorted, for the same reason the result is sorted: map iteration
+			// is not ordered, so a document with two bad paths would name a
+			// different one each time and a caller retrying a failed write
+			// would get a different answer twice.
+			keys := make([]string, 0, len(v))
+			for key := range v {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				if err := walk(v[key], path+"."+key, depth+1); err != nil {
 					return err
 				}
 			}
 		case []any:
-			for _, child := range v {
-				if err := walk(child, depth+1); err != nil {
+			for i, child := range v {
+				if err := walk(child, fmt.Sprintf("%s[%d]", path, i), depth+1); err != nil {
 					return err
 				}
 			}
@@ -108,7 +136,7 @@ func descriptorsIn(doc json.RawMessage) ([]blob.Hash, error) {
 		return nil
 	}
 
-	if err := walk(root, 0); err != nil {
+	if err := walk(root, "doc", 0); err != nil {
 		return nil, err
 	}
 
@@ -116,15 +144,16 @@ func descriptorsIn(doc json.RawMessage) ([]blob.Hash, error) {
 	return out, nil
 }
 
-// descriptorHash reads the hash out of a descriptor-shaped object.
-func descriptorHash(obj map[string]any) (blob.Hash, bool) {
-	raw, ok := obj[descriptorKey].(string)
+// descriptorHash reads the hash out of the value under the reserved key.
+//
+// Every failure is an error rather than a "not a descriptor", including a value
+// of the wrong JSON type. A number or an object under this key is not an
+// innocent field the walk should skip ... it is the reserved word being used for
+// something else, which the author needs telling about.
+func descriptorHash(raw any) (blob.Hash, error) {
+	s, ok := raw.(string)
 	if !ok {
-		return blob.Hash{}, false
+		return blob.Hash{}, fmt.Errorf("value is %T, not a string", raw)
 	}
-	h, err := blob.ParseHash(raw)
-	if err != nil {
-		return blob.Hash{}, false
-	}
-	return h, true
+	return blob.ParseHash(s)
 }

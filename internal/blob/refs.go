@@ -312,7 +312,7 @@ func (c *Catalog) resolveWith(ctx context.Context, db DB, cred identity.Credenti
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Not "forbidden". Not found.
-			return Descriptor{}, trust.Untrusted, fmt.Errorf("%w: %s", ErrNoRef, h)
+			return Descriptor{}, trust.Untrusted, fmt.Errorf("%w: %s", ErrNotFound, h)
 		}
 		return Descriptor{}, trust.Untrusted, fmt.Errorf("blob: resolve %s: %w", h, err)
 	}
@@ -382,7 +382,7 @@ func (c *Catalog) Release(
 		return fmt.Errorf("blob: release ref for %s: %w", h, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: no live reference to %s", ErrNoRef, h)
+		return fmt.Errorf("%w: no live reference to %s", ErrNotFound, h)
 	}
 	return nil
 }

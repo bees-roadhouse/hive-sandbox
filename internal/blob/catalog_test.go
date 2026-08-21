@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -861,5 +862,53 @@ func TestReleaseBySourceIsOwnerScoped(t *testing.T) {
 	}
 	if count, _ := w.catalog.LiveRefCount(w.ctx, desc.Hash); count != 1 {
 		t.Errorf("live refs = %d, want 1", count)
+	}
+}
+
+// LinkRef must be unable to tell a caller which of two things went wrong.
+//
+// "You hold no reference to these bytes" and "no such blob" have to be one
+// error with one message, because a caller that can distinguish them can be
+// asked for a status code, and a guest reading that status learns whether
+// arbitrary bytes exist anywhere on the platform. One bit per guess.
+//
+// This is the same hole Augie found in AddRef, reachable through a status code
+// instead of a write.
+func TestLinkRefCannotDistinguishAbsentFromUnheld(t *testing.T) {
+	t.Parallel()
+
+	w := newCatalogWorld(t)
+	alice := w.person("alice")
+	carol := w.person("carol")
+
+	// Exists, alice holds it, carol does not.
+	held := w.publish([]byte("alice's document"), capture(alice, "upload-1"), originalClass)
+	// Never stored at all.
+	absent := blob.HashBytes([]byte("bytes nobody ever stored"))
+
+	link := func(h blob.Hash) error {
+		return pgx.BeginFunc(w.ctx, w.pool, func(tx pgx.Tx) error {
+			_, err := w.catalog.LinkRef(w.ctx, tx, carol, h, capture(carol, "probe"))
+			return err
+		})
+	}
+
+	unheld, missing := link(held.Hash), link(absent)
+	if unheld == nil || missing == nil {
+		t.Fatal("carol linked bytes she does not hold")
+	}
+	if !errors.Is(unheld, blob.ErrNotFound) || !errors.Is(missing, blob.ErrNotFound) {
+		t.Fatalf("errors are not both ErrNotFound:\n unheld:  %v\n missing: %v", unheld, missing)
+	}
+
+	// Identical shape, not merely the same sentinel. The hash itself may differ
+	// ... the caller supplied it and already knows it ... so compare with each
+	// one masked. Anything left that differs is something the caller did not
+	// already have, which is what a leak is here.
+	maskedUnheld := strings.ReplaceAll(unheld.Error(), held.Hash.String(), "<hash>")
+	maskedMissing := strings.ReplaceAll(missing.Error(), absent.String(), "<hash>")
+	if maskedUnheld != maskedMissing {
+		t.Errorf("LinkRef distinguishes unheld from absent:\n unheld:  %q\n missing: %q",
+			maskedUnheld, maskedMissing)
 	}
 }

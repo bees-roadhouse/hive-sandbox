@@ -224,6 +224,18 @@ func MaxCollectionName() int { return maxIdentifier - longestDerivedSuffix() }
 // MaxIdentifier is Postgres's identifier limit, exported for the same reason.
 func MaxIdentifier() int { return maxIdentifier }
 
+// MaxAppName is the longest app name whose derived schema name still fits, and
+// therefore still keeps its owner digest.
+//
+// Exported because Validate is not the only place that has to know it.
+// SchemaName appends the owner digest LAST, so a slug over this bound pushes
+// that digest off the end of a Postgres identifier: two owners then derive
+// names distinct in Go and identical in Postgres, and `schema_name UNIQUE`
+// never sees it, because that column is text and stores the untruncated string
+// happily. Anything deriving a schema name from a slug it did not get from
+// Validate has to check this itself.
+func MaxAppName() int { return maxAppName }
+
 // DerivedSuffixes is every suffix the platform appends to a collection name.
 // Exported so a test can assert the budget covers all of them, which is what
 // makes adding a longer one fail here rather than in Postgres.

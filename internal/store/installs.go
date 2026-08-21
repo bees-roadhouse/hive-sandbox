@@ -74,6 +74,24 @@ func StageInstall(ctx context.Context, db DB, spec InstallSpec, by Credential) (
 	if spec.Slug == "" {
 		return uuid.Nil, errors.New("install needs a slug")
 	}
+	// Invariant 14, one input further back than the schema-name fix below.
+	//
+	// SchemaName appends the owner digest LAST, so a long enough slug pushes it
+	// off the end of a Postgres identifier. Two owners then derive names that
+	// are distinct in Go and identical in Postgres, and schema_name UNIQUE never
+	// sees it, because that column is text and stores the untruncated string
+	// happily.
+	//
+	// Deriving correctly is not enough when the input is unbounded, and this
+	// function is exported and takes a raw string. Every caller today arrives
+	// through Prepare, where Validate enforces the same bound ... which is what
+	// makes this latent rather than live, and is also exactly the reasoning that
+	// would leave it here until the caller that does not exist yet appears.
+	if len(spec.Slug) > manifest.MaxAppName() {
+		return uuid.Nil, fmt.Errorf("install slug is %d characters, over the %d that leave room "+
+			"for the owner suffix in a %d-character identifier",
+			len(spec.Slug), manifest.MaxAppName(), manifest.MaxIdentifier())
+	}
 	ok, err := actsFor(ctx, db, by, spec.Owner)
 	if err != nil {
 		return uuid.Nil, err

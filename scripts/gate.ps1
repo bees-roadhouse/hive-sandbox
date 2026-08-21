@@ -74,6 +74,26 @@ if ($skipped.Count -gt 0) {
     Write-Host "Container-image tests need scripts/harness-build.ps1 and scripts/egress-build.ps1." -ForegroundColor Yellow
 }
 
+# A count of what was skipped CANNOT see what was never built.
+#
+# A test package that does not compile has zero tests rather than skipped ones,
+# so it contributes nothing to the number above and "0 skipped" reads identically
+# for "everything ran" and "this package was never built". That is not
+# hypothetical: internal/store's test package stopped compiling for an hour and
+# every Postgres-backed test in it ... the whole grant predicate suite ... was
+# absent from main while go build ./... stayed green, because test files are not
+# part of it.
+#
+# `go vet ./...` above already fails on it. This is the second reading, because
+# the failure mode of the first one being wrong is that the number people trust
+# is the number that lies.
+if ($captured -match "\[build failed\]") {
+    Write-Host ""
+    Write-Host "A TEST PACKAGE FAILED TO BUILD ... it ran zero tests and skipped none." -ForegroundColor Red
+    $captured | Where-Object { $_ -match "\[build failed\]" } | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+    $failed += "test-build"
+}
+
 if ($failed.Count -gt 0) {
     Write-Host ""
     Write-Host "GATE RED: $($failed -join ', ')" -ForegroundColor Red

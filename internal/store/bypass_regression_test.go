@@ -278,7 +278,7 @@ func TestAICannotActivateItsOwnBuild(t *testing.T) {
 
 	// Staging is the unprivileged half and the loop may do it.
 	installID, err := store.StageInstall(w.ctx, w.s.Pool(), store.InstallSpec{
-		BuildID: buildID, Slug: "extract", Owner: aliceOwner, SchemaName: "app_extract",
+		BuildID: buildID, Slug: "extract", Owner: aliceOwner,
 	}, avaCred)
 	if err != nil {
 		t.Fatalf("stage: %v", err)
@@ -348,7 +348,7 @@ func TestStandingAuthorityMustBeHumanDelegated(t *testing.T) {
 	// unscoped: it still writes a row into a principal's own namespace.
 	if _, err := store.StageInstall(w.ctx, w.s.Pool(), store.InstallSpec{
 		BuildID: buildIDOf(t, w, installID), Slug: "squatter",
-		Owner: aliceOwner, SchemaName: "app_squatter",
+		Owner: aliceOwner,
 	}, carolCred); err == nil {
 		t.Fatal("a carol staged an install owned by somebody else")
 	}
@@ -493,10 +493,9 @@ func stageBuild(t *testing.T, w *world, slug string, author uuid.UUID, owner sto
 		t.Fatalf("register build: %v", err)
 	}
 	installID, err := store.StageInstall(w.ctx, w.s.Pool(), store.InstallSpec{
-		BuildID:    buildID,
-		Slug:       slug,
-		Owner:      owner,
-		SchemaName: "app_" + slug + "_" + buildID.String()[:8],
+		BuildID: buildID,
+		Slug:    slug,
+		Owner:   owner,
 	}, cred(author, owner.Kind, owner.ID))
 	if err != nil {
 		t.Fatalf("stage install: %v", err)

@@ -45,7 +45,7 @@ func (g modelGrant) live(now time.Time) bool {
 }
 
 type modelRow struct {
-	id    uuid.UUID
+	subj  store.Subject
 	owner store.Owner
 }
 
@@ -98,7 +98,7 @@ func (m *modelWorld) reason(cred store.Credential, row modelRow, access store.Ac
 	}
 
 	for _, g := range m.grants {
-		if g.subjectID != row.id || g.source == store.SourceOverride || !g.live(now) {
+		if g.subjectID != row.subj.ID || g.source == store.SourceOverride || !g.live(now) {
 			continue
 		}
 		if g.targetKind == cred.PrincipalKind && g.targetID == cred.PrincipalID && satisfies(g.access, access) {
@@ -108,7 +108,7 @@ func (m *modelWorld) reason(cred store.Credential, row modelRow, access store.Ac
 
 	if cred.PrincipalKind == store.PrincipalUser {
 		for _, g := range m.grants {
-			if g.subjectID != row.id || g.source == store.SourceOverride || !g.live(now) {
+			if g.subjectID != row.subj.ID || g.source == store.SourceOverride || !g.live(now) {
 				continue
 			}
 			if g.targetKind == store.PrincipalOrg && m.isMember(g.targetID, cred.PrincipalID) && satisfies(g.access, access) {
@@ -119,7 +119,7 @@ func (m *modelWorld) reason(cred store.Credential, row modelRow, access store.Ac
 
 	if a.kind == "human" && row.owner.Kind == store.PrincipalOrg && m.isAdmin(row.owner.ID, cred.ActorID) {
 		for _, g := range m.grants {
-			if g.subjectID != row.id || g.source != store.SourceOverride || !g.live(now) {
+			if g.subjectID != row.subj.ID || g.source != store.SourceOverride || !g.live(now) {
 				continue
 			}
 			if g.expires == nil {
@@ -175,21 +175,28 @@ func TestAccessReasonMatchesTheModel(t *testing.T) {
 		{Kind: store.PrincipalOrg, ID: o1},
 	}
 
-	// One install per owner, so an entity's owner and its install's owner agree.
+	// Both grantable subject kinds. An install is a subject in its own right,
+	// and the predicate resolves its owner from a different table than an
+	// entity's, so a corpus of entities only would not have exercised that path.
 	for i, own := range owners {
 		inst := w.install(fmt.Sprintf("app%d", i), own, h[0])
+		model.rows = append(model.rows, modelRow{
+			subj:  store.Subject{Kind: store.SubjectInstall, ID: inst},
+			owner: own,
+		})
 		for j := range 2 {
 			id := w.entity(inst, "entries", fmt.Sprintf("e%d-%d", i, j), own, h[0])
-			model.rows = append(model.rows, modelRow{id: id, owner: own})
+			model.rows = append(model.rows, modelRow{
+				subj:  store.Subject{Kind: store.SubjectEntity, ID: id},
+				owner: own,
+			})
 		}
 	}
 
 	// The read predicate has to be correct for ANY row in the grants table,
 	// including rows a bug wrote. The write-side policy is tested separately, in
 	// TestAICannotClimb, so it is out of the way here on purpose.
-	if _, err := w.s.Pool().Exec(w.ctx, "ALTER TABLE grants DISABLE TRIGGER grants_issue_policy"); err != nil {
-		t.Fatalf("disable issue policy: %v", err)
-	}
+	withIssuePolicyOff(t, w, func() {})
 
 	targets := owners
 	accesses := []store.Access{store.AccessRead, store.AccessWrite, store.AccessCall}
@@ -198,6 +205,48 @@ func TestAccessReasonMatchesTheModel(t *testing.T) {
 	rng := rand.New(rand.NewPCG(0x5EED, 0xB335))
 	var parents []uuid.UUID
 	now := time.Now()
+
+	// Directed grants first, one per branch, so the coverage guard below is
+	// checking that the predicate agrees rather than that the dice were kind.
+	// The override branch in particular needs an org-owned subject and an admin
+	// of that org, which random draws hit about twice in a thousand.
+	directed := []struct {
+		row    modelRow
+		target store.Owner
+		access store.Access
+		source store.GrantSource
+	}{
+		{model.rows[0], store.Owner{Kind: store.PrincipalUser, ID: h[1]}, store.AccessRead, store.SourceDirect},
+		{model.rows[0], store.Owner{Kind: store.PrincipalOrg, ID: o1}, store.AccessRead, store.SourceDirect},
+	}
+	for _, r := range model.rows {
+		if r.owner.Kind == store.PrincipalOrg && r.owner.ID == o0 {
+			directed = append(directed, struct {
+				row    modelRow
+				target store.Owner
+				access store.Access
+				source store.GrantSource
+			}{r, store.Owner{Kind: store.PrincipalUser, ID: h[0]}, store.AccessRead, store.SourceOverride})
+			break
+		}
+	}
+	for _, d := range directed {
+		var expires *time.Time
+		if d.source == store.SourceOverride {
+			e := now.Add(2 * time.Hour)
+			expires = &e
+		}
+		if _, err := store.WriteGrant(w.ctx, w.s.Pool(), store.GrantSpec{
+			Subject: d.row.subj, Target: d.target, Access: d.access, Source: d.source,
+			By: cred(h[0], store.PrincipalUser, h[0]), ExpiresAt: expires,
+		}); err != nil {
+			t.Fatalf("directed grant: %v", err)
+		}
+		model.grants = append(model.grants, modelGrant{
+			subjectID: d.row.subj.ID, targetKind: d.target.Kind, targetID: d.target.ID,
+			access: d.access, source: d.source, expires: expires,
+		})
+	}
 
 	for range 90 {
 		row := model.rows[rng.IntN(len(model.rows))]
@@ -235,7 +284,7 @@ func TestAccessReasonMatchesTheModel(t *testing.T) {
 		}
 
 		id, err := store.WriteGrant(w.ctx, w.s.Pool(), store.GrantSpec{
-			Subject:       store.Subject{Kind: store.SubjectEntity, ID: row.id},
+			Subject:       row.subj,
 			Target:        target,
 			Access:        access,
 			Source:        source,
@@ -259,13 +308,9 @@ func TestAccessReasonMatchesTheModel(t *testing.T) {
 		}
 
 		model.grants = append(model.grants, modelGrant{
-			subjectID: row.id, targetKind: target.Kind, targetID: target.ID,
+			subjectID: row.subj.ID, targetKind: target.Kind, targetID: target.ID,
 			access: access, source: source, expires: expires, revoked: revoked,
 		})
-	}
-
-	if _, err := w.s.Pool().Exec(w.ctx, "ALTER TABLE grants ENABLE TRIGGER grants_issue_policy"); err != nil {
-		t.Fatalf("enable issue policy: %v", err)
 	}
 
 	// Every actor, claiming every principal ... including ones it has no path
@@ -287,14 +332,11 @@ func TestAccessReasonMatchesTheModel(t *testing.T) {
 			for _, row := range model.rows {
 				for _, access := range accesses {
 					want := model.reason(c, row, access, now)
-					got, err := g.Reason(w.ctx, c,
-						store.Subject{Kind: store.SubjectEntity, ID: row.id}, row.owner, access)
-					if err != nil {
-						t.Fatalf("access_reason: %v", err)
-					}
+					got := reasonOf(w.ctx, t, g, c, row.subj, access)
 					if got != want {
-						t.Fatalf("actor=%s principal=%s/%s row=%s owner=%s/%s access=%s: database says %q, model says %q",
-							actor, p.Kind, p.ID, row.id, row.owner.Kind, row.owner.ID, access, got, want)
+						t.Fatalf("actor=%s principal=%s/%s subject=%s/%s owner=%s/%s access=%s: database says %q, model says %q",
+							actor, p.Kind, p.ID, row.subj.Kind, row.subj.ID,
+							row.owner.Kind, row.owner.ID, access, got, want)
 					}
 					seen[got]++
 					checked++
@@ -348,9 +390,7 @@ func TestPredicateInvariantsHoldOverRandomGrants(t *testing.T) {
 		}
 	}
 
-	if _, err := w.s.Pool().Exec(w.ctx, "ALTER TABLE grants DISABLE TRIGGER grants_issue_policy"); err != nil {
-		t.Fatalf("disable issue policy: %v", err)
-	}
+	withIssuePolicyOff(t, w, func() {})
 
 	rng := rand.New(rand.NewPCG(0xC0FFEE, 0x1234))
 	now := time.Now()
@@ -371,9 +411,6 @@ func TestPredicateInvariantsHoldOverRandomGrants(t *testing.T) {
 			By: cred(nate, store.PrincipalUser, nate), ExpiresAt: expires,
 		})
 	}
-	if _, err := w.s.Pool().Exec(w.ctx, "ALTER TABLE grants ENABLE TRIGGER grants_issue_policy"); err != nil {
-		t.Fatalf("enable issue policy: %v", err)
-	}
 
 	g := w.s.Guard()
 	nateCred := cred(nate, store.PrincipalUser, nate)
@@ -383,14 +420,8 @@ func TestPredicateInvariantsHoldOverRandomGrants(t *testing.T) {
 		for _, access := range []store.Access{store.AccessRead, store.AccessWrite, store.AccessCall} {
 			// An AI never gains authority its principal lacks. Every reason
 			// Pia gets, Nate must also get.
-			piaReason, err := g.Reason(w.ctx, piaCred, row.subj, row.owner, access)
-			if err != nil {
-				t.Fatalf("pia: %v", err)
-			}
-			nateReason, err := g.Reason(w.ctx, nateCred, row.subj, row.owner, access)
-			if err != nil {
-				t.Fatalf("nate: %v", err)
-			}
+			piaReason := reasonOf(w.ctx, t, g, piaCred, row.subj, access)
+			nateReason := reasonOf(w.ctx, t, g, nateCred, row.subj, access)
 			if piaReason.Allowed() && !nateReason.Allowed() {
 				t.Fatalf("row %s access %s: pia allowed (%q) where her principal is denied",
 					row.subj.ID, access, piaReason)

@@ -1,0 +1,621 @@
+package store_test
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/bees-roadhouse/hive-sandbox/internal/store"
+)
+
+// One test per authorization bypass reproduced against a real Postgres in the
+// review of 507a0f8. Each names the attack rather than the fix, because the fix
+// is what changes and the attack is what has to keep failing.
+
+// --- the predicate took the owner on trust from its caller ------------------
+//
+// access_reason() used to accept p_owner_kind and p_owner_id as parameters and
+// compare them to the credential's principal without ever checking that the
+// subject was owned by the owner it was handed. Passing your own principal
+// returned 'owner' for any row in the database.
+//
+// There is no test for "pass a lying owner" any more, because the parameters
+// are gone: the predicate resolves ownership from the subject. What is left to
+// assert is that resolution is actually happening.
+func TestPredicateResolvesOwnershipItself(t *testing.T) {
+	w := newWorld(t)
+	nate := w.human("nate")
+	maggie := w.human("maggie")
+	house := w.org("house", nate)
+	w.member(house, maggie, "member", nate)
+
+	houseOwner := store.Owner{Kind: store.PrincipalOrg, ID: house}
+	inst := w.install("shared", houseOwner, nate)
+	orgRow := store.Subject{Kind: store.SubjectEntity, ID: w.entity(inst, "entries", "o", houseOwner, nate)}
+
+	g := w.s.Guard()
+	maggieCred := cred(maggie, store.PrincipalUser, maggie)
+
+	// A plain member of the owning org, with no grant, on an org-owned row.
+	// The old signature let her claim the row was hers and get write.
+	for _, access := range []store.Access{store.AccessRead, store.AccessWrite} {
+		if r := reasonOf(w.ctx, t, g, maggieCred, orgRow, access); r != store.Deny {
+			t.Fatalf("%s on an org-owned row returned %q for a plain member", access, r)
+		}
+	}
+
+	// Ownership is real when it is real: an AI acting for the org reads owner.
+	orgAI := w.ai("house-assistant", "melli", store.PrincipalOrg, house, nate)
+	orgCred := cred(orgAI, store.PrincipalOrg, house)
+	if r := reasonOf(w.ctx, t, g, orgCred, orgRow, store.AccessRead); r != store.ReasonOwner {
+		t.Fatalf("the owning principal got %q, want owner", r)
+	}
+
+	// A subject nobody owns has no scope, so it is deny rather than a panic or
+	// an accidental allow.
+	ghost := store.Subject{Kind: store.SubjectEntity, ID: uuid.New()}
+	if r := reasonOf(w.ctx, t, g, orgCred, ghost, store.AccessRead); r != store.Deny {
+		t.Fatalf("a nonexistent subject returned %q", r)
+	}
+}
+
+// --- the set read returned override rows and audited nothing ---------------
+
+func TestVisibleEntityIDsAuditsOverrides(t *testing.T) {
+	w := newWorld(t)
+	nate := w.human("nate")
+	house := w.org("house", nate)
+	houseOwner := store.Owner{Kind: store.PrincipalOrg, ID: house}
+	nateCred := cred(nate, store.PrincipalUser, nate)
+
+	inst := w.install("shared", houseOwner, nate)
+	entityID := w.entity(inst, "entries", "o", houseOwner, nate)
+	row := store.Subject{Kind: store.SubjectEntity, ID: entityID}
+
+	g := w.s.Guard()
+
+	// Before break-glass the admin cannot see it at all.
+	ids, err := g.VisibleEntityIDs(w.ctx, nateCred, store.AccessRead, "", 100)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("an admin listed %d org-owned rows with no grant", len(ids))
+	}
+
+	if _, bgErr := store.EnterBreakGlass(w.ctx, w.s.Pool(), row, nateCred, time.Hour, "incident"); bgErr != nil {
+		t.Fatalf("break-glass: %v", bgErr)
+	}
+
+	ids, err = g.VisibleEntityIDs(w.ctx, nateCred, store.AccessRead, "", 100)
+	if err != nil {
+		t.Fatalf("list after break-glass: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != entityID {
+		t.Fatalf("list returned %v, want the one override row", ids)
+	}
+
+	// THE POINT: the row came back solely because of break-glass, so the set
+	// read owes the audit exactly as the point check does. It used to owe
+	// nothing, which made the obligation optional for every list, search and
+	// graph query there will ever be.
+	var audits int
+	if err := w.s.Pool().QueryRow(w.ctx,
+		"SELECT count(*) FROM grant_override_audit WHERE actor_id = $1", nate).Scan(&audits); err != nil {
+		t.Fatalf("count audits: %v", err)
+	}
+	if audits == 0 {
+		t.Fatal("a set read returned an override-only row and wrote no audit row")
+	}
+
+	// The audit records the owner the predicate resolved, not one a caller
+	// supplied.
+	var ownerKind string
+	var ownerID uuid.UUID
+	if err := w.s.Pool().QueryRow(w.ctx,
+		"SELECT owner_kind, owner_id FROM grant_override_audit ORDER BY id DESC LIMIT 1").
+		Scan(&ownerKind, &ownerID); err != nil {
+		t.Fatalf("read audit row: %v", err)
+	}
+	if ownerKind != "org" || ownerID != house {
+		t.Fatalf("audit named owner %s/%s, want org/%s", ownerKind, ownerID, house)
+	}
+}
+
+// The audit lands outside the caller's transaction. An override audit records
+// that something happened; if it rode the caller's transaction, a read could
+// stream rows to a client and roll the evidence back with everything else.
+func TestOverrideAuditSurvivesACallerRollback(t *testing.T) {
+	w := newWorld(t)
+	nate := w.human("nate")
+	house := w.org("house", nate)
+	houseOwner := store.Owner{Kind: store.PrincipalOrg, ID: house}
+	nateCred := cred(nate, store.PrincipalUser, nate)
+
+	inst := w.install("shared", houseOwner, nate)
+	row := store.Subject{Kind: store.SubjectEntity, ID: w.entity(inst, "entries", "o", houseOwner, nate)}
+	if _, err := store.EnterBreakGlass(w.ctx, w.s.Pool(), row, nateCred, time.Hour, "incident"); err != nil {
+		t.Fatalf("break-glass: %v", err)
+	}
+
+	tx, err := w.s.Pool().Begin(w.ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	g := w.s.GuardTx(tx)
+	if _, err := g.Authorize(w.ctx, nateCred, row, store.AccessRead, "incident"); err != nil {
+		_ = tx.Rollback(w.ctx)
+		t.Fatalf("authorize in tx: %v", err)
+	}
+	if err := tx.Rollback(w.ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	var audits int
+	if err := w.s.Pool().QueryRow(w.ctx,
+		"SELECT count(*) FROM grant_override_audit WHERE actor_id = $1", nate).Scan(&audits); err != nil {
+		t.Fatalf("count audits: %v", err)
+	}
+	if audits != 1 {
+		t.Fatalf("%d audit rows survived the caller's rollback, want 1", audits)
+	}
+}
+
+// --- a grant could be rewritten by UPDATE -----------------------------------
+
+func TestGrantsCannotBeRewrittenByUpdate(t *testing.T) {
+	w := newWorld(t)
+	nate := w.human("nate")
+	maggie := w.human("maggie")
+	stranger := w.human("stranger")
+	pia := w.ai("pia", "pia", store.PrincipalUser, nate, nate)
+
+	nateOwner := store.Owner{Kind: store.PrincipalUser, ID: nate}
+	nateCred := cred(nate, store.PrincipalUser, nate)
+	inst := w.install("journal", nateOwner, nate)
+	entry := store.Subject{Kind: store.SubjectEntity, ID: w.entity(inst, "entries", "e", nateOwner, nate)}
+
+	id, err := store.WriteGrant(w.ctx, w.s.Pool(), store.GrantSpec{
+		Subject: entry, Target: store.Owner{Kind: store.PrincipalUser, ID: maggie},
+		Access: store.AccessRead, Source: store.SourceDirect, By: nateCred,
+	})
+	if err != nil {
+		t.Fatalf("share: %v", err)
+	}
+
+	// The issue policy is an INSERT trigger, so every one of these used to
+	// succeed: retarget a live grant at an unrelated principal, widen read to
+	// write, reattribute it to an AI, promote it to an override.
+	attacks := []struct {
+		name string
+		sql  string
+		args []any
+	}{
+		{"retarget", "UPDATE grants SET target_id = $2 WHERE id = $1", []any{id, stranger}},
+		{"widen", "UPDATE grants SET access = 'write' WHERE id = $1", []any{id}},
+		{"reattribute to an AI", "UPDATE grants SET granted_by_actor = $2 WHERE id = $1", []any{id, pia}},
+		{"promote to override", "UPDATE grants SET source = 'override', expires_at = now() + interval '1 day' WHERE id = $1", []any{id}},
+		{"move the subject", "UPDATE grants SET subject_id = $2 WHERE id = $1", []any{id, uuid.New()}},
+		{"extend the window", "UPDATE grants SET expires_at = now() + interval '1 year' WHERE id = $1", []any{id}},
+	}
+	for _, a := range attacks {
+		t.Run(a.name, func(t *testing.T) {
+			if _, err := w.s.Pool().Exec(w.ctx, a.sql, a.args...); err == nil {
+				t.Fatalf("%s succeeded; the issue policy can be walked around by UPDATE", a.name)
+			}
+		})
+	}
+
+	// Revocation is the one thing an UPDATE may do, because that is what the
+	// tombstone mechanism needs.
+	if _, err := w.s.Pool().Exec(w.ctx,
+		"UPDATE grants SET revoked_at = now(), revoked_by = $2 WHERE id = $1", id, nate); err != nil {
+		t.Fatalf("revocation was refused: %v", err)
+	}
+}
+
+// --- any org member could mint a credential for another member's actor ------
+
+func TestOrgMemberCannotMintCredentialsForAnotherActor(t *testing.T) {
+	w := newWorld(t)
+	nate := w.human("nate")
+	maggie := w.human("maggie")
+	house := w.org("house", nate)
+	w.member(house, maggie, "member", nate)
+
+	// Maggie legitimately holds (actor = maggie, principal = house), because a
+	// human may act for an org they belong to. Presenting that pair used to
+	// read as "the principal issuing for itself", which let her mint a
+	// credential naming NATE as author_actor ... forging "Nate did this", the
+	// one distinction invariant 2 exists to preserve.
+	_, err := w.s.Pool().Exec(w.ctx, `
+		INSERT INTO credentials (actor_id, principal_kind, principal_id, token_sha256,
+		                         issued_by_actor, issued_by_principal_kind, issued_by_principal_id)
+		VALUES ($1, 'org', $2, repeat('a', 64), $3, 'org', $2)`, nate, house, maggie)
+	if err == nil {
+		t.Fatal("a plain member minted a credential for another member's actor")
+	}
+
+	// The admin branch is the intended route and still works.
+	if _, err := w.s.Pool().Exec(w.ctx, `
+		INSERT INTO credentials (actor_id, principal_kind, principal_id, token_sha256,
+		                         issued_by_actor, issued_by_principal_kind, issued_by_principal_id)
+		VALUES ($1, 'org', $2, repeat('b', 64), $3, 'user', $3)`, maggie, house, nate); err != nil {
+		t.Fatalf("an org admin could not issue for a member: %v", err)
+	}
+
+	// And a person still issues for themselves and for an AI they own.
+	pia := w.ai("pia", "pia", store.PrincipalUser, nate, nate)
+	if _, _, err := store.IssueCredential(w.ctx, w.s.Pool(), pia,
+		store.Owner{Kind: store.PrincipalUser, ID: nate},
+		cred(nate, store.PrincipalUser, nate), "pia", nil); err != nil {
+		t.Fatalf("a person could not issue for their own AI: %v", err)
+	}
+}
+
+// --- an AI promoted its own build by naming a human activator ---------------
+
+func TestAICannotActivateItsOwnBuild(t *testing.T) {
+	w := newWorld(t)
+	nate := w.human("nate")
+	pia := w.ai("pia", "pia", store.PrincipalUser, nate, nate)
+	nateOwner := store.Owner{Kind: store.PrincipalUser, ID: nate}
+	piaCred := cred(pia, store.PrincipalUser, nate)
+	nateCred := cred(nate, store.PrincipalUser, nate)
+
+	var buildID uuid.UUID
+	if err := w.s.Pool().QueryRow(w.ctx, `
+		INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
+		                        author_actor, owner_kind, owner_id, visibility, trust, status)
+		VALUES ('extract', 'tool', 'host', '{}', repeat('b', 64), $1, 'user', $2, 'private', 'local', 'registered')
+		RETURNING id`, pia, nate).Scan(&buildID); err != nil {
+		t.Fatalf("an AI could not register a build, which D19.4 allows: %v", err)
+	}
+
+	// Staging is the unprivileged half and the loop may do it.
+	installID, err := store.StageInstall(w.ctx, w.s.Pool(), store.InstallSpec{
+		BuildID: buildID, Slug: "extract", Owner: nateOwner, SchemaName: "app_extract",
+	}, piaCred)
+	if err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	// THE ATTACK: the trigger checks kind='human' on a column the writer
+	// supplies, so an AI acting for the owner could name a human and promote
+	// its own output. The trigger cannot see a credential; the writer can.
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, piaCred); err == nil {
+		t.Fatal("an AI activated its own build")
+	} else if !errors.Is(err, store.ErrNotHuman) {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+
+	var state string
+	if err := w.s.Pool().QueryRow(w.ctx, "SELECT state FROM installs WHERE id = $1", installID).Scan(&state); err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if state != "disabled" {
+		t.Fatalf("install state is %q after a refused activation", state)
+	}
+
+	// A human activates it, and the row records who actually did it.
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, nateCred); err != nil {
+		t.Fatalf("a human could not activate: %v", err)
+	}
+	var activator uuid.UUID
+	if err := w.s.Pool().QueryRow(w.ctx,
+		"SELECT activated_by_actor FROM installs WHERE id = $1", installID).Scan(&activator); err != nil {
+		t.Fatalf("read activator: %v", err)
+	}
+	if activator != nate {
+		t.Fatalf("activated_by_actor is %s, want the actor on the credential", activator)
+	}
+}
+
+// The standing-grant route is the deliberate exception, and it needs a grant a
+// HUMAN wrote. Without that clause the rule is decorative: an AI acting for the
+// owner already reads owner on the install, so it could mint its own.
+func TestStandingGrantMustBeHumanIssued(t *testing.T) {
+	w := newWorld(t)
+	nate := w.human("nate")
+	pia := w.ai("pia", "pia", store.PrincipalUser, nate, nate)
+	nateOwner := store.Owner{Kind: store.PrincipalUser, ID: nate}
+	piaCred := cred(pia, store.PrincipalUser, nate)
+	nateCred := cred(nate, store.PrincipalUser, nate)
+
+	var buildID uuid.UUID
+	if err := w.s.Pool().QueryRow(w.ctx, `
+		INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
+		                        author_actor, owner_kind, owner_id, visibility, trust, status)
+		VALUES ('extract', 'tool', 'host', '{}', repeat('c', 64), $1, 'user', $2, 'private', 'local', 'registered')
+		RETURNING id`, pia, nate).Scan(&buildID); err != nil {
+		t.Fatalf("register build: %v", err)
+	}
+	installID, err := store.StageInstall(w.ctx, w.s.Pool(), store.InstallSpec{
+		BuildID: buildID, Slug: "extract", Owner: nateOwner, SchemaName: "app_extract",
+	}, piaCred)
+	if err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	// Pia writes her own standing grant. She is allowed to: she acts for the
+	// owner. It must not be enough to activate.
+	if _, err := store.WriteGrant(w.ctx, w.s.Pool(), store.GrantSpec{
+		Subject: store.Subject{Kind: store.SubjectInstall, ID: installID},
+		Target:  store.Owner{Kind: store.PrincipalUser, ID: nate},
+		Access:  store.AccessWrite, Source: store.SourceDirect, By: piaCred,
+	}); err != nil {
+		t.Fatalf("ai self-grant: %v", err)
+	}
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, piaCred); err == nil {
+		t.Fatal("an AI activated using a standing grant it wrote itself")
+	}
+
+	// The same grant written by a human is the standing decision D19.4 means.
+	if _, err := w.s.Pool().Exec(w.ctx,
+		"DELETE FROM grants WHERE subject_kind = 'install' AND subject_id = $1", installID); err != nil {
+		t.Fatalf("clear grants: %v", err)
+	}
+	if _, err := store.WriteGrant(w.ctx, w.s.Pool(), store.GrantSpec{
+		Subject: store.Subject{Kind: store.SubjectInstall, ID: installID},
+		Target:  store.Owner{Kind: store.PrincipalUser, ID: nate},
+		Access:  store.AccessWrite, Source: store.SourceDirect, By: nateCred,
+		Reason: "standing permission to roll rebuilt tools",
+	}); err != nil {
+		t.Fatalf("human standing grant: %v", err)
+	}
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, piaCred); err != nil {
+		t.Fatalf("the loop could not roll a build under a human standing grant: %v", err)
+	}
+}
+
+// --- break-glass on one tool killed every tool on the install ---------------
+
+func TestToolAllowlist(t *testing.T) {
+	w := newWorld(t)
+	nate := w.human("nate")
+	maggie := w.human("maggie")
+	house := w.org("house", nate)
+	w.member(house, maggie, "member", nate)
+
+	houseOwner := store.Owner{Kind: store.PrincipalOrg, ID: house}
+	inst := w.install("journal", houseOwner, nate)
+	orgTarget := store.Owner{Kind: store.PrincipalOrg, ID: house}
+	nateCred := cred(nate, store.PrincipalUser, nate)
+	maggieCred := cred(maggie, store.PrincipalUser, maggie)
+	orgCred := cred(w.ai("house-ai", "melli", store.PrincipalOrg, house, nate), store.PrincipalOrg, house)
+	// The install is org-owned, so only the org principal may grant on it.
+	// Nate acts for house because he belongs to it.
+	nateForHouse := cred(nate, store.PrincipalOrg, house)
+
+	g := w.s.Guard()
+	call := func(c store.Credential, tool string) store.Reason {
+		t.Helper()
+		r, err := g.ToolReason(w.ctx, c, inst, tool)
+		if err != nil {
+			t.Fatalf("tool_access_reason: %v", err)
+		}
+		return r
+	}
+
+	// Absence is deny, before anything is granted.
+	if r := call(maggieCred, "search"); r != store.Deny {
+		t.Fatalf("an ungranted tool returned %q", r)
+	}
+	// The owning principal reads owner on the install, so it holds the full set.
+	if r := call(orgCred, "anything"); r != store.ReasonOwner {
+		t.Fatalf("the owner got %q on a tool call", r)
+	}
+
+	// An install grant with no allowlist implies the full tool set.
+	if _, err := store.WriteGrant(w.ctx, w.s.Pool(), store.GrantSpec{
+		Subject: store.Subject{Kind: store.SubjectInstall, ID: inst},
+		Target:  orgTarget, Access: store.AccessCall, Source: store.SourceDirect,
+		By: nateForHouse,
+	}); err != nil {
+		t.Fatalf("install grant: %v", err)
+	}
+	for _, tool := range []string{"search", "add_entry", "delete"} {
+		for who, c := range map[string]store.Credential{"maggie": maggieCred, "nate": nateCred} {
+			if r := call(c, tool); r != store.ReasonOrg {
+				t.Fatalf("with no allowlist, %s returned %q for %s", tool, r, who)
+			}
+		}
+	}
+
+	// THE BUG: break-glass on ONE tool used to flip the whole install onto the
+	// allowlist path, and the allowlist path can never satisfy 'call' because
+	// an override row is read-only by CHECK. The admin lost the entire
+	// install's tool set for the duration of his own incident, silently, at the
+	// moment he was trying to fix something.
+	if _, err := store.EnterBreakGlass(w.ctx, w.s.Pool(),
+		store.Subject{Kind: store.SubjectTool, ID: inst, Name: "summarize"},
+		nateCred, time.Hour, "incident"); err != nil {
+		t.Fatalf("break-glass on a tool: %v", err)
+	}
+	// The admin who broke the glass is the one who loses, so he is the one to
+	// assert on: the override row targets HIM, so it is his allowlist probe
+	// that the override flips.
+	for _, tool := range []string{"search", "add_entry", "delete"} {
+		if r := call(nateCred, tool); r != store.ReasonOrg {
+			t.Fatalf("break-glass on tool %q revoked the admin's own access to %s (%q)",
+				"summarize", tool, r)
+		}
+		if r := call(maggieCred, tool); r != store.ReasonOrg {
+			t.Fatalf("break-glass on an unrelated tool changed %s to %q for another member", tool, r)
+		}
+	}
+
+	// One tool grant turns the allowlist on, and it means exactly those tools.
+	if _, err := store.WriteGrant(w.ctx, w.s.Pool(), store.GrantSpec{
+		Subject: store.Subject{Kind: store.SubjectTool, ID: inst, Name: "search"},
+		Target:  orgTarget, Access: store.AccessCall, Source: store.SourceDirect,
+		By: nateForHouse,
+	}); err != nil {
+		t.Fatalf("tool grant: %v", err)
+	}
+	if r := call(maggieCred, "search"); r != store.ReasonOrg {
+		t.Fatalf("an allowlisted tool returned %q", r)
+	}
+	if r := call(maggieCred, "delete"); r != store.Deny {
+		t.Fatalf("a tool outside the allowlist returned %q", r)
+	}
+}
+
+// --- D20.5: "org members are human" is a named invariant --------------------
+
+// The override branch joins org_members, and an AI can never satisfy it because
+// org_members.user_id must be a human. That membership join, not the explicit
+// actor-kind clause, is what actually enforces "an AI never holds override" ...
+// found by mutating the model and watching zero divergences.
+//
+// So the humanness of org members is load-bearing security, not a data-modelling
+// preference, and relaxing it has to fail here rather than silently disarming
+// the override rule.
+func TestOrgMembersAreHuman(t *testing.T) {
+	w := newWorld(t)
+	nate := w.human("nate")
+	house := w.org("house", nate)
+	pia := w.ai("pia", "pia", store.PrincipalUser, nate, nate)
+
+	_, err := w.s.Pool().Exec(w.ctx,
+		"INSERT INTO org_members (org_id, user_id, role, added_by_actor) VALUES ($1,$2,'admin',$3)",
+		house, pia, nate)
+	if err == nil {
+		t.Fatal("an AI actor was seated in an org; the override rule is now unenforced")
+	}
+	if !strings.Contains(err.Error(), "not a human") {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+
+	// An org cannot be seated in an org either.
+	other := w.org("other", nate)
+	if _, err := w.s.Pool().Exec(w.ctx,
+		"INSERT INTO org_members (org_id, user_id, role, added_by_actor) VALUES ($1,$2,'member',$3)",
+		house, other, nate); err == nil {
+		t.Fatal("an org was seated as a member of another org")
+	}
+
+	// And an AI cannot seat anyone, which is the other half of D19.2.
+	maggie := w.human("maggie")
+	if _, err := w.s.Pool().Exec(w.ctx,
+		"INSERT INTO org_members (org_id, user_id, role, added_by_actor) VALUES ($1,$2,'member',$3)",
+		house, maggie, pia); err == nil {
+		t.Fatal("an AI seated a member in an org")
+	}
+}
+
+// --- bootstrap -------------------------------------------------------------
+
+func TestBootstrapCapsTheOrgToo(t *testing.T) {
+	s, ctx := testStore(t)
+
+	first, err := s.BootstrapInTx(ctx, store.BootstrapConfig{
+		RootHandle: "nate", RootName: "Nate", OrgHandle: "roadhouse", OrgName: "Roadhouse",
+	})
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	if first.OrgActorID == uuid.Nil {
+		t.Fatal("no org created")
+	}
+
+	// Restart-safe with the same config.
+	again, err := s.BootstrapInTx(ctx, store.BootstrapConfig{
+		RootHandle: "nate", RootName: "Nate", OrgHandle: "roadhouse", OrgName: "Roadhouse",
+	})
+	if err != nil {
+		t.Fatalf("second bootstrap: %v", err)
+	}
+	if again.OrgActorID != first.OrgActorID {
+		t.Fatal("the second bootstrap created a different org")
+	}
+
+	// THE HOLE: the root cap is a unique index, but nothing stopped a caller
+	// passing the existing root handle with a new org handle, over and over,
+	// with no credential anywhere.
+	if _, err := s.BootstrapInTx(ctx, store.BootstrapConfig{
+		RootHandle: "nate", RootName: "Nate", OrgHandle: "second-org", OrgName: "Second",
+	}); err == nil {
+		t.Fatal("bootstrap created a second org")
+	}
+
+	var orgs int
+	if err := s.Pool().QueryRow(ctx, "SELECT count(*) FROM actors WHERE kind = 'org'").Scan(&orgs); err != nil {
+		t.Fatalf("count orgs: %v", err)
+	}
+	if orgs != 1 {
+		t.Fatalf("%d orgs exist after the attempt, want 1", orgs)
+	}
+}
+
+// The three writes are atomic, so a failure cannot leave an org with no members
+// that a later call skips over and never repairs.
+func TestBootstrapIsAtomic(t *testing.T) {
+	s, ctx := testStore(t)
+
+	if _, err := s.BootstrapInTx(ctx, store.BootstrapConfig{RootHandle: "nate"}); err != nil {
+		t.Fatalf("seed root: %v", err)
+	}
+	var root uuid.UUID
+	if err := s.Pool().QueryRow(ctx, "SELECT id FROM actors WHERE created_by_actor IS NULL").Scan(&root); err != nil {
+		t.Fatalf("read root: %v", err)
+	}
+
+	// An org named "clash", created by somebody OTHER than the root, so the
+	// "did I seed one" lookup misses it and the insert below collides on the
+	// handle unique index instead ... which is a failure partway through
+	// bootstrap rather than a clean early return.
+	other := uuid.New()
+	if _, err := s.Pool().Exec(ctx, `
+		INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
+		VALUES ($1, 'human', 'other', 'Other', 'user', $1, $2)`, other, root); err != nil {
+		t.Fatalf("create other: %v", err)
+	}
+	clash := uuid.New()
+	if _, err := s.Pool().Exec(ctx, `
+		INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
+		VALUES ($1, 'org', 'clash', 'clash', 'org', $1, $2)`, clash, other); err != nil {
+		t.Fatalf("occupy handle: %v", err)
+	}
+
+	beforeMembers := countOrgMembers(ctx, t, s)
+	beforeOrgs := countOrgs(ctx, t, s)
+
+	if _, err := s.BootstrapInTx(ctx, store.BootstrapConfig{
+		RootHandle: "nate", OrgHandle: "clash", OrgName: "clash",
+	}); err == nil {
+		t.Fatal("a colliding org handle was accepted")
+	}
+
+	// Nothing partial survives. Three unrelated statements used to mean a
+	// failure between the org insert and the admin seat left an org with no
+	// members that a later call skipped over and never repaired.
+	if after := countOrgMembers(ctx, t, s); after != beforeMembers {
+		t.Fatalf("org_members went from %d to %d after a failed bootstrap", beforeMembers, after)
+	}
+	if after := countOrgs(ctx, t, s); after != beforeOrgs {
+		t.Fatalf("orgs went from %d to %d after a failed bootstrap", beforeOrgs, after)
+	}
+}
+
+func countOrgs(ctx context.Context, t *testing.T, s *store.Store) int {
+	t.Helper()
+	var n int
+	if err := s.Pool().QueryRow(ctx, "SELECT count(*) FROM actors WHERE kind = 'org'").Scan(&n); err != nil {
+		t.Fatalf("count orgs: %v", err)
+	}
+	return n
+}
+
+func countOrgMembers(ctx context.Context, t *testing.T, s *store.Store) int {
+	t.Helper()
+	var n int
+	if err := s.Pool().QueryRow(ctx, "SELECT count(*) FROM org_members").Scan(&n); err != nil {
+		t.Fatalf("count members: %v", err)
+	}
+	return n
+}

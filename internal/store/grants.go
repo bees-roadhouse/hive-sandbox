@@ -67,8 +67,8 @@ const (
 // Allowed reports whether the reason permits the access.
 func (r Reason) Allowed() bool { return r != Deny }
 
-// ErrDenied is returned by Authorize when the predicate says no. Callers must
-// not distinguish "no such row" from "not allowed to see it" any further than
+// ErrDenied is returned when the predicate says no. Callers must not
+// distinguish "no such row" from "not allowed to see it" any further than
 // this ... the difference is an existence oracle.
 var ErrDenied = errors.New("denied")
 
@@ -100,54 +100,75 @@ func (s Subject) name() any {
 
 // Owner is the principal a row belongs to. Ownership is per-row and it is what
 // keeps an org admin out of a member's personal entries (D18.2).
+//
+// It is NOT an input to any access check. The predicate resolves ownership
+// itself; see Guard.
 type Owner struct {
 	Kind PrincipalKind
 	ID   uuid.UUID
 }
 
 // Guard answers "may this actor do this" and is the only thing in the platform
-// allowed to. It holds no policy of its own: every decision is
-// access_reason(), the SQL function migration one installs.
-type Guard struct{ db DB }
-
-// NewGuard wraps any DB (pool or transaction). Use the transaction form when a
-// check has to be consistent with writes in the same unit of work.
-func NewGuard(db DB) *Guard { return &Guard{db: db} }
-
-// Guard returns a guard over the store's pool.
-func (s *Store) Guard() *Guard { return NewGuard(s.pool) }
-
-// accessReasonSQL is the one expression in the codebase that decides
-// visibility. Nothing else may SELECT from grants.
-const accessReasonSQL = `SELECT access_reason($1, $2, $3, $4, $5, $6, $7, $8, $9, now())`
-
-// Reason returns why the credential may perform access on the subject, or Deny.
-// It does not audit; use Authorize on a real access path.
-func (g *Guard) Reason(ctx context.Context, cred Credential, subj Subject, owner Owner, access Access) (Reason, error) {
-	var reason *string
-	err := g.db.QueryRow(ctx, accessReasonSQL,
-		string(subj.Kind), subj.ID, subj.name(),
-		string(owner.Kind), owner.ID,
-		string(cred.PrincipalKind), cred.PrincipalID,
-		cred.ActorID, string(access),
-	).Scan(&reason)
-	if err != nil {
-		return Deny, fmt.Errorf("access_reason: %w", err)
-	}
-	if reason == nil {
-		return Deny, nil
-	}
-	return Reason(*reason), nil
+// allowed to. It holds no policy of its own: every decision comes from
+// access_decision(), the SQL function migration one installs.
+//
+// Two properties are structural rather than conventional, because both were
+// lost once when they were conventions:
+//
+//   - No method takes an owner. An earlier signature accepted one and compared
+//     it to the credential's principal, which meant every caller composed half
+//     the access check; passing your own principal returned "owner" for any row
+//     in the database.
+//   - There is no exported non-auditing entry point. D18.2 requires that an
+//     access which succeeded only through an override writes an audit row, and
+//     "use Authorize on a real access path" is what a convention looks like
+//     when it loses: the set-read form skipped the audit entirely.
+type Guard struct {
+	db DB
+	// audit is a SEPARATE handle, never the caller's transaction. An override
+	// audit records that something happened; riding the caller's transaction
+	// would let a read stream rows to a client and then roll the evidence back
+	// with everything else.
+	audit DB
 }
 
-// Authorize is Reason plus the D18.2 obligation: an access that succeeded ONLY
-// because of an override writes an audit row. Because 'override' is the last
-// branch access_reason() evaluates, "only because" is mechanically decidable
-// rather than a judgement call.
-//
-// Every real read and write path calls this, not Reason.
-func (g *Guard) Authorize(ctx context.Context, cred Credential, subj Subject, owner Owner, access Access, note string) (Reason, error) {
-	reason, err := g.Reason(ctx, cred, subj, owner, access)
+// Guard returns a guard over the store's pool.
+func (s *Store) Guard() *Guard { return &Guard{db: s.pool, audit: s.pool} }
+
+// GuardTx returns a guard whose reads are consistent with writes in tx, while
+// its audit rows still land outside it.
+func (s *Store) GuardTx(tx DB) *Guard { return &Guard{db: tx, audit: s.pool} }
+
+// decision is the single call every method here funnels through. Nothing
+// outside this file may reference access_decision, access_reason or the grants
+// table.
+func (g *Guard) decision(ctx context.Context, cred Credential, subj Subject, access Access) (Reason, uuid.UUID, error) {
+	var (
+		reason  *string
+		grantID *uuid.UUID
+	)
+	err := g.db.QueryRow(ctx,
+		`SELECT reason, grant_id FROM access_decision($1, $2, $3, $4, $5, $6, $7, now())`,
+		string(subj.Kind), subj.ID, subj.name(),
+		string(cred.PrincipalKind), cred.PrincipalID, cred.ActorID, string(access),
+	).Scan(&reason, &grantID)
+	if err != nil {
+		return Deny, uuid.Nil, fmt.Errorf("access_decision: %w", err)
+	}
+	if reason == nil {
+		return Deny, uuid.Nil, nil
+	}
+	id := uuid.Nil
+	if grantID != nil {
+		id = *grantID
+	}
+	return Reason(*reason), id, nil
+}
+
+// Authorize is the point check. It returns why access was allowed, or
+// ErrDenied, and audits an override before returning.
+func (g *Guard) Authorize(ctx context.Context, cred Credential, subj Subject, access Access, note string) (Reason, error) {
+	reason, grantID, err := g.decision(ctx, cred, subj, access)
 	if err != nil {
 		return Deny, err
 	}
@@ -155,7 +176,7 @@ func (g *Guard) Authorize(ctx context.Context, cred Credential, subj Subject, ow
 		return Deny, ErrDenied
 	}
 	if reason == ReasonOverride {
-		if err := g.recordOverride(ctx, cred, subj, owner, access, note); err != nil {
+		if err := g.recordOverride(ctx, cred, subj, access, grantID, note); err != nil {
 			// Refuse the access rather than let it happen unaudited.
 			// Visibility is what makes the power acceptable.
 			return Deny, fmt.Errorf("override audit failed, access refused: %w", err)
@@ -164,33 +185,57 @@ func (g *Guard) Authorize(ctx context.Context, cred Credential, subj Subject, ow
 	return reason, nil
 }
 
-func (g *Guard) recordOverride(ctx context.Context, cred Credential, subj Subject, owner Owner, access Access, note string) error {
-	_, err := g.db.Exec(ctx, `
+// Allowed is Authorize reduced to a boolean, for call sites that do not care
+// which branch fired. It still audits.
+func (g *Guard) Allowed(ctx context.Context, cred Credential, subj Subject, access Access) (bool, error) {
+	reason, err := g.Authorize(ctx, cred, subj, access, "")
+	if errors.Is(err, ErrDenied) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return reason.Allowed(), nil
+}
+
+// recordOverride writes the audit row on the audit handle, outside whatever
+// transaction the caller is running, and fails loudly if it wrote nothing.
+//
+// A zero-row insert is not an error to Postgres, so without the RowsAffected
+// check the guarantee would be "the audit statement did not error", which is a
+// weaker claim than the one D18.2 makes. The owner comes from subject_owner()
+// for the same reason the predicate resolves it: an audit row naming an owner
+// the caller supplied would record the caller's belief rather than the fact.
+func (g *Guard) recordOverride(ctx context.Context, cred Credential, subj Subject, access Access, grantID uuid.UUID, note string) error {
+	var id *uuid.UUID
+	if grantID != uuid.Nil {
+		id = &grantID
+	}
+	tag, err := g.audit.Exec(ctx, `
 		INSERT INTO grant_override_audit (
 			grant_id, actor_id, principal_kind, principal_id,
 			subject_kind, subject_id, subject_name,
 			owner_kind, owner_id, access, reason)
-		SELECT g.id, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
-		  FROM grants g
-		 WHERE g.subject_kind = $4 AND g.subject_id = $5
-		   AND g.subject_name IS NOT DISTINCT FROM $6
-		   AND g.source = 'override' AND g.target_kind = 'user' AND g.target_id = $1
-		   AND g.revoked_at IS NULL AND g.expires_at > now()
-		 LIMIT 1`,
-		cred.ActorID, string(cred.PrincipalKind), cred.PrincipalID,
-		string(subj.Kind), subj.ID, subj.name(),
-		string(owner.Kind), owner.ID, string(access), note)
-	return err
+		SELECT $1, $2, $3, $4, $5, $6, $7, so.owner_kind, so.owner_id, $8, $9
+		  FROM subject_owner($5, $6) so`,
+		id, cred.ActorID, string(cred.PrincipalKind), cred.PrincipalID,
+		string(subj.Kind), subj.ID, subj.name(), string(access), note)
+	if err != nil {
+		return fmt.Errorf("write override audit: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return errors.New("override audit wrote no row")
+	}
+	return nil
 }
 
 // ToolReason applies the allowlist-only rule (D18.1): an install grant with no
 // tool allowlist implies the full tool set; with one, exactly those tools.
-func (g *Guard) ToolReason(ctx context.Context, cred Credential, installID uuid.UUID, tool string, owner Owner) (Reason, error) {
+func (g *Guard) ToolReason(ctx context.Context, cred Credential, installID uuid.UUID, tool string) (Reason, error) {
 	var reason *string
 	err := g.db.QueryRow(ctx,
-		`SELECT tool_access_reason($1, $2, $3, $4, $5, $6, $7, now())`,
-		installID, tool, string(owner.Kind), owner.ID,
-		string(cred.PrincipalKind), cred.PrincipalID, cred.ActorID,
+		`SELECT tool_access_reason($1, $2, $3, $4, $5, now())`,
+		installID, tool, string(cred.PrincipalKind), cred.PrincipalID, cred.ActorID,
 	).Scan(&reason)
 	if err != nil {
 		return Deny, fmt.Errorf("tool_access_reason: %w", err)
@@ -198,38 +243,79 @@ func (g *Guard) ToolReason(ctx context.Context, cred Credential, installID uuid.
 	if reason == nil {
 		return Deny, nil
 	}
-	return Reason(*reason), nil
+
+	r := Reason(*reason)
+	if r == ReasonOverride {
+		subj := Subject{Kind: SubjectTool, ID: installID, Name: tool}
+		_, grantID, err := g.decision(ctx, cred, subj, AccessCall)
+		if err != nil {
+			return Deny, err
+		}
+		if err := g.recordOverride(ctx, cred, subj, AccessCall, grantID, "tool call"); err != nil {
+			return Deny, fmt.Errorf("override audit failed, access refused: %w", err)
+		}
+	}
+	return r, nil
 }
 
-// VisibleEntityIDs is the set-read form of the same predicate. It exists so
-// that list, search and graph queries have a filter to compose rather than a
-// reason to write their own. The access_reason() call is the filter; there is
-// no second policy hiding in the WHERE clause.
+// VisibleEntityIDs is the set-read form, and it carries the same audit
+// obligation as the point check.
+//
+// The earlier version returned override-only rows and wrote no audit rows at
+// all, because the obligation lived on Authorize rather than on the predicate.
+// That made it optional for anyone who reached for this method, which is every
+// list, search and graph query there will ever be.
 func (g *Guard) VisibleEntityIDs(ctx context.Context, cred Credential, access Access, kind string, limit int) ([]uuid.UUID, error) {
 	rows, err := g.db.Query(ctx, `
-		SELECT e.id
+		SELECT e.id, d.reason
 		  FROM entities e
+		 CROSS JOIN LATERAL access_decision('entity', e.id, NULL, $2, $3, $4, $5, now()) d
 		 WHERE e.deleted_at IS NULL
 		   AND ($1 = '' OR e.kind = $1)
-		   AND access_reason('entity', e.id, NULL, e.owner_kind, e.owner_id,
-		                     $2, $3, $4, $5, now()) IS NOT NULL
+		   AND d.reason IS NOT NULL
 		 ORDER BY e.created_at DESC
 		 LIMIT $6`,
 		kind, string(cred.PrincipalKind), cred.PrincipalID, cred.ActorID, string(access), limit)
 	if err != nil {
 		return nil, fmt.Errorf("visible entities: %w", err)
 	}
-	defer rows.Close()
 
-	var ids []uuid.UUID
+	var (
+		ids       []uuid.UUID
+		overrides []uuid.UUID
+	)
 	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
+		var (
+			id     uuid.UUID
+			reason string
+		)
+		if err := rows.Scan(&id, &reason); err != nil {
+			rows.Close()
 			return nil, fmt.Errorf("scan entity id: %w", err)
 		}
 		ids = append(ids, id)
+		if Reason(reason) == ReasonOverride {
+			overrides = append(overrides, id)
+		}
 	}
-	return ids, rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("visible entities: %w", err)
+	}
+
+	// Audit before returning. If the evidence cannot be written, the rows do
+	// not leave this function.
+	for _, id := range overrides {
+		subj := Subject{Kind: SubjectEntity, ID: id}
+		_, grantID, err := g.decision(ctx, cred, subj, access)
+		if err != nil {
+			return nil, err
+		}
+		if err := g.recordOverride(ctx, cred, subj, access, grantID, "list"); err != nil {
+			return nil, fmt.Errorf("override audit failed, %d row(s) withheld: %w", len(ids), err)
+		}
+	}
+	return ids, nil
 }
 
 // GrantSpec is one grant to write. The database enforces who may write it
@@ -290,28 +376,50 @@ func RevokeGrant(ctx context.Context, db DB, id uuid.UUID) error {
 	return nil
 }
 
-// NarrowGrant tombstones every live grant on (subject, target), so "shared with
-// the thread except this one reply" is expressible.
+// Unshare removes access on (subject, target), whatever produced it.
 //
-// The tombstone is the grant row itself with revoked_at set, NOT a separate
-// deny table. A revoked row is invisible to access_reason(); it is read only by
-// the materializer, which is why the read path still has exactly one policy:
-// a live grant, or deny. Its persistence is what stops the next write from
-// resurrecting a deliberately narrowed child, through the unique index.
-func NarrowGrant(ctx context.Context, db DB, subj Subject, target Owner, by uuid.UUID) (int64, error) {
+// The two halves are genuinely different operations rather than one with a
+// flag, and conflating them was a bug:
+//
+//   - An INHERITED row is tombstoned. The tombstone keeps its slot in
+//     grants_identity_uq, which is what stops the materializer resurrecting a
+//     deliberately narrowed child on the next write. That is the whole reason
+//     the tombstone exists.
+//   - A DIRECT row is deleted. Tombstoning one occupies the exact slot a
+//     re-share needs, so "unshare, then share again" used to dead-end on a raw
+//     unique-constraint error with no recovery path in the API.
+//
+// A tombstone is invisible to the predicate either way; it is read only by the
+// materializer, so the read path still has exactly one policy.
+func Unshare(ctx context.Context, db DB, subj Subject, target Owner, by uuid.UUID) (tombstoned, deleted int64, err error) {
 	tag, err := db.Exec(ctx, `
 		UPDATE grants
 		   SET revoked_at = now(), revoked_by = $6
 		 WHERE subject_kind = $1 AND subject_id = $2
 		   AND subject_name IS NOT DISTINCT FROM $3
 		   AND target_kind = $4 AND target_id = $5
+		   AND source = 'inherited'
 		   AND revoked_at IS NULL`,
 		string(subj.Kind), subj.ID, subj.name(),
 		string(target.Kind), target.ID, by)
 	if err != nil {
-		return 0, fmt.Errorf("narrow grant: %w", err)
+		return 0, 0, fmt.Errorf("tombstone inherited grants: %w", err)
 	}
-	return tag.RowsAffected(), nil
+	tombstoned = tag.RowsAffected()
+
+	tag, err = db.Exec(ctx, `
+		DELETE FROM grants
+		 WHERE subject_kind = $1 AND subject_id = $2
+		   AND subject_name IS NOT DISTINCT FROM $3
+		   AND target_kind = $4 AND target_id = $5
+		   AND source = 'direct'
+		   AND revoked_at IS NULL`,
+		string(subj.Kind), subj.ID, subj.name(),
+		string(target.Kind), target.ID)
+	if err != nil {
+		return tombstoned, 0, fmt.Errorf("delete direct grants: %w", err)
+	}
+	return tombstoned, tag.RowsAffected(), nil
 }
 
 // MaterializeInherited copies every live, non-override grant from parent to
@@ -353,9 +461,14 @@ func MaterializeInherited(ctx context.Context, db DB, parent, child Subject, by 
 
 // EnterBreakGlass writes a time-boxed override grant (D18.2). It is a grant
 // produced by policy, evaluated in the same predicate as every other grant, so
-// there is no second code path answering "may this actor do this". The
-// database refuses it unless the subject is org-owned and the actor is a human
-// admin of that org.
+// there is no second code path answering "may this actor do this". The database
+// refuses it unless the subject is org-owned and the actor is a human admin of
+// that org.
+//
+// Dead rows for the same (subject, admin) are reaped first. Nothing else reaps
+// expired grants, and this is the one path that has to work at 3am under
+// stress, so it cleans up after itself rather than depending on a sweeper
+// somebody has not written yet.
 func EnterBreakGlass(ctx context.Context, db DB, subj Subject, admin Credential, window time.Duration, reason string) (uuid.UUID, error) {
 	if window <= 0 {
 		return uuid.Nil, errors.New("break-glass needs a positive window")
@@ -363,6 +476,18 @@ func EnterBreakGlass(ctx context.Context, db DB, subj Subject, admin Credential,
 	if reason == "" {
 		return uuid.Nil, errors.New("break-glass needs a reason")
 	}
+
+	if _, err := db.Exec(ctx, `
+		DELETE FROM grants
+		 WHERE source = 'override'
+		   AND subject_kind = $1 AND subject_id = $2
+		   AND subject_name IS NOT DISTINCT FROM $3
+		   AND target_kind = 'user' AND target_id = $4
+		   AND (revoked_at IS NOT NULL OR expires_at <= now())`,
+		string(subj.Kind), subj.ID, subj.name(), admin.ActorID); err != nil {
+		return uuid.Nil, fmt.Errorf("reap expired break-glass: %w", err)
+	}
+
 	expires := time.Now().Add(window)
 	return WriteGrant(ctx, db, GrantSpec{
 		Subject:   subj,

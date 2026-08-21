@@ -51,10 +51,6 @@ func TestMigrateIsIdempotent(t *testing.T) {
 func TestMigrateConcurrent(t *testing.T) {
 	s, ctx := testStore(t)
 
-	if _, err := s.Pool().Exec(ctx, "DROP SCHEMA IF EXISTS public CASCADE"); err != nil {
-		_ = err // the test schema is not public; this is a no-op guard
-	}
-
 	const racers = 6
 	var wg sync.WaitGroup
 	errs := make([]error, racers)
@@ -88,25 +84,97 @@ func TestMigrateConcurrent(t *testing.T) {
 // an insert is an outage, so the default is not optional.
 func TestEventPartitions(t *testing.T) {
 	s, ctx := testStore(t)
-	w := newWorld(t)
-	_ = w
 
-	if err := store.EnsureEventPartitions(ctx, s.Pool(), 2); err != nil {
+	blocked, err := store.EnsureEventPartitions(ctx, s.Pool(), 2)
+	if err != nil {
 		t.Fatalf("ensure partitions: %v", err)
 	}
-	// Idempotent.
-	if err := store.EnsureEventPartitions(ctx, s.Pool(), 2); err != nil {
+	if len(blocked) != 0 {
+		t.Fatalf("months blocked on a fresh schema: %v", blocked)
+	}
+	// Idempotent, and specifically not racing itself: the helper uses
+	// CREATE TABLE IF NOT EXISTS rather than probe-then-create.
+	if _, err := store.EnsureEventPartitions(ctx, s.Pool(), 2); err != nil {
 		t.Fatalf("ensure partitions twice: %v", err)
 	}
 
+	// relnamespace matters: without it this counts every schema in the database
+	// that happens to have an events table, so the test could pass on another
+	// test's partitions while this code did nothing.
 	var parts int
 	if err := s.Pool().QueryRow(ctx, `
 		SELECT count(*) FROM pg_inherits i
 		  JOIN pg_class p ON p.oid = i.inhparent
-		 WHERE p.relname = 'events'`).Scan(&parts); err != nil {
+		  JOIN pg_namespace n ON n.oid = p.relnamespace
+		 WHERE p.relname = 'events'
+		   AND n.nspname = current_schema()`).Scan(&parts); err != nil {
 		t.Fatalf("count partitions: %v", err)
 	}
-	if parts < 4 { // default + three months
-		t.Fatalf("events has %d partitions, want at least 4", parts)
+	if parts != 4 { // default + this month + two ahead
+		t.Fatalf("events has %d partitions in this schema, want 4", parts)
+	}
+}
+
+// TestFutureEventCannotWedgeAPartition is Augie's finding 9. One row dated past
+// the last partition lands in the default partition and makes that month
+// uncreatable forever, while the append-only trigger means the row cannot be
+// deleted either.
+func TestFutureEventCannotWedgeAPartition(t *testing.T) {
+	s, ctx := testStore(t)
+	w := newWorld(t)
+	nate := w.human("nate")
+
+	_, err := s.Pool().Exec(ctx, `
+		INSERT INTO events (created_at, kind, owner_kind, owner_id, author_actor,
+		                    principal_kind, principal_id)
+		VALUES (now() + interval '3 months', 'probe', 'user', $1, $1, 'user', $1)`, nate)
+	if err == nil {
+		t.Fatal("an event dated three months out was accepted; it would wedge that month's partition")
+	}
+
+	// Small skew is still fine: rejecting it would make the daemon fragile
+	// against an ordinary clock difference.
+	if _, err := s.Pool().Exec(ctx, `
+		INSERT INTO events (created_at, kind, owner_kind, owner_id, author_actor,
+		                    principal_kind, principal_id)
+		VALUES (now() + interval '1 minute', 'probe', 'user', $1, $1, 'user', $1)`, nate); err != nil {
+		t.Fatalf("a minute of clock skew was rejected: %v", err)
+	}
+}
+
+// A blocked month is reported, not fatal. Writes still land in the default
+// partition, so failing the boot would turn degraded into down, every restart.
+func TestBlockedPartitionIsReportedNotFatal(t *testing.T) {
+	s, ctx := testStore(t)
+	w := newWorld(t)
+	nate := w.human("nate")
+
+	// Reach past the trigger the way only a backfill could: a past month whose
+	// partition does not exist yet.
+	if _, err := s.Pool().Exec(ctx, `
+		INSERT INTO events (created_at, kind, owner_kind, owner_id, author_actor,
+		                    principal_kind, principal_id)
+		VALUES (date_trunc('month', now()) - interval '2 months', 'backfill',
+		        'user', $1, $1, 'user', $1)`, nate); err != nil {
+		t.Fatalf("insert backfill row: %v", err)
+	}
+
+	var name *string
+	if err := s.Pool().QueryRow(ctx,
+		`SELECT ensure_events_partition((date_trunc('month', now()) - interval '2 months')::date)`,
+	).Scan(&name); err != nil {
+		t.Fatalf("ensure_events_partition raised instead of reporting: %v", err)
+	}
+	if name != nil {
+		t.Fatalf("the blocked month reported success as %q", *name)
+	}
+
+	// And the months that are not blocked still get created.
+	blocked, err := store.EnsureEventPartitions(ctx, s.Pool(), 1)
+	if err != nil {
+		t.Fatalf("ensure partitions: %v", err)
+	}
+	if len(blocked) != 0 {
+		t.Fatalf("unrelated months blocked: %v", blocked)
 	}
 }

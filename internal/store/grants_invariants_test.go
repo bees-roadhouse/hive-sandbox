@@ -57,10 +57,7 @@ func TestRevokingAParentRemovesEveryInheritedChild(t *testing.T) {
 
 	g := w.s.Guard()
 	for i, r := range replies {
-		reason, err := g.Reason(w.ctx, maggieCred, r, nateOwner, store.AccessRead)
-		if err != nil {
-			t.Fatalf("reply %d: %v", i, err)
-		}
+		reason := reasonOf(w.ctx, t, g, maggieCred, r, store.AccessRead)
 		if reason != store.ReasonGrant {
 			t.Fatalf("reply %d: reason %q before revocation, want %q", i, reason, store.ReasonGrant)
 		}
@@ -72,10 +69,7 @@ func TestRevokingAParentRemovesEveryInheritedChild(t *testing.T) {
 	}
 
 	for i, r := range replies {
-		reason, err := g.Reason(w.ctx, maggieCred, r, nateOwner, store.AccessRead)
-		if err != nil {
-			t.Fatalf("reply %d after revoke: %v", i, err)
-		}
+		reason := reasonOf(w.ctx, t, g, maggieCred, r, store.AccessRead)
 		if reason != store.Deny {
 			t.Fatalf("reply %d: reason %q after revoking the parent, want deny", i, reason)
 		}
@@ -124,12 +118,13 @@ func TestNarrowingSurvivesRematerializationButRevocationDoesNot(t *testing.T) {
 	}
 
 	// "Shared with the thread except this one reply."
-	n, err := store.NarrowGrant(w.ctx, w.s.Pool(), hide, maggieTarget, nate)
+	tombstoned, deleted, err := store.Unshare(w.ctx, w.s.Pool(), hide, maggieTarget, nate)
 	if err != nil {
-		t.Fatalf("narrow: %v", err)
+		t.Fatalf("unshare: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("narrow touched %d rows, want 1", n)
+	if tombstoned != 1 || deleted != 0 {
+		t.Fatalf("unshare tombstoned %d and deleted %d, want 1 and 0 for an inherited child",
+			tombstoned, deleted)
 	}
 
 	// The materializer runs again (a new write on the thread) and must not
@@ -141,10 +136,10 @@ func TestNarrowingSurvivesRematerializationButRevocationDoesNot(t *testing.T) {
 	}
 
 	g := w.s.Guard()
-	if r, _ := g.Reason(w.ctx, maggieCred, keep, nateOwner, store.AccessRead); r != store.ReasonGrant {
+	if r := reasonOf(w.ctx, t, g, maggieCred, keep, store.AccessRead); r != store.ReasonGrant {
 		t.Fatalf("keep: reason %q, want %q", r, store.ReasonGrant)
 	}
-	if r, _ := g.Reason(w.ctx, maggieCred, hide, nateOwner, store.AccessRead); r != store.Deny {
+	if r := reasonOf(w.ctx, t, g, maggieCred, hide, store.AccessRead); r != store.Deny {
 		t.Fatalf("hide: reason %q after narrowing, want deny", r)
 	}
 
@@ -175,7 +170,7 @@ func TestNarrowingSurvivesRematerializationButRevocationDoesNot(t *testing.T) {
 	if _, err := store.MaterializeInherited(w.ctx, w.s.Pool(), thread, hide, nateCred); err != nil {
 		t.Fatalf("materialize after re-share: %v", err)
 	}
-	if r, _ := g.Reason(w.ctx, maggieCred, hide, nateOwner, store.AccessRead); r != store.ReasonGrant {
+	if r := reasonOf(w.ctx, t, g, maggieCred, hide, store.AccessRead); r != store.ReasonGrant {
 		t.Fatalf("hide after re-share: reason %q, want %q", r, store.ReasonGrant)
 	}
 }
@@ -205,10 +200,7 @@ func TestAbsenceIsDeny(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, access := range []store.Access{store.AccessRead, store.AccessWrite, store.AccessCall} {
-				reason, err := g.Reason(w.ctx, tc.cred, entry, nateOwner, access)
-				if err != nil {
-					t.Fatalf("%s: %v", access, err)
-				}
+				reason := reasonOf(w.ctx, t, g, tc.cred, entry, access)
 				if reason != store.Deny {
 					t.Fatalf("%s: reason %q, want deny", access, reason)
 				}
@@ -218,7 +210,7 @@ func TestAbsenceIsDeny(t *testing.T) {
 
 	// Authorize turns deny into an error rather than a zero value a caller can
 	// forget to check.
-	_, err := g.Authorize(w.ctx, cred(maggie, store.PrincipalUser, maggie), entry, nateOwner, store.AccessRead, "")
+	_, err := g.Authorize(w.ctx, cred(maggie, store.PrincipalUser, maggie), entry, store.AccessRead, "")
 	if !errors.Is(err, store.ErrDenied) {
 		t.Fatalf("Authorize returned %v, want ErrDenied", err)
 	}
@@ -234,13 +226,13 @@ func TestDisabledActorIsDenied(t *testing.T) {
 	entry := store.Subject{Kind: store.SubjectEntity, ID: w.entity(inst, "entries", "e", nateOwner, nate)}
 	g := w.s.Guard()
 
-	if r, _ := g.Reason(w.ctx, cred(nate, store.PrincipalUser, nate), entry, nateOwner, store.AccessRead); r != store.ReasonOwner {
+	if r := reasonOf(w.ctx, t, g, cred(nate, store.PrincipalUser, nate), entry, store.AccessRead); r != store.ReasonOwner {
 		t.Fatalf("owner reason %q, want owner", r)
 	}
 	if _, err := w.s.Pool().Exec(w.ctx, "UPDATE actors SET disabled_at = now() WHERE id = $1", nate); err != nil {
 		t.Fatalf("disable: %v", err)
 	}
-	if r, _ := g.Reason(w.ctx, cred(nate, store.PrincipalUser, nate), entry, nateOwner, store.AccessRead); r != store.Deny {
+	if r := reasonOf(w.ctx, t, g, cred(nate, store.PrincipalUser, nate), entry, store.AccessRead); r != store.Deny {
 		t.Fatalf("disabled actor reason %q, want deny", r)
 	}
 }
@@ -263,17 +255,17 @@ func TestAIHoldsNoAuthorityBeyondItsPrincipal(t *testing.T) {
 	g := w.s.Guard()
 
 	// Pia reaches exactly what Nate reaches: his own rows, yes.
-	if r, _ := g.Reason(w.ctx, cred(pia, store.PrincipalUser, nate), nateEntry, nateOwner, store.AccessRead); r != store.ReasonOwner {
+	if r := reasonOf(w.ctx, t, g, cred(pia, store.PrincipalUser, nate), nateEntry, store.AccessRead); r != store.ReasonOwner {
 		t.Fatalf("pia on nate's entry: %q, want owner", r)
 	}
 	// Maggie's rows, no.
-	if r, _ := g.Reason(w.ctx, cred(pia, store.PrincipalUser, nate), maggieEntry, maggieOwner, store.AccessRead); r != store.Deny {
+	if r := reasonOf(w.ctx, t, g, cred(pia, store.PrincipalUser, nate), maggieEntry, store.AccessRead); r != store.Deny {
 		t.Fatalf("pia on maggie's entry: %q, want deny", r)
 	}
 	// And Pia cannot simply claim Maggie's principal. The credential pins the
 	// pair, and the predicate checks that the pair agrees rather than trusting
 	// whatever the edge put in it.
-	if r, _ := g.Reason(w.ctx, cred(pia, store.PrincipalUser, maggie), maggieEntry, maggieOwner, store.AccessRead); r != store.Deny {
+	if r := reasonOf(w.ctx, t, g, cred(pia, store.PrincipalUser, maggie), maggieEntry, store.AccessRead); r != store.Deny {
 		t.Fatalf("pia claiming maggie's principal: %q, want deny", r)
 	}
 }
@@ -302,7 +294,7 @@ func TestOverrideNeverReachesAPersonallyOwnedRow(t *testing.T) {
 	if _, err := store.EnterBreakGlass(w.ctx, w.s.Pool(), orgRow, nateCred, 30*time.Minute, "incident"); err != nil {
 		t.Fatalf("break-glass on org row: %v", err)
 	}
-	reason, err := g.Authorize(w.ctx, nateCred, orgRow, houseOwner, store.AccessRead, "incident")
+	reason, err := g.Authorize(w.ctx, nateCred, orgRow, store.AccessRead, "incident")
 	if err != nil {
 		t.Fatalf("authorize org row: %v", err)
 	}
@@ -328,16 +320,12 @@ func TestOverrideNeverReachesAPersonallyOwnedRow(t *testing.T) {
 	// Even if a row like that reached the table by some other route, the
 	// predicate refuses it. Both halves matter: the write path is a policy, the
 	// read path is the guarantee.
-	if _, err := w.s.Pool().Exec(w.ctx, "ALTER TABLE grants DISABLE TRIGGER grants_issue_policy"); err != nil {
-		t.Fatalf("disable trigger: %v", err)
-	}
-	if _, err := store.EnterBreakGlass(w.ctx, w.s.Pool(), maggieRow, nateCred, 30*time.Minute, "smuggled"); err != nil {
-		t.Fatalf("smuggle override row: %v", err)
-	}
-	if _, err := w.s.Pool().Exec(w.ctx, "ALTER TABLE grants ENABLE TRIGGER grants_issue_policy"); err != nil {
-		t.Fatalf("enable trigger: %v", err)
-	}
-	if r, _ := g.Reason(w.ctx, nateCred, maggieRow, maggieOwner, store.AccessRead); r != store.Deny {
+	withIssuePolicyOff(t, w, func() {
+		if _, err := store.EnterBreakGlass(w.ctx, w.s.Pool(), maggieRow, nateCred, 30*time.Minute, "smuggled"); err != nil {
+			t.Fatalf("smuggle override row: %v", err)
+		}
+	})
+	if r := reasonOf(w.ctx, t, g, nateCred, maggieRow, store.AccessRead); r != store.Deny {
 		t.Fatalf("smuggled override reached a personal row: reason %q", r)
 	}
 }
@@ -359,12 +347,12 @@ func TestAIDoesNotInheritOverride(t *testing.T) {
 	}
 
 	g := w.s.Guard()
-	if r, _ := g.Reason(w.ctx, nateCred, row, houseOwner, store.AccessRead); r != store.ReasonOverride {
+	if r := reasonOf(w.ctx, t, g, nateCred, row, store.AccessRead); r != store.ReasonOverride {
 		t.Fatalf("nate: reason %q, want override", r)
 	}
 	// Pia acts for the same principal and the override grant targets that
 	// principal's actor, and she still gets nothing.
-	if r, _ := g.Reason(w.ctx, cred(pia, store.PrincipalUser, nate), row, houseOwner, store.AccessRead); r != store.Deny {
+	if r := reasonOf(w.ctx, t, g, cred(pia, store.PrincipalUser, nate), row, store.AccessRead); r != store.Deny {
 		t.Fatalf("pia inherited override: reason %q, want deny", r)
 	}
 }
@@ -384,16 +372,93 @@ func TestOverrideExpires(t *testing.T) {
 		t.Fatalf("break-glass: %v", err)
 	}
 	g := w.s.Guard()
-	if r, _ := g.Reason(w.ctx, nateCred, row, houseOwner, store.AccessRead); r != store.ReasonOverride {
+	if r := reasonOf(w.ctx, t, g, nateCred, row, store.AccessRead); r != store.ReasonOverride {
 		t.Fatalf("before expiry: %q, want override", r)
 	}
-	// No wall-clock sleeping: move the window instead.
+	// No wall-clock sleeping, and no moving the window either: a grant is
+	// immutable except for its revocation, so extending or expiring one in
+	// place is refused. Ask the predicate what it will say later instead.
 	if _, err := w.s.Pool().Exec(w.ctx,
-		"UPDATE grants SET expires_at = now() - interval '1 second' WHERE id = $1", id); err != nil {
-		t.Fatalf("expire: %v", err)
+		"UPDATE grants SET expires_at = now() + interval '2 hours' WHERE id = $1", id); err == nil {
+		t.Fatal("expires_at was mutable; break-glass could be extended in place")
 	}
-	if r, _ := g.Reason(w.ctx, nateCred, row, houseOwner, store.AccessRead); r != store.Deny {
-		t.Fatalf("after expiry: %q, want deny", r)
+	if r := reasonAt(t, w, nateCred, row, store.AccessRead, 2*time.Hour); r != store.Deny {
+		t.Fatalf("past the window: %q, want deny", r)
+	}
+	if r := reasonAt(t, w, nateCred, row, store.AccessRead, time.Minute); r != store.ReasonOverride {
+		t.Fatalf("inside the window: %q, want override", r)
+	}
+}
+
+// Break-glass has to work more than once. The identity index used to collide on
+// the second incident for the same (subject, admin), forever, including after
+// the first had expired ... on the one path that has to work at 3am.
+func TestBreakGlassWorksMoreThanOnce(t *testing.T) {
+	w := newWorld(t)
+	nate := w.human("nate")
+	house := w.org("house", nate)
+	houseOwner := store.Owner{Kind: store.PrincipalOrg, ID: house}
+	inst := w.install("shared", houseOwner, nate)
+	row := store.Subject{Kind: store.SubjectEntity, ID: w.entity(inst, "entries", "o", houseOwner, nate)}
+	nateCred := cred(nate, store.PrincipalUser, nate)
+
+	first, err := store.EnterBreakGlass(w.ctx, w.s.Pool(), row, nateCred, time.Hour, "incident one")
+	if err != nil {
+		t.Fatalf("first incident: %v", err)
+	}
+	second, err := store.EnterBreakGlass(w.ctx, w.s.Pool(), row, nateCred, time.Hour, "incident two")
+	if err != nil {
+		t.Fatalf("second incident on the same subject: %v", err)
+	}
+	if second == first {
+		t.Fatal("the second incident reused the first row")
+	}
+
+	g := w.s.Guard()
+	if r := reasonOf(w.ctx, t, g, nateCred, row, store.AccessRead); r != store.ReasonOverride {
+		t.Fatalf("reason %q after two incidents, want override", r)
+	}
+}
+
+// Unsharing a DIRECT grant deletes it, so the pair can be shared again. A
+// tombstone there would occupy the exact slot a re-share needs.
+func TestUnshareThenReshareADirectGrant(t *testing.T) {
+	w := newWorld(t)
+	nate := w.human("nate")
+	maggie := w.human("maggie")
+	nateOwner := store.Owner{Kind: store.PrincipalUser, ID: nate}
+	nateCred := cred(nate, store.PrincipalUser, nate)
+	maggieCred := cred(maggie, store.PrincipalUser, maggie)
+	maggieTarget := store.Owner{Kind: store.PrincipalUser, ID: maggie}
+
+	inst := w.install("journal", nateOwner, nate)
+	entry := store.Subject{Kind: store.SubjectEntity, ID: w.entity(inst, "entries", "e", nateOwner, nate)}
+	spec := store.GrantSpec{
+		Subject: entry, Target: maggieTarget, Access: store.AccessRead,
+		Source: store.SourceDirect, By: nateCred,
+	}
+
+	if _, err := store.WriteGrant(w.ctx, w.s.Pool(), spec); err != nil {
+		t.Fatalf("share: %v", err)
+	}
+	tombstoned, deleted, err := store.Unshare(w.ctx, w.s.Pool(), entry, maggieTarget, nate)
+	if err != nil {
+		t.Fatalf("unshare: %v", err)
+	}
+	if deleted != 1 || tombstoned != 0 {
+		t.Fatalf("unshare on a direct grant tombstoned %d and deleted %d, want 0 and 1",
+			tombstoned, deleted)
+	}
+
+	g := w.s.Guard()
+	if r := reasonOf(w.ctx, t, g, maggieCred, entry, store.AccessRead); r != store.Deny {
+		t.Fatalf("reason %q after unsharing, want deny", r)
+	}
+	if _, err := store.WriteGrant(w.ctx, w.s.Pool(), spec); err != nil {
+		t.Fatalf("re-share after unshare: %v", err)
+	}
+	if r := reasonOf(w.ctx, t, g, maggieCred, entry, store.AccessRead); r != store.ReasonGrant {
+		t.Fatalf("reason %q after re-sharing, want grant", r)
 	}
 }
 

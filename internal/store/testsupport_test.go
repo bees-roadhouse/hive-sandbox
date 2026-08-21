@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -155,4 +156,64 @@ func (w *world) entity(install uuid.UUID, collection, ref string, owner store.Ow
 
 func cred(actor uuid.UUID, kind store.PrincipalKind, principal uuid.UUID) store.Credential {
 	return store.Credential{ActorID: actor, PrincipalKind: kind, PrincipalID: principal}
+}
+
+// reasonOf is Authorize with ErrDenied mapped back to Deny, so a test can
+// assert on the branch that fired without treating a denial as a failure.
+//
+// It is Authorize rather than a non-auditing call on purpose: there is no
+// exported non-auditing entry point any more, and a test that reached for one
+// would be testing something no caller can do.
+func reasonOf(ctx context.Context, t *testing.T, g *store.Guard, c store.Credential, subj store.Subject, access store.Access) store.Reason {
+	t.Helper()
+	reason, err := g.Authorize(ctx, c, subj, access, "")
+	if errors.Is(err, store.ErrDenied) {
+		return store.Deny
+	}
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	return reason
+}
+
+// withIssuePolicyOff runs fn with the grant write policy disabled, so the READ
+// predicate can be tested against rows a bug would have written.
+//
+// The re-enable is a Cleanup rather than a trailing statement: with a t.Fatalf
+// inside the window, a trailing statement never runs.
+func withIssuePolicyOff(t *testing.T, w *world, fn func()) {
+	t.Helper()
+	if _, err := w.s.Pool().Exec(w.ctx, "ALTER TABLE grants DISABLE TRIGGER grants_issue_policy"); err != nil {
+		t.Fatalf("disable issue policy: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := w.s.Pool().Exec(context.WithoutCancel(w.ctx),
+			"ALTER TABLE grants ENABLE TRIGGER grants_issue_policy"); err != nil {
+			t.Errorf("re-enable issue policy: %v", err)
+		}
+	})
+	fn()
+}
+
+// reasonAt asks the predicate what it will say at some offset from now, so a
+// test can cross a break-glass window without sleeping and without mutating a
+// grant, which the schema refuses.
+func reasonAt(t *testing.T, w *world, c store.Credential, subj store.Subject, access store.Access, offset time.Duration) store.Reason {
+	t.Helper()
+	var reason *string
+	name := any(nil)
+	if subj.Name != "" {
+		name = subj.Name
+	}
+	if err := w.s.Pool().QueryRow(w.ctx,
+		`SELECT access_reason($1, $2, $3, $4, $5, $6, $7, now() + $8::interval)`,
+		string(subj.Kind), subj.ID, name,
+		string(c.PrincipalKind), c.PrincipalID, c.ActorID, string(access),
+		offset.String()).Scan(&reason); err != nil {
+		t.Fatalf("access_reason at +%s: %v", offset, err)
+	}
+	if reason == nil {
+		return store.Deny
+	}
+	return store.Reason(*reason)
 }

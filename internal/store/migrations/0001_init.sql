@@ -259,21 +259,28 @@ BEGIN
             NEW.id, NEW.actor_id, NEW.principal_id;
     END IF;
 
-    -- The issuer is the credential's own principal, or an admin of it.
-    IF NEW.issued_by_principal_kind = NEW.principal_kind
-       AND NEW.issued_by_principal_id = NEW.principal_id THEN
+    -- A person issuing for themselves, which also covers a person issuing for
+    -- an AI persona instance they own, since such an actor's principal IS them.
+    --
+    -- The test is against the issuing ACTOR, not against the issuing principal.
+    -- Comparing principals looked equivalent and was not: a plain org member
+    -- legitimately holds a credential of (actor = them, principal = the org),
+    -- and presenting that pair read as "the principal issuing for itself",
+    -- which let any member mint a credential naming ANOTHER member as
+    -- author_actor. That forges "Nate did this", which is the one distinction
+    -- invariant 2 exists to preserve.
+    IF NEW.principal_kind = 'user' AND NEW.principal_id = NEW.issued_by_actor THEN
         RETURN NEW;
     END IF;
+
+    -- An org admin, for actors in their org. Membership and role, never a
+    -- principal comparison.
     IF NEW.principal_kind = 'org' AND EXISTS (
         SELECT 1 FROM org_members m
          WHERE m.org_id = NEW.principal_id
            AND m.user_id = NEW.issued_by_actor
            AND m.role = 'admin'
     ) THEN
-        RETURN NEW;
-    END IF;
-    -- A person issuing for an AI persona instance they own.
-    IF NEW.principal_kind = 'user' AND NEW.principal_id = NEW.issued_by_actor THEN
         RETURN NEW;
     END IF;
 
@@ -346,10 +353,22 @@ CREATE TABLE grants (
 
 -- NULLS NOT DISTINCT so two install-subject rows (subject_name NULL) collide
 -- rather than silently duplicating.
+--
+-- Override rows are excluded, and that exclusion is load-bearing rather than
+-- tidy. source and expires_at are not in the key, so with overrides included a
+-- second break-glass on the same subject by the same admin collided with the
+-- first ... forever, including after the first had expired, because nothing
+-- reaps expired grants. Break-glass is the one path that has to work at 3am
+-- under stress, and it worked exactly once per (subject, admin) for the life of
+-- the database. An incident is inherently a repeatable event; an ordinary grant
+-- is a statement of fact, and only the latter needs to be unique.
 CREATE UNIQUE INDEX grants_identity_uq ON grants (
     subject_kind, subject_id, subject_name,
     target_kind, target_id, access, inherited_from
-) NULLS NOT DISTINCT;
+) NULLS NOT DISTINCT WHERE source <> 'override';
+
+CREATE INDEX grants_override_idx ON grants (subject_kind, subject_id, target_id)
+    WHERE source = 'override';
 
 CREATE INDEX grants_lookup_idx ON grants (subject_kind, subject_id, target_kind, target_id)
     WHERE revoked_at IS NULL;
@@ -376,198 +395,6 @@ CREATE TABLE grant_override_audit (
 );
 
 CREATE INDEX grant_override_audit_actor_idx ON grant_override_audit (actor_id, occurred_at DESC);
-
--- ---------------------------------------------------------------------------
--- The grant predicate. THE single enforcement point (D1.4).
---
--- Returns the reason access is allowed, or NULL for deny. It returns a reason
--- rather than a boolean because D18.2 requires auditing accesses that succeeded
--- ONLY via an override, and a boolean cannot say which branch fired. Branch
--- order therefore matters: 'override' is evaluated last, so seeing it means
--- nothing else would have worked.
---
--- No caller may consult the grants table directly. If a query needs to filter
--- rows, it calls this function.
--- ---------------------------------------------------------------------------
-
-CREATE FUNCTION access_satisfies(p_held text, p_required text) RETURNS boolean
-LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
-    -- write implies read. call is orthogonal: it gates tools and routes, and a
-    -- reader of an install's data has no business invoking its tools.
-    SELECT p_held = p_required OR (p_required = 'read' AND p_held = 'write');
-$$;
-
-CREATE FUNCTION access_reason(
-    p_subject_kind   text,
-    p_subject_id     uuid,
-    p_subject_name   text,
-    p_owner_kind     text,
-    p_owner_id       uuid,
-    p_principal_kind text,
-    p_principal_id   uuid,
-    p_actor_id       uuid,
-    p_access         text,
-    p_now            timestamptz DEFAULT now()
-) RETURNS text
-LANGUAGE plpgsql STABLE PARALLEL SAFE AS $$
-DECLARE
-    a_kind           text;
-    a_principal_kind text;
-    a_principal_id   uuid;
-    a_disabled       timestamptz;
-BEGIN
-    -- Absence of scope is deny, and that starts with an absent actor.
-    IF p_actor_id IS NULL OR p_principal_id IS NULL OR p_owner_id IS NULL THEN
-        RETURN NULL;
-    END IF;
-
-    SELECT kind, principal_kind, principal_id, disabled_at
-      INTO a_kind, a_principal_kind, a_principal_id, a_disabled
-      FROM actors WHERE id = p_actor_id;
-
-    IF a_kind IS NULL OR a_disabled IS NOT NULL THEN
-        RETURN NULL;
-    END IF;
-
-    -- Credential coherence (D17.4). The credential pins author_actor AND owner
-    -- principal, and the two have to agree or the pair proves nothing. Checking
-    -- it HERE rather than at the edge is what makes "an AI never gains authority
-    -- its principal lacks" structural: an AI cannot be handed a principal it
-    -- does not belong to, whatever the edge believed.
-    IF a_kind = 'ai' THEN
-        IF a_principal_kind IS DISTINCT FROM p_principal_kind
-           OR a_principal_id IS DISTINCT FROM p_principal_id THEN
-            RETURN NULL;
-        END IF;
-    ELSIF a_kind = 'human' THEN
-        -- A human acts for themselves, or for an org they belong to.
-        IF NOT (
-            (p_principal_kind = 'user' AND p_principal_id = p_actor_id)
-            OR (p_principal_kind = 'org' AND EXISTS (
-                    SELECT 1 FROM org_members m
-                     WHERE m.org_id = p_principal_id AND m.user_id = p_actor_id))
-        ) THEN
-            RETURN NULL;
-        END IF;
-    ELSE
-        -- An org is an owner and a grant target. It is not something that acts.
-        RETURN NULL;
-    END IF;
-
-    -- 1. The principal owns the row.
-    IF p_owner_kind = p_principal_kind AND p_owner_id = p_principal_id THEN
-        RETURN 'owner';
-    END IF;
-
-    -- 2. A grant written against this principal. Direct and inherited are the
-    --    same row shape by construction (D18.3), so they are one branch.
-    IF EXISTS (
-        SELECT 1 FROM grants g
-         WHERE g.subject_kind = p_subject_kind
-           AND g.subject_id = p_subject_id
-           AND g.subject_name IS NOT DISTINCT FROM p_subject_name
-           AND g.target_kind = p_principal_kind
-           AND g.target_id = p_principal_id
-           AND g.source <> 'override'
-           AND access_satisfies(g.access, p_access)
-           AND g.revoked_at IS NULL
-           AND (g.expires_at IS NULL OR g.expires_at > p_now)
-    ) THEN
-        RETURN 'grant';
-    END IF;
-
-    -- 3. A grant written against an org this principal belongs to. Resolved at
-    --    read time against membership, never materialized per member (D18.3):
-    --    materialized rows would be wrong the moment membership changes.
-    IF p_principal_kind = 'user' AND EXISTS (
-        SELECT 1
-          FROM grants g
-          JOIN org_members m ON m.org_id = g.target_id AND m.user_id = p_principal_id
-         WHERE g.subject_kind = p_subject_kind
-           AND g.subject_id = p_subject_id
-           AND g.subject_name IS NOT DISTINCT FROM p_subject_name
-           AND g.target_kind = 'org'
-           AND g.source <> 'override'
-           AND access_satisfies(g.access, p_access)
-           AND g.revoked_at IS NULL
-           AND (g.expires_at IS NULL OR g.expires_at > p_now)
-    ) THEN
-        RETURN 'org_grant';
-    END IF;
-
-    -- 4. Admin override. A grant produced by policy, evaluated in the same
-    --    predicate as everything else, under four constraints (D18.2):
-    --      * org-owned rows only ... being admin of the household does not
-    --        reach a member's personal rows,
-    --      * time-boxed, enforced by the expires_at CHECK on the row,
-    --      * a human actor only ... an AI acting for an admin principal does
-    --        not inherit override, which is D13.14's lesson,
-    --      * audited by the caller, because this branch is reached only when
-    --        nothing above it fired.
-    IF a_kind = 'human' AND p_owner_kind = 'org' AND EXISTS (
-        SELECT 1
-          FROM grants g
-          JOIN org_members m ON m.org_id = p_owner_id AND m.user_id = p_actor_id
-         WHERE g.subject_kind = p_subject_kind
-           AND g.subject_id = p_subject_id
-           AND g.subject_name IS NOT DISTINCT FROM p_subject_name
-           AND g.source = 'override'
-           AND m.role = 'admin'
-           AND g.target_kind = 'user'
-           AND g.target_id = p_actor_id
-           AND access_satisfies(g.access, p_access)
-           AND g.revoked_at IS NULL
-           AND g.expires_at > p_now
-    ) THEN
-        RETURN 'override';
-    END IF;
-
-    RETURN NULL;
-END;
-$$;
-
--- Tool access, allowlist only (D18.1). An install grant with no tool allowlist
--- implies the app's full tool set; with one, exactly those tools. Expressed
--- here rather than at a call site so it cannot become a second policy.
-CREATE FUNCTION tool_access_reason(
-    p_install_id     uuid,
-    p_tool_name      text,
-    p_owner_kind     text,
-    p_owner_id       uuid,
-    p_principal_kind text,
-    p_principal_id   uuid,
-    p_actor_id       uuid,
-    p_now            timestamptz DEFAULT now()
-) RETURNS text
-LANGUAGE plpgsql STABLE PARALLEL SAFE AS $$
-DECLARE
-    has_allowlist boolean;
-BEGIN
-    SELECT EXISTS (
-        SELECT 1 FROM grants g
-         WHERE g.subject_kind = 'tool'
-           AND g.subject_id = p_install_id
-           AND g.revoked_at IS NULL
-           AND (g.expires_at IS NULL OR g.expires_at > p_now)
-           AND (
-                (g.target_kind = p_principal_kind AND g.target_id = p_principal_id)
-             OR (p_principal_kind = 'user' AND g.target_kind = 'org' AND EXISTS (
-                    SELECT 1 FROM org_members m
-                     WHERE m.org_id = g.target_id AND m.user_id = p_principal_id))
-           )
-    ) INTO has_allowlist;
-
-    IF has_allowlist THEN
-        RETURN access_reason('tool', p_install_id, p_tool_name,
-                             p_owner_kind, p_owner_id,
-                             p_principal_kind, p_principal_id, p_actor_id, 'call', p_now);
-    END IF;
-
-    RETURN access_reason('install', p_install_id, NULL,
-                         p_owner_kind, p_owner_id,
-                         p_principal_kind, p_principal_id, p_actor_id, 'call', p_now);
-END;
-$$;
 
 -- ---------------------------------------------------------------------------
 -- Blobs. Bytes and references are separate tables because ownership,
@@ -777,6 +604,14 @@ BEGIN
         RETURN NEW;
     END IF;
 
+    -- A trigger can check that the named activator is a human. It CANNOT check
+    -- that the named activator is the actor on the credential, because there is
+    -- no credential in scope here ... so an AI could register a build and
+    -- activate it by naming a human in this column.
+    --
+    -- That binding lives in store.ActivateInstall, which sets this column from
+    -- cred.ActorID and refuses anything else. Do not write to installs.state
+    -- directly; the schema looks like it handles this and it only handles half.
     IF NEW.activated_by_actor IS NOT NULL THEN
         IF (SELECT kind FROM actors WHERE id = NEW.activated_by_actor) <> 'human' THEN
             RAISE EXCEPTION
@@ -899,135 +734,6 @@ CREATE TABLE links (
 CREATE INDEX links_dst_idx ON links (dst_id, kind);
 
 -- ---------------------------------------------------------------------------
--- Who may WRITE a grant (D13.14, D18.2, D19.3).
---
--- The read predicate above answers "may this actor see this." This answers the
--- other half, and it is the half that decides whether an AI can climb: a writer
--- must not be able to end a transaction holding authority its principal did not
--- already have. It lives in a trigger for the same reason access_reason() lives
--- in the database ... it has to hold for every writer that reaches this schema,
--- not only for the ones that remember to call a service.
--- ---------------------------------------------------------------------------
-
-CREATE FUNCTION subject_owner(p_subject_kind text, p_subject_id uuid)
-RETURNS TABLE (owner_kind text, owner_id uuid)
-LANGUAGE sql STABLE PARALLEL SAFE AS $$
-    -- tool, route and collection are install-scoped, so subject_id is the
-    -- install id for all three and they share the install's owner.
-    SELECT e.owner_kind, e.owner_id FROM entities e
-     WHERE p_subject_kind = 'entity' AND e.id = p_subject_id
-    UNION ALL
-    SELECT i.owner_kind, i.owner_id FROM installs i
-     WHERE p_subject_kind IN ('install', 'tool', 'route', 'collection') AND i.id = p_subject_id;
-$$;
-
-CREATE FUNCTION grant_issue_denial(
-    p_subject_kind    text,
-    p_subject_id      uuid,
-    p_target_kind     text,
-    p_target_id       uuid,
-    p_source          text,
-    p_by_actor        uuid,
-    p_by_principal_kind text,
-    p_by_principal_id uuid
-) RETURNS text
-LANGUAGE plpgsql STABLE PARALLEL SAFE AS $$
-DECLARE
-    o_kind    text;
-    o_id      uuid;
-    a_kind    text;
-    a_p_kind  text;
-    a_p_id    uuid;
-BEGIN
-    SELECT owner_kind, owner_id INTO o_kind, o_id
-      FROM subject_owner(p_subject_kind, p_subject_id);
-    IF o_kind IS NULL THEN
-        RETURN format('subject %s/%s does not exist', p_subject_kind, p_subject_id);
-    END IF;
-
-    SELECT kind, principal_kind, principal_id INTO a_kind, a_p_kind, a_p_id
-      FROM actors WHERE id = p_by_actor;
-    IF a_kind IS NULL THEN
-        RETURN 'granting actor does not exist';
-    END IF;
-
-    -- The credential's pair has to agree, here as much as on a read.
-    IF a_kind = 'ai' AND (a_p_kind IS DISTINCT FROM p_by_principal_kind
-                          OR a_p_id IS DISTINCT FROM p_by_principal_id) THEN
-        RETURN 'granting actor is not bound to that principal';
-    END IF;
-
-    IF p_source = 'override' THEN
-        -- D18.2: produced by policy, org-owned rows only, human admin only. An
-        -- AI never holds override and therefore never mints one either.
-        IF a_kind <> 'human' THEN
-            RETURN 'only a human actor may enter break-glass (D18.2)';
-        END IF;
-        IF o_kind <> 'org' THEN
-            RETURN 'override never reaches a personally-owned row (D18.2)';
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM org_members m
-                        WHERE m.org_id = o_id AND m.user_id = p_by_actor AND m.role = 'admin') THEN
-            RETURN 'break-glass requires admin of the owning org (D18.2)';
-        END IF;
-        RETURN NULL;
-    END IF;
-
-    -- Sharing is not transfer (D13.10), and it is not laundering either: only
-    -- the owner's principal may widen a row. A grantee reads and replies.
-    IF o_kind IS DISTINCT FROM p_by_principal_kind OR o_id IS DISTINCT FROM p_by_principal_id THEN
-        RETURN 'only the owning principal may grant on this subject';
-    END IF;
-
-    -- D13.14: a tag is an exfiltration primitive once an AI can write one.
-    IF a_kind = 'ai' THEN
-        IF p_target_kind = a_p_kind AND p_target_id = a_p_id THEN
-            RETURN NULL;  -- its own principal, widening nothing
-        END IF;
-        IF p_target_kind = 'org' AND (
-            (a_p_kind = 'org' AND a_p_id = p_target_id)
-            OR (a_p_kind = 'user' AND EXISTS (
-                    SELECT 1 FROM org_members m
-                     WHERE m.org_id = p_target_id AND m.user_id = a_p_id))
-        ) THEN
-            RETURN NULL;  -- an org its principal belongs to
-        END IF;
-        IF p_target_kind = 'user' AND a_p_kind = 'user' AND EXISTS (
-            SELECT 1 FROM org_members mine
-              JOIN org_members theirs ON theirs.org_id = mine.org_id
-             WHERE mine.user_id = a_p_id AND theirs.user_id = p_target_id
-        ) THEN
-            RETURN NULL;  -- a member principal of the same org
-        END IF;
-        RETURN 'AI-authored share crosses a principal boundary; '
-               || 'needs a standing grant or human confirmation (D13.14)';
-    END IF;
-
-    RETURN NULL;
-END;
-$$;
-
-CREATE FUNCTION grants_issue_check() RETURNS trigger
-LANGUAGE plpgsql AS $$
-DECLARE
-    denial text;
-BEGIN
-    denial := grant_issue_denial(
-        NEW.subject_kind, NEW.subject_id, NEW.target_kind, NEW.target_id,
-        NEW.source, NEW.granted_by_actor,
-        NEW.granted_by_principal_kind, NEW.granted_by_principal_id);
-    IF denial IS NOT NULL THEN
-        RAISE EXCEPTION 'grant refused: %', denial;
-    END IF;
-    RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER grants_issue_policy
-    AFTER INSERT ON grants
-    FOR EACH ROW EXECUTE FUNCTION grants_issue_check();
-
--- ---------------------------------------------------------------------------
 -- Events: append-only, the transport of record (D4.5).
 --
 -- Partitioned monthly by created_at so growth stays an operational non-event
@@ -1081,21 +787,66 @@ CREATE INDEX events_subject_idx ON events (subject_kind, subject_id, created_at 
 -- an outage. It should stay empty; the store creates partitions ahead of time.
 CREATE TABLE events_default PARTITION OF events DEFAULT;
 
+-- Returns the partition name, or NULL when the month could not be created.
+--
+-- NULL rather than an exception because a blocked month must not be a boot
+-- failure: writes still land in the DEFAULT partition, so the daemon is
+-- degraded rather than down. The blocking condition is a row already sitting in
+-- the default partition for a range this would claim, which Postgres refuses
+-- with "updated partition constraint for default partition would be violated".
+-- Recovery is DDL (detach the default, move the rows, reattach), so the message
+-- says which range is in the way rather than making somebody guess.
 CREATE FUNCTION ensure_events_partition(p_month date) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
     lo   date := date_trunc('month', p_month)::date;
     hi   date := (date_trunc('month', p_month) + interval '1 month')::date;
     name text := format('events_%s', to_char(lo, 'YYYY_MM'));
+    blocking bigint;
 BEGIN
-    IF to_regclass(name) IS NULL THEN
-        EXECUTE format(
-            'CREATE TABLE %I PARTITION OF events FOR VALUES FROM (%L) TO (%L)',
-            name, lo, hi);
-    END IF;
+    -- IF NOT EXISTS rather than a to_regclass probe followed by CREATE: the
+    -- probe is not atomic, so two daemons booting together race into 42P07.
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS %I PARTITION OF events FOR VALUES FROM (%L) TO (%L)',
+        name, lo, hi);
     RETURN name;
+EXCEPTION
+    WHEN check_violation OR invalid_table_definition OR object_not_in_prerequisite_state THEN
+        EXECUTE format(
+            'SELECT count(*) FROM events_default WHERE created_at >= %L AND created_at < %L',
+            lo, hi) INTO blocking;
+        RAISE WARNING
+            'events partition % not created: % row(s) already in events_default for [%, %)',
+            name, blocking, lo, hi;
+        RETURN NULL;
 END;
 $$;
+
+-- created_at is a LOCAL ingest timestamp and the partition key, not a claim
+-- about when something happened elsewhere.
+--
+-- One row dated past the last partition lands in the default partition, and
+-- from then on that month can never be created ... while the append-only
+-- trigger below means the row cannot be deleted either. The realistic causes
+-- are exactly the ones D4.12 plans for: clock skew, and a bridged event
+-- carrying another hive's timestamp. A bridge puts the origin's timestamp in
+-- the body, where it belongs.
+CREATE FUNCTION events_reject_future_timestamps() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.created_at > now() + interval '1 hour' THEN
+        RAISE EXCEPTION
+            'events.created_at % is more than an hour ahead of the server clock; '
+            'it is a local ingest time, not the origin''s timestamp',
+            NEW.created_at;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER events_no_future_timestamps
+    BEFORE INSERT ON events
+    FOR EACH ROW EXECUTE FUNCTION events_reject_future_timestamps();
 
 -- D4.12 asks for (origin, origin_id) unique from the first migration. A UNIQUE
 -- constraint on a partitioned table must include the partition key, which would
@@ -1351,3 +1102,446 @@ CREATE INDEX workflow_steps_timer_idx ON workflow_steps (wake_at) WHERE state = 
 CREATE INDEX workflow_steps_lease_idx ON workflow_steps (lease_expires_at) WHERE state = 'leased';
 CREATE INDEX workflow_steps_wait_idx ON workflow_steps (run_id) WHERE state = 'waiting_event';
 CREATE INDEX workflow_steps_run_idx ON workflow_steps (run_id, seq);
+
+-- ---------------------------------------------------------------------------
+-- POLICY. Everything above is data; everything below decides who may touch it.
+--
+-- This section is last on purpose: the predicate resolves ownership by looking
+-- rows up, so it has to be created after the tables it reads.
+--
+-- Two rules shape all of it:
+--
+--   1. The predicate takes NOTHING about authority on trust from its caller.
+--      An earlier version accepted the owner as a parameter and compared it to
+--      the credential's principal, which meant every caller composed half the
+--      access check and one copy-paste returned 'owner' for anything. The
+--      predicate now resolves the owner itself from the subject.
+--   2. Reads answer with a REASON rather than a boolean, because D18.2 requires
+--      auditing accesses that succeeded ONLY through an override and a boolean
+--      cannot say which branch fired. Branch order is load-bearing: override is
+--      last, so seeing it means nothing else would have worked.
+-- ---------------------------------------------------------------------------
+
+-- Where a subject's authority actually lives. tool, route and collection are
+-- install-scoped, so subject_id is the install id for all three.
+CREATE FUNCTION subject_owner(p_subject_kind text, p_subject_id uuid)
+RETURNS TABLE (owner_kind text, owner_id uuid)
+LANGUAGE sql STABLE PARALLEL SAFE AS $fn$
+    SELECT e.owner_kind, e.owner_id FROM entities e
+     WHERE p_subject_kind = 'entity' AND e.id = p_subject_id
+    UNION ALL
+    SELECT i.owner_kind, i.owner_id FROM installs i
+     WHERE p_subject_kind IN ('install', 'tool', 'route', 'collection') AND i.id = p_subject_id;
+$fn$;
+
+CREATE FUNCTION access_satisfies(p_held text, p_required text) RETURNS boolean
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $fn$
+    -- write implies read. call is orthogonal: it gates tools and routes, and a
+    -- reader of an install's data has no business invoking its tools.
+    SELECT p_held = p_required OR (p_required = 'read' AND p_held = 'write');
+$fn$;
+
+-- Credential coherence (D17.4). The credential pins author_actor AND owner
+-- principal, and the two have to agree or the pair proves nothing. Returns the
+-- acting actor's kind, or NULL when the pair does not hold up.
+--
+-- Doing this HERE rather than at the edge is what makes "an AI never gains
+-- authority its principal lacks" structural: an AI cannot be handed a principal
+-- it does not belong to, whatever the edge believed.
+CREATE FUNCTION acting_kind(
+    p_actor_id       uuid,
+    p_principal_kind text,
+    p_principal_id   uuid
+) RETURNS text
+LANGUAGE plpgsql STABLE PARALLEL SAFE AS $fn$
+DECLARE
+    a_kind   text;
+    a_p_kind text;
+    a_p_id   uuid;
+    a_off    timestamptz;
+BEGIN
+    IF p_actor_id IS NULL OR p_principal_id IS NULL OR p_principal_kind IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    SELECT kind, principal_kind, principal_id, disabled_at
+      INTO a_kind, a_p_kind, a_p_id, a_off
+      FROM actors WHERE id = p_actor_id;
+
+    IF a_kind IS NULL OR a_off IS NOT NULL THEN
+        RETURN NULL;
+    END IF;
+
+    IF a_kind = 'ai' THEN
+        IF a_p_kind IS DISTINCT FROM p_principal_kind OR a_p_id IS DISTINCT FROM p_principal_id THEN
+            RETURN NULL;
+        END IF;
+        RETURN 'ai';
+    END IF;
+
+    IF a_kind = 'human' THEN
+        -- A human acts for themselves, or for an org they belong to.
+        IF (p_principal_kind = 'user' AND p_principal_id = p_actor_id)
+           OR (p_principal_kind = 'org' AND EXISTS (
+                   SELECT 1 FROM org_members m
+                    WHERE m.org_id = p_principal_id AND m.user_id = p_actor_id)) THEN
+            RETURN 'human';
+        END IF;
+        RETURN NULL;
+    END IF;
+
+    -- An org is an owner and a grant target. It is not something that acts.
+    RETURN NULL;
+END;
+$fn$;
+
+-- THE single enforcement point (D1.4).
+--
+-- Note what is NOT in the signature: the owner. It is resolved from the subject
+-- so that no caller can supply one.
+--
+-- Returns (reason, grant_id). grant_id is the override row when reason is
+-- 'override', so the auditing caller does not have to re-query for it and
+-- cannot see a different answer across a clock tick.
+CREATE FUNCTION access_decision(
+    p_subject_kind   text,
+    p_subject_id     uuid,
+    p_subject_name   text,
+    p_principal_kind text,
+    p_principal_id   uuid,
+    p_actor_id       uuid,
+    p_access         text,
+    p_now            timestamptz DEFAULT now()
+) RETURNS TABLE (reason text, grant_id uuid)
+LANGUAGE plpgsql STABLE PARALLEL SAFE AS $fn$
+DECLARE
+    a_kind text;
+    o_kind text;
+    o_id   uuid;
+    g_id   uuid;
+BEGIN
+    reason := NULL;
+    grant_id := NULL;
+
+    a_kind := acting_kind(p_actor_id, p_principal_kind, p_principal_id);
+    IF a_kind IS NULL THEN
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    -- Absence of scope is deny, and a subject nobody owns has no scope.
+    SELECT so.owner_kind, so.owner_id INTO o_kind, o_id
+      FROM subject_owner(p_subject_kind, p_subject_id) so;
+    IF o_kind IS NULL THEN
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    -- 1. The principal owns the row.
+    IF o_kind = p_principal_kind AND o_id = p_principal_id THEN
+        reason := 'owner';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    -- 2. A grant written against this principal. Direct and inherited are the
+    --    same row shape by construction (D18.3), so they are one branch.
+    SELECT g.id INTO g_id FROM grants g
+     WHERE g.subject_kind = p_subject_kind
+       AND g.subject_id = p_subject_id
+       AND g.subject_name IS NOT DISTINCT FROM p_subject_name
+       AND g.target_kind = p_principal_kind
+       AND g.target_id = p_principal_id
+       AND g.source <> 'override'
+       AND access_satisfies(g.access, p_access)
+       AND g.revoked_at IS NULL
+       AND (g.expires_at IS NULL OR g.expires_at > p_now)
+     LIMIT 1;
+    IF g_id IS NOT NULL THEN
+        reason := 'grant';
+        grant_id := g_id;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    -- 3. A grant written against an org this principal belongs to. Resolved at
+    --    read time against membership, never materialized per member (D18.3):
+    --    materialized rows would be wrong the moment membership changes.
+    IF p_principal_kind = 'user' THEN
+        SELECT g.id INTO g_id
+          FROM grants g
+          JOIN org_members m ON m.org_id = g.target_id AND m.user_id = p_principal_id
+         WHERE g.subject_kind = p_subject_kind
+           AND g.subject_id = p_subject_id
+           AND g.subject_name IS NOT DISTINCT FROM p_subject_name
+           AND g.target_kind = 'org'
+           AND g.source <> 'override'
+           AND access_satisfies(g.access, p_access)
+           AND g.revoked_at IS NULL
+           AND (g.expires_at IS NULL OR g.expires_at > p_now)
+         LIMIT 1;
+        IF g_id IS NOT NULL THEN
+            reason := 'org_grant';
+            grant_id := g_id;
+            RETURN NEXT;
+            RETURN;
+        END IF;
+    END IF;
+
+    -- 4. Admin override. A grant produced by policy, evaluated in the same
+    --    predicate as everything else, under four constraints (D18.2):
+    --    org-owned rows only, time-boxed, a human actor only, and audited by
+    --    the caller ... which is safe to require because this branch is reached
+    --    only when nothing above it fired.
+    IF a_kind = 'human' AND o_kind = 'org' THEN
+        SELECT g.id INTO g_id
+          FROM grants g
+          JOIN org_members m ON m.org_id = o_id AND m.user_id = p_actor_id
+         WHERE g.subject_kind = p_subject_kind
+           AND g.subject_id = p_subject_id
+           AND g.subject_name IS NOT DISTINCT FROM p_subject_name
+           AND g.source = 'override'
+           AND m.role = 'admin'
+           AND g.target_kind = 'user'
+           AND g.target_id = p_actor_id
+           AND access_satisfies(g.access, p_access)
+           AND g.revoked_at IS NULL
+           AND g.expires_at > p_now
+         LIMIT 1;
+        IF g_id IS NOT NULL THEN
+            reason := 'override';
+            grant_id := g_id;
+            RETURN NEXT;
+            RETURN;
+        END IF;
+    END IF;
+
+    RETURN NEXT;
+END;
+$fn$;
+
+-- The single-value form, for composing into a WHERE clause. Same decision, same
+-- function, so a set read cannot drift from a point check.
+--
+-- A set read that uses this still owes the D18.2 audit for every row whose
+-- reason is 'override'. store.Guard is the only thing that may call it, and it
+-- discharges that obligation on every path.
+CREATE FUNCTION access_reason(
+    p_subject_kind   text,
+    p_subject_id     uuid,
+    p_subject_name   text,
+    p_principal_kind text,
+    p_principal_id   uuid,
+    p_actor_id       uuid,
+    p_access         text,
+    p_now            timestamptz DEFAULT now()
+) RETURNS text
+LANGUAGE sql STABLE PARALLEL SAFE AS $fn$
+    SELECT reason FROM access_decision(p_subject_kind, p_subject_id, p_subject_name,
+                                       p_principal_kind, p_principal_id, p_actor_id,
+                                       p_access, p_now);
+$fn$;
+
+-- NOTE for whoever adds the event bus: an event that names no grantable
+-- subject still needs a visibility rule, and the obvious shape ... pass the
+-- event's own owner columns in ... reintroduces an owner parameter. Two of
+-- those functions were drafted here and removed rather than shipped unused
+-- beside a predicate whose whole point is that it accepts no owner. Resolve
+-- from the event id instead, the same way access_decision resolves from the
+-- subject id.
+
+-- Tool access, allowlist only (D18.1). An install grant with no tool allowlist
+-- implies the app's full tool set; with one, exactly those tools.
+--
+-- The allowlist probe is narrow on purpose. It asks for a live, non-override,
+-- call-bearing tool grant, because anything looser flips the install onto the
+-- allowlist path for rows that can never satisfy it: an override row is
+-- read-only by CHECK, so a break-glass on one tool used to silently revoke call
+-- access to every tool on that install, at the moment an admin needed it most.
+CREATE FUNCTION tool_access_reason(
+    p_install_id     uuid,
+    p_tool_name      text,
+    p_principal_kind text,
+    p_principal_id   uuid,
+    p_actor_id       uuid,
+    p_now            timestamptz DEFAULT now()
+) RETURNS text
+LANGUAGE plpgsql STABLE PARALLEL SAFE AS $fn$
+DECLARE
+    has_allowlist boolean;
+BEGIN
+    SELECT EXISTS (
+        SELECT 1 FROM grants g
+         WHERE g.subject_kind = 'tool'
+           AND g.subject_id = p_install_id
+           AND g.source <> 'override'
+           AND g.access = 'call'
+           AND g.revoked_at IS NULL
+           AND (g.expires_at IS NULL OR g.expires_at > p_now)
+           AND (
+                (g.target_kind = p_principal_kind AND g.target_id = p_principal_id)
+             OR (p_principal_kind = 'user' AND g.target_kind = 'org' AND EXISTS (
+                    SELECT 1 FROM org_members m
+                     WHERE m.org_id = g.target_id AND m.user_id = p_principal_id))
+           )
+    ) INTO has_allowlist;
+
+    IF has_allowlist THEN
+        RETURN access_reason('tool', p_install_id, p_tool_name,
+                             p_principal_kind, p_principal_id, p_actor_id, 'call', p_now);
+    END IF;
+
+    RETURN access_reason('install', p_install_id, NULL,
+                         p_principal_kind, p_principal_id, p_actor_id, 'call', p_now);
+END;
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- Who may WRITE a grant (D13.14, D18.2, D19.3).
+--
+-- The predicate above answers "may this actor see this." This answers the other
+-- half, and it is the half that decides whether an AI can climb: a writer must
+-- not be able to end a transaction holding authority its principal did not
+-- already have.
+-- ---------------------------------------------------------------------------
+
+CREATE FUNCTION grant_issue_denial(
+    p_subject_kind      text,
+    p_subject_id        uuid,
+    p_target_kind       text,
+    p_target_id         uuid,
+    p_source            text,
+    p_by_actor          uuid,
+    p_by_principal_kind text,
+    p_by_principal_id   uuid
+) RETURNS text
+LANGUAGE plpgsql STABLE PARALLEL SAFE AS $fn$
+DECLARE
+    o_kind   text;
+    o_id     uuid;
+    a_kind   text;
+    a_p_kind text;
+    a_p_id   uuid;
+BEGIN
+    SELECT owner_kind, owner_id INTO o_kind, o_id
+      FROM subject_owner(p_subject_kind, p_subject_id);
+    IF o_kind IS NULL THEN
+        RETURN format('subject %s/%s does not exist', p_subject_kind, p_subject_id);
+    END IF;
+
+    SELECT kind, principal_kind, principal_id INTO a_kind, a_p_kind, a_p_id
+      FROM actors WHERE id = p_by_actor;
+    IF a_kind IS NULL THEN
+        RETURN 'granting actor does not exist';
+    END IF;
+
+    IF acting_kind(p_by_actor, p_by_principal_kind, p_by_principal_id) IS NULL THEN
+        RETURN 'granting actor is not bound to that principal';
+    END IF;
+
+    IF p_source = 'override' THEN
+        -- D18.2: produced by policy, org-owned rows only, human admin only. An
+        -- AI never holds override and therefore never mints one either.
+        IF a_kind <> 'human' THEN
+            RETURN 'only a human actor may enter break-glass (D18.2)';
+        END IF;
+        IF o_kind <> 'org' THEN
+            RETURN 'override never reaches a personally-owned row (D18.2)';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM org_members m
+                        WHERE m.org_id = o_id AND m.user_id = p_by_actor AND m.role = 'admin') THEN
+            RETURN 'break-glass requires admin of the owning org (D18.2)';
+        END IF;
+        RETURN NULL;
+    END IF;
+
+    -- Sharing is not transfer (D13.10), and it is not laundering either: only
+    -- the owner's principal may widen a row. A grantee reads and replies.
+    IF o_kind IS DISTINCT FROM p_by_principal_kind OR o_id IS DISTINCT FROM p_by_principal_id THEN
+        RETURN 'only the owning principal may grant on this subject';
+    END IF;
+
+    -- D13.14: a tag is an exfiltration primitive once an AI can write one.
+    IF a_kind = 'ai' THEN
+        IF p_target_kind = a_p_kind AND p_target_id = a_p_id THEN
+            RETURN NULL;  -- its own principal, widening nothing
+        END IF;
+        IF p_target_kind = 'org' AND (
+            (a_p_kind = 'org' AND a_p_id = p_target_id)
+            OR (a_p_kind = 'user' AND EXISTS (
+                    SELECT 1 FROM org_members m
+                     WHERE m.org_id = p_target_id AND m.user_id = a_p_id))
+        ) THEN
+            RETURN NULL;  -- an org its principal belongs to
+        END IF;
+        IF p_target_kind = 'user' AND a_p_kind = 'user' AND EXISTS (
+            SELECT 1 FROM org_members mine
+              JOIN org_members theirs ON theirs.org_id = mine.org_id
+             WHERE mine.user_id = a_p_id AND theirs.user_id = p_target_id
+        ) THEN
+            RETURN NULL;  -- a member principal of the same org
+        END IF;
+        RETURN 'AI-authored share crosses a principal boundary; '
+               || 'needs a standing grant or human confirmation (D13.14)';
+    END IF;
+
+    RETURN NULL;
+END;
+$fn$;
+
+CREATE FUNCTION grants_issue_check() RETURNS trigger
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    denial text;
+BEGIN
+    denial := grant_issue_denial(
+        NEW.subject_kind, NEW.subject_id, NEW.target_kind, NEW.target_id,
+        NEW.source, NEW.granted_by_actor,
+        NEW.granted_by_principal_kind, NEW.granted_by_principal_id);
+    IF denial IS NOT NULL THEN
+        RAISE EXCEPTION 'grant refused: %', denial;
+    END IF;
+    RETURN NEW;
+END;
+$fn$;
+
+CREATE TRIGGER grants_issue_policy
+    AFTER INSERT ON grants
+    FOR EACH ROW EXECUTE FUNCTION grants_issue_check();
+
+-- A grant is immutable except for its revocation.
+--
+-- The issue policy above only fires on INSERT, so without this an UPDATE walks
+-- straight around every rule in it: retarget a live grant at an unrelated
+-- principal, widen read to write, reattribute it to an AI, or promote source to
+-- 'override' and mint break-glass without passing the admin check. All four
+-- were reproduced against a real database. Pinning which columns an UPDATE may
+-- touch closes the whole class at once, and it is a smaller rule than re-running
+-- the issue policy on every narrow.
+CREATE FUNCTION grants_are_immutable_except_revocation() RETURNS trigger
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF NEW.id IS DISTINCT FROM OLD.id
+       OR NEW.subject_kind IS DISTINCT FROM OLD.subject_kind
+       OR NEW.subject_id IS DISTINCT FROM OLD.subject_id
+       OR NEW.subject_name IS DISTINCT FROM OLD.subject_name
+       OR NEW.target_kind IS DISTINCT FROM OLD.target_kind
+       OR NEW.target_id IS DISTINCT FROM OLD.target_id
+       OR NEW.access IS DISTINCT FROM OLD.access
+       OR NEW.source IS DISTINCT FROM OLD.source
+       OR NEW.inherited_from IS DISTINCT FROM OLD.inherited_from
+       OR NEW.granted_by_actor IS DISTINCT FROM OLD.granted_by_actor
+       OR NEW.granted_by_principal_kind IS DISTINCT FROM OLD.granted_by_principal_kind
+       OR NEW.granted_by_principal_id IS DISTINCT FROM OLD.granted_by_principal_id
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+       OR NEW.expires_at IS DISTINCT FROM OLD.expires_at THEN
+        RAISE EXCEPTION
+            'a grant is immutable except for revoked_at and revoked_by; delete it and write a new one';
+    END IF;
+    RETURN NEW;
+END;
+$fn$;
+
+CREATE TRIGGER grants_immutability
+    BEFORE UPDATE ON grants
+    FOR EACH ROW EXECUTE FUNCTION grants_are_immutable_except_revocation();

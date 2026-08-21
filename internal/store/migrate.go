@@ -204,19 +204,30 @@ func containsVersion(migrations []Migration, version string) bool {
 }
 
 // EnsureEventPartitions creates the monthly partitions covering now and the
-// next months ahead. The DEFAULT partition means a miss is never an outage, but
-// rows landing there cannot be pruned by dropping a partition later, so this
-// runs at boot and on a timer.
-func EnsureEventPartitions(ctx context.Context, db DB, monthsAhead int) error {
+// next months ahead, and returns the months it could not create.
+//
+// A blocked month is NOT an error. One row already sitting in the DEFAULT
+// partition for a range makes that range uncreatable, and recovery is DDL
+// (detach the default, move the rows, reattach). Failing the boot over it would
+// turn a degraded-but-working table into an outage that repeats every restart,
+// so the caller logs the blocked months and carries on: writes still land in
+// the default partition.
+//
+// ensure_events_partition raises a WARNING naming the blocking range.
+func EnsureEventPartitions(ctx context.Context, db DB, monthsAhead int) (blocked []string, err error) {
 	if monthsAhead < 0 {
-		return fmt.Errorf("monthsAhead must not be negative, got %d", monthsAhead)
+		return nil, fmt.Errorf("monthsAhead must not be negative, got %d", monthsAhead)
 	}
 	for i := 0; i <= monthsAhead; i++ {
-		if _, err := db.Exec(ctx,
+		var name *string
+		if err := db.QueryRow(ctx,
 			`SELECT ensure_events_partition((date_trunc('month', now()) + make_interval(months => $1))::date)`,
-			i); err != nil {
-			return fmt.Errorf("ensure events partition +%d: %w", i, err)
+			i).Scan(&name); err != nil {
+			return blocked, fmt.Errorf("ensure events partition +%d: %w", i, err)
+		}
+		if name == nil {
+			blocked = append(blocked, fmt.Sprintf("+%d month", i))
 		}
 	}
-	return nil
+	return blocked, nil
 }

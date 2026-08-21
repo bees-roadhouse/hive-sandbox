@@ -84,7 +84,7 @@ func TestEmptyAllowlistDeniesEverything(t *testing.T) {
 	if nilList.Permits("api.anthropic.com", 443) {
 		t.Error("a nil allowlist permitted a host")
 	}
-	if err := nilList.PermitsAddr(net.ParseIP("93.184.216.34")); err == nil {
+	if err := nilList.PermitsAddr(net.ParseIP("192.0.2.1")); err == nil {
 		t.Error("a nil allowlist permitted an address")
 	}
 }
@@ -132,7 +132,9 @@ func TestPermitsAddrRejectsNonPublicDestinations(t *testing.T) {
 		}
 	}
 
-	if err := list.PermitsAddr(net.ParseIP("93.184.216.34")); err != nil {
+	// RFC 5737 documentation range: reserved, but not a private address, so it
+	// takes the same path a real public destination would.
+	if err := list.PermitsAddr(net.ParseIP("192.0.2.1")); err != nil {
 		t.Errorf("PermitsAddr on a public address: %v", err)
 	}
 }

@@ -28,8 +28,9 @@ import (
 const egressProbe = `
 set +e
 # 1. Direct, bypassing the proxy entirely, straight at an IP so DNS is not what
-#    fails. On an --internal network there is no route and this must fail.
-curl -sS -m 5 --noproxy '*' -o /dev/null http://93.184.216.34/ 2>/dev/null
+#    fails. RFC 5737 documentation range, so this is never a real host. On an
+#    --internal network there is no route and this must fail.
+curl -sS -m 5 --noproxy '*' -o /dev/null http://192.0.2.1/ 2>/dev/null
 echo "direct_rc=$?"
 # 2. An allowed host over plain HTTP.
 echo "allowed=$(curl -s -m 25 -o /dev/null -w '%{http_code}' http://example.com/)"

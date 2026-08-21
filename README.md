@@ -10,11 +10,26 @@ It replaces [`bees-roadhouse/hive`](https://github.com/bees-roadhouse/hive).
 
 ## Status
 
-Phase 0. The daemon boots and serves `/healthz`. `internal/wasmhost` runs guest
-apps on wazero behind the JSON ABI, with the data layer stubbed until
-`internal/store` lands. Everything else is still to come. The design is complete
-through decision D18; see `CLAUDE.md` for where it lives and which invariants
-are load-bearing.
+Phase 0, and honest about the gap. What exists:
+
+| | |
+|---|---|
+| `internal/store` | migrations, the grant predicate, install authority |
+| `internal/wasmhost` | guest apps on wazero behind the JSON ABI, with trust structural in the ABI |
+| `internal/blob` | the driver seam, the disk driver, and the reference layer |
+| `internal/harness` | hosted agent runs under Podman |
+| `internal/egress` | the allowlisting proxy a run reaches the internet through |
+
+**The daemon wires almost none of it yet.** It boots and serves `/healthz`;
+composing the pieces is [issue #9](https://github.com/bees-roadhouse/hive-sandbox/issues/9),
+and the event bus, workflow engine, dynamic surfaces, tools tier and journal app
+are all still ahead. [Issue #29](https://github.com/bees-roadhouse/hive-sandbox/issues/29)
+tracks the lot.
+
+The design is complete through decision D23. `CLAUDE.md` says where it lives and
+carries the thirteen invariants that are load-bearing ... **each one came out of
+a defect a review reproduced**, so breaking one is a bug even when the tests
+pass.
 
 ## Shape
 

@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/bees-roadhouse/hive-sandbox/internal/blob"
 	"github.com/bees-roadhouse/hive-sandbox/internal/manifest"
 	"github.com/bees-roadhouse/hive-sandbox/internal/store"
 	"github.com/bees-roadhouse/hive-sandbox/internal/trust"
@@ -21,9 +22,72 @@ import (
 type appFixture struct {
 	w          *world
 	data       *store.AppData
+	blobs      *blob.Catalog
+	driver     *blob.DiskDriver
 	install    uuid.UUID
 	owner      store.Owner
 	collection string
+}
+
+// hold publishes bytes and gives owner a live reference to them, which is the
+// precondition every descriptor test needs: LinkRef authorises from what the
+// caller ALREADY holds, so a document naming a blob nobody holds is refused and
+// that is the whole point of it.
+//
+// SourceUpload rather than SourceCollection, so the hold a document links from
+// is visibly a different hold than the one the document itself creates.
+func (f *appFixture) hold(c store.Credential, content []byte) blob.Descriptor {
+	f.w.t.Helper()
+
+	up, err := f.driver.CreateUpload(f.w.ctx, blob.CreateUpload{})
+	if err != nil {
+		f.w.t.Fatalf("create upload: %v", err)
+	}
+	if _, wErr := up.Write(content); wErr != nil {
+		f.w.t.Fatalf("write upload: %v", wErr)
+	}
+	sealed, err := up.Seal(f.w.ctx)
+	if err != nil {
+		f.w.t.Fatalf("seal: %v", err)
+	}
+
+	var desc blob.Descriptor
+	if txErr := f.w.s.InTx(f.w.ctx, func(tx pgx.Tx) error {
+		d, _, pErr := f.blobs.Publish(f.w.ctx, tx, sealed, "text/plain",
+			blob.Provenance{Class: blob.ClassCapture},
+			blob.RefSpec{Cred: c, SourceKind: blob.SourceUpload, SourceID: uuid.NewString()})
+		desc = d
+		return pErr
+	}); txErr != nil {
+		f.w.t.Fatalf("publish: %v", txErr)
+	}
+	return desc
+}
+
+// liveRefs counts the unreleased references a document holds.
+func (f *appFixture) liveRefs(docID uuid.UUID) int {
+	f.w.t.Helper()
+	var n int
+	if err := f.w.s.Pool().QueryRow(f.w.ctx, `
+		SELECT count(*) FROM blob_refs
+		 WHERE source_kind = 'collection' AND source_id = $1 AND released_at IS NULL`,
+		docID.String()).Scan(&n); err != nil {
+		f.w.t.Fatalf("count refs: %v", err)
+	}
+	return n
+}
+
+// holdsRef reports whether the document holds a live reference to this blob.
+func (f *appFixture) holdsRef(docID uuid.UUID, h blob.Hash) bool {
+	f.w.t.Helper()
+	var n int
+	if err := f.w.s.Pool().QueryRow(f.w.ctx, `
+		SELECT count(*) FROM blob_refs
+		 WHERE sha256 = $1 AND source_kind = 'collection' AND source_id = $2
+		   AND released_at IS NULL`, h.String(), docID.String()).Scan(&n); err != nil {
+		f.w.t.Fatalf("count refs: %v", err)
+	}
+	return n > 0
 }
 
 // installApp registers a build declaring one collection, stages and activates
@@ -90,8 +154,21 @@ func installApp(t *testing.T, w *world, slug, collection string, owner store.Own
 		})
 	})
 
+	driver, drvErr := blob.NewDiskDriver(t.TempDir())
+	if drvErr != nil {
+		t.Fatalf("blob driver: %v", drvErr)
+	}
+	catalog, catErr := blob.NewCatalog(w.s.Pool(), driver)
+	if catErr != nil {
+		t.Fatalf("blob catalog: %v", catErr)
+	}
+	data, dataErr := store.NewAppData(w.s, catalog, nil)
+	if dataErr != nil {
+		t.Fatalf("new appdata: %v", dataErr)
+	}
+
 	return &appFixture{
-		w: w, data: store.NewAppData(w.s), install: installID,
+		w: w, data: data, blobs: catalog, driver: driver, install: installID,
 		owner: owner, collection: collection,
 	}
 }

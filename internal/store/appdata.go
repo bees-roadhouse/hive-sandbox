@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/bees-roadhouse/hive-sandbox/internal/blob"
 	"github.com/bees-roadhouse/hive-sandbox/internal/trust"
 	"github.com/bees-roadhouse/hive-sandbox/internal/wasmhost"
 )
@@ -25,32 +27,61 @@ import (
 // document, its entity row and its event without a window where an event names
 // something a subscriber cannot yet read (D13.2).
 //
-// # Not done yet, and it is not optional
+// # Documents own their blobs
 //
-// A document may contain blob descriptors, and D6 finding 2 makes maintaining
-// blob_refs a REQUIREMENT of host.storage.*: the host walks each document it is
-// handed, extracts descriptor-shaped objects, and writes the references in the
-// same transaction. Without it, either blobs leak forever or a delete corrupts
-// a live document, and mark-and-sweep over app JSONB is the wrong fix because
-// it is O(corpus) and still misses a descriptor sitting in a workflow step's
+// D6 finding 2 makes maintaining blob_refs a REQUIREMENT of host.storage.*
+// rather than a service it offers: the host walks each document it is handed,
+// extracts the descriptors, and writes the references on the same transaction
+// as the document. Without that, either blobs leak forever or a delete corrupts
+// a live document. Mark-and-sweep over app JSONB is the wrong fix, because it
+// is O(corpus) and still misses a descriptor sitting in a workflow step's
 // arguments.
 //
-// This does not do that yet, deliberately rather than by oversight. The only
-// entry point available today is blob.AddRef, which takes a bare hash and hands
-// back a reference ... so extracting a digest from a guest's JSON and calling it
-// would make knowing a sha256 enough to read someone else's bytes. That is the
-// bug Augie found and Melissa is replacing with LinkRef, which authorizes from
-// a reference the caller already holds rather than from the digest.
+// The load-bearing rule, and the one worth knowing before touching any of it:
+// a descriptor pulled out of a guest's document goes through blob.LinkRef,
+// NEVER blob.AddRef.
 //
-// So: when LinkRef lands, extraction goes here, in Insert, Update and Delete,
-// on the transaction those already have. Until then a document may carry a
-// descriptor and nothing will hold the bytes down for it.
+// The two authorize from different evidence. AddRef's evidence is a blob.Sealed
+// minted by a driver that actually hashed the bytes; LinkRef's is a live
+// reference the caller's principal already holds. A hash out of guest JSON is
+// neither, so there is no honest Sealed to be had here ... and a document
+// naming a blob is asking to reference bytes that already exist, which is
+// exactly what LinkRef is for.
+//
+// Reaching for AddRef with a hand-built blob.Sealed{Hash: h} does COMPILE, and
+// that is worth knowing before someone tries it: Go cannot stop a keyed literal
+// that sets only exported fields. It is refused at runtime by an unexported
+// marker only NewSealed sets. So the barrier is a check inside AddRef rather
+// than a property of the type, and the tests here fail on that mutation rather
+// than the build.
+//
+// A linked reference can never be more trusted than what the caller already
+// holds, and it can never exist without them already holding one.
 type AppData struct {
 	store *Store
+	blobs *blob.Catalog
+	log   *slog.Logger
 }
 
 // NewAppData wires the data layer over a store.
-func NewAppData(s *Store) *AppData { return &AppData{store: s} }
+//
+// The catalog is required rather than optional, and it returns an error rather
+// than tolerating nil. An AppData without one would accept documents naming
+// blobs and write no references for them ... which is not a degraded mode, it
+// is the corruption above arriving quietly.
+func NewAppData(s *Store, blobs *blob.Catalog, logger *slog.Logger) (*AppData, error) {
+	if s == nil {
+		return nil, errors.New("appdata needs a store")
+	}
+	if blobs == nil {
+		return nil, errors.New("appdata needs a blob catalog: a document that names a blob " +
+			"and writes no reference is a blob that gets collected under a live document")
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &AppData{store: s, blobs: blobs, log: logger}, nil
+}
 
 // Compile-time proof that this satisfies the ABI's expectations.
 var _ wasmhost.Storage = (*AppData)(nil)
@@ -94,28 +125,38 @@ type docRow struct {
 	UpdatedAt time.Time       `json:"updated_at"`
 }
 
-// installInfo is everything a call needs to know about where it is running.
-type installInfo struct {
+// InstallInfo is where an app runs and who it runs for.
+type InstallInfo struct {
 	ID     uuid.UUID
 	Slug   string
 	Schema string
 	Owner  Owner
+
+	// Collections is what the build's manifest declares. It rides along because
+	// it comes off the same joined row for free, and splitting it out would
+	// cost a second round trip on the storage hot path. A caller minting a
+	// Caller ignores it; the manifest is part of what an install IS.
+	Collections []string
 }
 
-// resolveInstall looks up the install and refuses anything but an active one.
+// ResolveActiveInstall looks up an install and refuses anything but an active
+// one. It is the ONE place that decides what "active" means.
 //
-// The state check is here rather than only where a Caller is minted, and that
-// is deliberate. D19.4 makes promoting a build a distinct human act; a staged
-// install already has a row, a schema name and real tables, so an unpromoted
-// build that reached a guest invocation would run. Whoever mints the install id
-// onto a Caller should check too, and this is the backstop that does not depend
-// on them remembering.
-func resolveInstall(ctx context.Context, db DB, installID uuid.UUID) (installInfo, map[string]bool, error) {
+// One enforcement point with two call sites, rather than a check here and
+// another wherever an install id is minted onto a Caller. That was going to be
+// two checks, and the argument for two was "defence in depth rather than each
+// assuming the other" ... which describes the same arrangement as "each
+// assuming the other is the real one", and from inside there is no way to tell
+// which one you built. So there is one, and the other caller calls it.
+//
+// D19.4 is why the check exists at all: promoting a build is a distinct human
+// act, and a staged install already has a row, a schema name and real tables.
+// An unpromoted build that reached a guest invocation would simply run.
+func ResolveActiveInstall(ctx context.Context, db DB, installID uuid.UUID) (InstallInfo, error) {
 	var (
-		info        installInfo
-		ownerKind   string
-		state       string
-		collections []string
+		info      InstallInfo
+		ownerKind string
+		state     string
 	)
 	err := db.QueryRow(ctx, `
 		SELECT i.id, i.slug, i.schema_name, i.owner_kind, i.owner_id, i.state,
@@ -126,22 +167,30 @@ func resolveInstall(ctx context.Context, db DB, installID uuid.UUID) (installInf
 		  FROM installs i
 		  JOIN app_builds b ON b.id = i.build_id
 		 WHERE i.id = $1`, installID,
-	).Scan(&info.ID, &info.Slug, &info.Schema, &ownerKind, &info.Owner.ID, &state, &collections)
+	).Scan(&info.ID, &info.Slug, &info.Schema, &ownerKind, &info.Owner.ID, &state, &info.Collections)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return installInfo{}, nil, wasmhost.Errorf(wasmhost.StatusNotFound, "install %s does not exist", installID)
+		return InstallInfo{}, wasmhost.Errorf(wasmhost.StatusNotFound, "install %s does not exist", installID)
 	}
 	if err != nil {
-		return installInfo{}, nil, fmt.Errorf("resolve install: %w", err)
+		return InstallInfo{}, fmt.Errorf("resolve install: %w", err)
 	}
 	if state != "active" {
-		return installInfo{}, nil, wasmhost.Errorf(wasmhost.StatusDenied,
+		return InstallInfo{}, wasmhost.Errorf(wasmhost.StatusDenied,
 			"install %s is %s, not active: a build nobody promoted does not serve calls (D19.4)",
 			installID, state)
 	}
 	info.Owner.Kind = PrincipalKind(ownerKind)
+	return info, nil
+}
 
-	declared := make(map[string]bool, len(collections))
-	for _, c := range collections {
+// resolveInstall is ResolveActiveInstall plus the lookup shape this file wants.
+func resolveInstall(ctx context.Context, db DB, installID uuid.UUID) (InstallInfo, map[string]bool, error) {
+	info, err := ResolveActiveInstall(ctx, db, installID)
+	if err != nil {
+		return InstallInfo{}, nil, err
+	}
+	declared := make(map[string]bool, len(info.Collections))
+	for _, c := range info.Collections {
 		declared[c] = true
 	}
 	return info, declared, nil
@@ -290,6 +339,17 @@ func (a *AppData) Insert(ctx context.Context, req wasmhost.Request) (wasmhost.Re
 			return fmt.Errorf("insert document: %w", docErr)
 		}
 
+		// Same transaction as the document, which is the whole requirement: a
+		// window where the row exists and its references do not is a window
+		// where a sweep can collect the bytes it points at.
+		named, descErr := descriptorsIn(doc)
+		if descErr != nil {
+			return descErr
+		}
+		if err := a.linkDescriptors(ctx, tx, req, id, named, level); err != nil {
+			return err
+		}
+
 		if err := a.emit(ctx, tx, req, info, d.Collection, id, owner, level, "created"); err != nil {
 			return err
 		}
@@ -365,7 +425,7 @@ func (a *AppData) Get(ctx context.Context, req wasmhost.Request) (wasmhost.Respo
 	return wasmhost.Response{Trust: row.Trust, Data: body}, nil
 }
 
-func (a *AppData) readDoc(ctx context.Context, info installInfo, collection string, id uuid.UUID) (docRow, error) {
+func (a *AppData) readDoc(ctx context.Context, info InstallInfo, collection string, id uuid.UUID) (docRow, error) {
 	var (
 		row       docRow
 		level     string
@@ -450,6 +510,10 @@ func (a *AppData) Update(ctx context.Context, req wasmhost.Request) (wasmhost.Re
 			return fmt.Errorf("update entity: %w", err)
 		}
 
+		if err := a.relinkDescriptors(ctx, tx, req, id, doc, level); err != nil {
+			return err
+		}
+
 		owner := Owner{Kind: req.Caller.PrincipalKind, ID: req.Caller.PrincipalID}
 		if err := a.emit(ctx, tx, req, info, d.Collection, id, owner, level, "updated"); err != nil {
 			return err
@@ -510,6 +574,16 @@ func (a *AppData) Delete(ctx context.Context, req wasmhost.Request) (wasmhost.Re
 		}
 		if tag.RowsAffected() == 0 {
 			return wasmhost.Errorf(wasmhost.StatusNotFound, "no such document")
+		}
+
+		// By SOURCE, never by re-reading the document that is going away. The
+		// document is the wrong place to ask: an update that failed partway, or
+		// any divergence at all between the JSON and the rows, leaves a
+		// reference nobody can name again ... and a reference nobody can name
+		// is a reference nobody can release.
+		if _, relErr := a.blobs.ReleaseBySource(ctx, tx, req.Caller.Credential,
+			blob.SourceCollection, id.String()); relErr != nil {
+			return fmt.Errorf("release document blobs: %w", relErr)
 		}
 
 		owner := Owner{Kind: req.Caller.PrincipalKind, ID: req.Caller.PrincipalID}
@@ -617,10 +691,127 @@ func (a *AppData) Query(ctx context.Context, req wasmhost.Request) (wasmhost.Res
 	return wasmhost.Response{Trust: level, Data: body}, nil
 }
 
+// linkDescriptors writes one blob_refs row per blob the document names.
+//
+// LinkRef, never AddRef. The hash came out of a guest's JSON, so possession is
+// exactly what has not been established ... LinkRef resolves it against what
+// this credential's principal already holds and refuses otherwise. AddRef would
+// take the guest's word for it, and knowing a sha256 would become sufficient to
+// read the bytes behind it.
+//
+// Trust rides down: LinkRef takes the weaker of what is asked for and what is
+// already held, so a reference linked out of an untrusted write cannot come out
+// trusted, and neither can one to bytes that arrived untrusted.
+//
+// There is no skip path. A descriptor that cannot be linked fails the whole
+// write, because the alternative is a stored document naming bytes nothing
+// holds down.
+func (a *AppData) linkDescriptors(ctx context.Context, tx pgx.Tx, req wasmhost.Request,
+	id uuid.UUID, hashes []blob.Hash, level trust.Level,
+) error {
+	if len(hashes) == 0 {
+		return nil
+	}
+	spec := blob.RefSpec{
+		Cred:       req.Caller.Credential,
+		SourceKind: blob.SourceCollection,
+		SourceID:   id.String(),
+		Trust:      level,
+	}
+	for _, h := range hashes {
+		if _, err := a.blobs.LinkRef(ctx, tx, req.Caller.Credential, h, spec); err != nil {
+			return a.descriptorDenied(req, h, err)
+		}
+	}
+	return nil
+}
+
+// relinkDescriptors moves a document's references to match its new body.
+//
+// The held set comes from the CATALOG, not from re-reading the old document.
+// Re-reading the old JSON is the obvious implementation and it is wrong for a
+// reason that is invisible until it has already lost a reference: the document
+// and the rows can diverge, and once they have, a reference the old body no
+// longer names is one nothing will ever release. The catalog knows what is
+// held; the document only knows what somebody meant to hold.
+//
+// A grantee updating somebody else's document links under THEIR OWN principal,
+// because that is the only ownership LinkRef will write. So the owner's
+// references to a descriptor this update dropped stay held. That is the
+// conservative direction ... bytes kept that could have gone ... and it follows
+// from invariant 3 rather than working around it: a reference belongs to whoever
+// holds it, and one principal does not get to release another's.
+func (a *AppData) relinkDescriptors(ctx context.Context, tx pgx.Tx, req wasmhost.Request,
+	id uuid.UUID, doc json.RawMessage, level trust.Level,
+) error {
+	named, err := descriptorsIn(doc)
+	if err != nil {
+		return err
+	}
+	held, err := a.blobs.HeldBySource(ctx, tx, req.Caller.Credential, blob.SourceCollection, id.String())
+	if err != nil {
+		return fmt.Errorf("read held document blobs: %w", err)
+	}
+
+	wanted := make(map[blob.Hash]bool, len(named))
+	for _, h := range named {
+		wanted[h] = true
+	}
+	holding := make(map[blob.Hash]bool, len(held))
+	for _, h := range held {
+		holding[h] = true
+	}
+
+	// Link first, release second. The other order opens a window inside the
+	// transaction where a blob named by both bodies is momentarily unheld, and
+	// while nothing can observe that today, the ordering costs nothing and the
+	// habit is the point.
+	var added []blob.Hash
+	for _, h := range named {
+		if !holding[h] {
+			added = append(added, h)
+		}
+	}
+	if err := a.linkDescriptors(ctx, tx, req, id, added, level); err != nil {
+		return err
+	}
+	for _, h := range held {
+		if wanted[h] {
+			continue
+		}
+		if relErr := a.blobs.Release(ctx, tx, req.Caller.Credential,
+			h, blob.SourceCollection, id.String()); relErr != nil {
+			return fmt.Errorf("release dropped document blob: %w", relErr)
+		}
+	}
+	return nil
+}
+
+// descriptorDenied maps a link failure onto what a guest is allowed to learn,
+// which is almost nothing.
+//
+// blob.ErrNotFound covers "no such blob" AND "you hold no reference to it", and
+// they are deliberately the same error. Telling them apart is an oracle over
+// the global hash space: a stranger who merely knows a hash could confirm the
+// bytes exist. Safe to LOG, never safe to RETURN ... so the actor, the
+// principal and the hash go into a line the guest cannot read, and the guest
+// gets the same status either way.
+func (a *AppData) descriptorDenied(req wasmhost.Request, h blob.Hash, err error) error {
+	if errors.Is(err, blob.ErrNotFound) {
+		a.log.Warn("storage: document named a blob this principal holds no reference to",
+			"actor", req.Caller.ActorID,
+			"principal_kind", string(req.Caller.PrincipalKind),
+			"principal", req.Caller.PrincipalID,
+			"blob", h.String())
+		return wasmhost.Errorf(wasmhost.StatusNotFound, "no such blob")
+	}
+	return fmt.Errorf("link document blob: %w", err)
+}
+
 // emit writes the event announcing a write, in the same transaction as the
 // write itself (D14.2: with no second writer, every write produces an event, so
 // mentions fire by construction).
-func (a *AppData) emit(ctx context.Context, tx pgx.Tx, req wasmhost.Request, info installInfo,
+func (a *AppData) emit(ctx context.Context, tx pgx.Tx, req wasmhost.Request, info InstallInfo,
 	collection string, id uuid.UUID, owner Owner, level trust.Level, verb string,
 ) error {
 	ev := &Event{

@@ -135,7 +135,19 @@ type Prepared struct {
 	// SurfaceHash content-addresses what this install exposes. It changes when
 	// the tool or route surface changes, which is what makes "is this promotion
 	// an equivalent one" answerable without a diff.
+	//
+	// It is meant to be PERSISTED with the build rather than recomputed on
+	// read, and the difference matters more than it looks: a recomputed hash
+	// says "this is what we would derive now", where a reviewer needs "this is
+	// what a human approved". If the deriver changes, every historical hash
+	// silently changes meaning.
 	SurfaceHash string
+
+	// DeriveVersion says which deriver produced SurfaceHash, and travels with
+	// it everywhere. Without it two differing hashes are ambiguous between "the
+	// app changed" and "we changed", which is the question the hash exists to
+	// answer. Persist both or neither ... the schema enforces that.
+	DeriveVersion int
 	// ModuleHash is the content address of the wasm, or empty for an app whose
 	// collections are all generated CRUD and which therefore needs no module.
 	ModuleHash string
@@ -176,7 +188,8 @@ func Prepare(m *manifest.Manifest, moduleHash string, exports []string) (Prepare
 
 	return Prepared{
 		Manifest: m, Surface: surface, Schema: plan,
-		SurfaceHash: hash, ModuleHash: moduleHash,
+		SurfaceHash: hash, DeriveVersion: manifest.DeriveVersion,
+		ModuleHash: moduleHash,
 	}, nil
 }
 

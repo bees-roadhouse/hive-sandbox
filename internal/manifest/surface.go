@@ -68,6 +68,23 @@ type Route struct {
 	Op         Op
 }
 
+// DeriveVersion identifies THIS deriver, and it is recorded next to every
+// surface hash a build is promoted with.
+//
+// Without it, two hashes that differ are ambiguous between "the app changed"
+// and "we changed", and a promotion reviewer cannot tell those apart ... which
+// is exactly the question the hash exists to answer. Cheap now, unanswerable
+// later, because a historical row cannot be re-derived once the deriver has
+// moved on.
+//
+// **Bump it whenever Derive's output changes for the same input**: a new field
+// on Tool or Route, a different sort key, another generated operation, a
+// changed CRUD schema. TestDerivedSurfaceIsGolden fails when you do, and its
+// message says to come here.
+//
+//	1 ... first version: generated CRUD, overrides, hidden, tool tier.
+const DeriveVersion = 1
+
 // Surface is everything derived from a manifest: what this app exposes, before
 // anybody asks who is connecting.
 //

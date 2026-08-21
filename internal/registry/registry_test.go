@@ -177,3 +177,19 @@ func TestPrepareValidatesBeforeCheckingTheModule(t *testing.T) {
 		t.Errorf("reported a module problem for a manifest problem: %v", err)
 	}
 }
+
+// A surface hash without the deriver that produced it is a number nobody can
+// interpret. They travel together from the moment they exist.
+func TestPreparedCarriesTheDeriver(t *testing.T) {
+	p, err := Prepare(journalish(), modHash,
+		[]string{"_initialize", "add_entry", "search"})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if p.DeriveVersion != manifest.DeriveVersion {
+		t.Errorf("derive version = %d, want %d", p.DeriveVersion, manifest.DeriveVersion)
+	}
+	if p.SurfaceHash == "" || p.DeriveVersion == 0 {
+		t.Error("a surface hash and its deriver must both be set, or neither")
+	}
+}

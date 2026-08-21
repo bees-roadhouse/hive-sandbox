@@ -193,6 +193,18 @@ test/                  integration tests, including Playwright-driven HTTP/SSE
      the assertion is honest, and `n = 12` against a batch limit of 500 means the
      interesting branch never runs. This one hides best, because the test is
      well written. Ask what size makes the loop take its other path.
+- **Ask what the instrument measured before believing it.** Three detectors,
+  each earned here by nearly shipping the thing it catches:
+  - **Check the clock.** A suite that returns green implausibly fast never ran.
+    Two suites came back in 0.5s because `HIVE_SANDBOX_TEST_DATABASE_URL` was
+    unset, and six security fixes were about to be reported as verified.
+  - **Check the skip.** Count what actually ran, not what was green.
+  - **Check what the mutation removed.** A green mutation result is evidence only
+    if the mutation actually removed the property, and **with defence in depth a
+    single-site mutation does not** ... deleting the Go check leaves the SQL
+    clause standing and vice versa. A pass came back "five uncaught", which reads
+    as five worthless tests and actually meant the redundancy was real.
+    **"Uncaught" is a verdict on the pair, not on the test.**
 - **When arranging the condition changes the outcome, test the decision instead
   of the mechanism.** Every attempt to stage "process finished, then context
   cancelled" against a context-bound command kills the process instead ... Linux

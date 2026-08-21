@@ -317,3 +317,54 @@ func containerExists(t *testing.T, name string) bool {
 	}
 	return strings.TrimSpace(string(out)) != ""
 }
+
+// Augie's finding 3. Podman takes the last --env for a key, and spec.Env was
+// appended after the launcher's own, so a spec could redirect HOME off the
+// tmpfs and onto the one directory that outlives the run.
+func TestSpecEnvCannotOverrideTheLauncherEnv(t *testing.T) {
+	t.Parallel()
+
+	for _, key := range []string{
+		"HOME",                                  // the one that matters: aims a credential at the workspace
+		"HTTP_PROXY", "https_proxy", "NO_PROXY", // how a proxied run reaches anything
+		"HIVE_SANDBOX_API_SOCKET", // the daemon's API
+		"HIVE_SANDBOX_RUN_ID",
+	} {
+		spec := testSpec(t, "run-args")
+		spec.Env = map[string]string{key: "/workspace"}
+
+		if _, err := harness.PodmanRunArgs(spec, nil); err == nil {
+			t.Errorf("a spec overrode %s", key)
+		}
+	}
+
+	// An ordinary variable still works ... this is a reserved list, not a ban.
+	spec := testSpec(t, "run-args")
+	spec.Env = map[string]string{"ANTHROPIC_API_KEY": "from-the-vault"}
+	args, err := harness.PodmanRunArgs(spec, nil)
+	if err != nil {
+		t.Fatalf("PodmanRunArgs: %v", err)
+	}
+	if !slices.Contains(valuesOf(args, "--env"), "ANTHROPIC_API_KEY=from-the-vault") {
+		t.Error("a credential from the vault did not reach the container")
+	}
+}
+
+// The launcher's own HOME must be the last word, whatever else is in the spec.
+func TestHomeStaysOnTheTmpfs(t *testing.T) {
+	t.Parallel()
+
+	args := argsFor(t, func(s *harness.RunSpec) {
+		s.Env = map[string]string{"ANTHROPIC_API_KEY": "k"}
+	})
+
+	var lastHome string
+	for _, env := range valuesOf(args, "--env") {
+		if strings.HasPrefix(env, "HOME=") {
+			lastHome = env
+		}
+	}
+	if lastHome != "HOME=/home/harness" {
+		t.Errorf("last HOME = %q, want the tmpfs", lastHome)
+	}
+}

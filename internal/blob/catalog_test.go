@@ -300,15 +300,19 @@ func TestTrustRidesTheReference(t *testing.T) {
 	// Alice uploaded it: trusted.
 	desc := w.publish(content, capture(alice, "upload-a"), originalClass)
 
-	// Bob's copy came from the web: untrusted, same bytes, same row.
+	// Bob's copy came from the web: untrusted, same bytes, same row. He seals
+	// them himself, which is what honest dedup is ... the earlier version of
+	// this test referenced alice's hash without holding anything, and that
+	// framed a read-access bypass as the legitimate case.
 	fetched := blob.RefSpec{
 		Cred:       bob,
 		SourceKind: blob.SourceScreenshot,
 		SourceID:   "browse-1",
 		Trust:      trust.Untrusted,
 	}
+	bobsCopy := w.seal(content)
 	err := pgx.BeginFunc(w.ctx, w.pool, func(tx pgx.Tx) error {
-		_, addErr := w.catalog.AddRef(w.ctx, tx, desc.Hash, fetched)
+		_, addErr := w.catalog.AddRef(w.ctx, tx, bobsCopy, fetched)
 		return addErr
 	})
 	if err != nil {
@@ -344,8 +348,9 @@ func TestReReferencingCannotLaunderTrustUpward(t *testing.T) {
 	// The same producer re-runs and claims trusted this time.
 	claimsTrusted := untrusted
 	claimsTrusted.Trust = trust.Trusted
+	resealed := w.seal(content)
 	err := pgx.BeginFunc(w.ctx, w.pool, func(tx pgx.Tx) error {
-		_, addErr := w.catalog.AddRef(w.ctx, tx, desc.Hash, claimsTrusted)
+		_, addErr := w.catalog.AddRef(w.ctx, tx, resealed, claimsTrusted)
 		return addErr
 	})
 	if err != nil {
@@ -371,8 +376,9 @@ func TestReReferencingDoesNotInflateTheRefcount(t *testing.T) {
 	desc := w.publish([]byte("written twice by a retry"), spec, originalClass)
 
 	for range 3 {
+		retry := w.seal([]byte("written twice by a retry"))
 		err := pgx.BeginFunc(w.ctx, w.pool, func(tx pgx.Tx) error {
-			_, addErr := w.catalog.AddRef(w.ctx, tx, desc.Hash, spec)
+			_, addErr := w.catalog.AddRef(w.ctx, tx, retry, spec)
 			return addErr
 		})
 		if err != nil {
@@ -446,8 +452,9 @@ func TestTrashRefusesWhenAReferenceReappears(t *testing.T) {
 	}
 
 	// Someone else references it before the sweeper gets there.
+	bobsCopy := w.seal([]byte("referenced again mid-sweep"))
 	err := pgx.BeginFunc(w.ctx, w.pool, func(tx pgx.Tx) error {
-		_, addErr := w.catalog.AddRef(w.ctx, tx, desc.Hash, capture(bob, "upload-b"))
+		_, addErr := w.catalog.AddRef(w.ctx, tx, bobsCopy, capture(bob, "upload-b"))
 		return addErr
 	})
 	if err != nil {
@@ -596,4 +603,163 @@ func contains(haystack, needle string) bool {
 		}
 		return false
 	}()
+}
+
+// Augie's finding 1, all three holes it opened. A bare sha256 must not be a
+// bearer token for the bytes it names.
+func TestAddRefRefusesAHashWithoutTheBytes(t *testing.T) {
+	t.Parallel()
+
+	w := newCatalogWorld(t)
+	alice := w.person("alice")
+	carol := w.person("carol")
+
+	secret := []byte("alice's private document, never shared with carol")
+	desc := w.publish(secret, capture(alice, "upload-1"), originalClass)
+
+	// Control: carol cannot resolve it.
+	if _, _, err := w.catalog.Resolve(w.ctx, carol, desc.Hash); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("control: carol resolved alice's bytes: %v", err)
+	}
+
+	// A Sealed she filled in herself from a hash she learned. It never went
+	// through a driver, so it is not evidence of anything.
+	forged := blob.Sealed{Hash: desc.Hash, Size: desc.Size}
+	err := pgx.BeginFunc(w.ctx, w.pool, func(tx pgx.Tx) error {
+		_, addErr := w.catalog.AddRef(w.ctx, tx, forged, capture(carol, "stolen-1"))
+		return addErr
+	})
+	if err == nil {
+		t.Fatal("carol wrote herself a reference from a hash she only knew")
+	}
+
+	// Read access did not follow.
+	if _, _, err := w.catalog.Resolve(w.ctx, carol, desc.Hash); !errors.Is(err, blob.ErrNotFound) {
+		t.Errorf("carol can resolve alice's bytes after a refused AddRef: %v", err)
+	}
+	if _, _, _, err := w.catalog.Open(w.ctx, carol, desc.Hash, blob.Range{}); !errors.Is(err, blob.ErrNotFound) {
+		t.Errorf("carol can read alice's bytes: %v", err)
+	}
+}
+
+// The oracle half: whether AddRef succeeds must not depend on whether the hash
+// exists, or the error is a probe for the global hash space.
+func TestAddRefIsNotAnExistenceOracle(t *testing.T) {
+	t.Parallel()
+
+	w := newCatalogWorld(t)
+	alice := w.person("alice")
+	carol := w.person("carol")
+
+	present := w.publish([]byte("bytes that exist"), capture(alice, "upload-1"), originalClass)
+	absent := blob.HashBytes([]byte("bytes that were never stored"))
+
+	refuse := func(h blob.Hash) error {
+		return pgx.BeginFunc(w.ctx, w.pool, func(tx pgx.Tx) error {
+			_, addErr := w.catalog.AddRef(w.ctx, tx, blob.Sealed{Hash: h, Size: 1}, capture(carol, "probe"))
+			return addErr
+		})
+	}
+
+	existing, missing := refuse(present.Hash), refuse(absent)
+	if existing == nil || missing == nil {
+		t.Fatal("a forged Sealed was accepted")
+	}
+	// Same refusal either way. A difference here is the probe.
+	if existing.Error() != missing.Error() {
+		t.Errorf("AddRef distinguishes an existing hash from an absent one:\n existing: %v\n absent:   %v",
+			existing, missing)
+	}
+}
+
+// The trust half, which needed no bytes at all: a fresh (owner, kind, id) tuple
+// was a clean slate, so the downward-only rule scoped to ON CONFLICT never saw
+// it.
+func TestAStrangerCannotLaunderTrustByReferencing(t *testing.T) {
+	t.Parallel()
+
+	w := newCatalogWorld(t)
+	alice := w.person("alice")
+	carol := w.person("carol")
+
+	fetched := []byte("<p>a page alice fetched from the web</p>")
+	desc := w.publish(fetched, blob.RefSpec{
+		Cred: alice, SourceKind: blob.SourceScreenshot, SourceID: "browse-1", Trust: trust.Untrusted,
+	}, originalClass)
+
+	// Carol tries to mint a trusted view of untrusted bytes without holding
+	// them.
+	err := pgx.BeginFunc(w.ctx, w.pool, func(tx pgx.Tx) error {
+		_, addErr := w.catalog.AddRef(w.ctx, tx, blob.Sealed{Hash: desc.Hash, Size: desc.Size},
+			blob.RefSpec{Cred: carol, SourceKind: blob.SourceUpload, SourceID: "laundered",
+				Trust: trust.Trusted})
+		return addErr
+	})
+	if err == nil {
+		t.Fatal("a stranger minted a trusted reference to bytes she does not hold")
+	}
+}
+
+// LinkRef is the honest path for bytes already held, and it is authorized by an
+// existing reference rather than by knowing the hash.
+func TestLinkRefRequiresAnExistingReference(t *testing.T) {
+	t.Parallel()
+
+	w := newCatalogWorld(t)
+	alice := w.person("alice")
+	carol := w.person("carol")
+
+	desc := w.publish([]byte("alice's photo"), capture(alice, "upload-1"), originalClass)
+
+	// Alice may attach what she already holds to a new producer.
+	err := pgx.BeginFunc(w.ctx, w.pool, func(tx pgx.Tx) error {
+		_, linkErr := w.catalog.LinkRef(w.ctx, tx, alice, desc.Hash, blob.RefSpec{
+			Cred: alice, SourceKind: blob.SourceCollection, SourceID: "entry-7", Trust: trust.Trusted,
+		})
+		return linkErr
+	})
+	if err != nil {
+		t.Fatalf("alice could not link bytes she holds: %v", err)
+	}
+	if count, _ := w.catalog.LiveRefCount(w.ctx, desc.Hash); count != 2 {
+		t.Errorf("live refs = %d, want 2", count)
+	}
+
+	// Carol may not, and gets the same not-found a stranger always gets.
+	linkErr := pgx.BeginFunc(w.ctx, w.pool, func(tx pgx.Tx) error {
+		_, e := w.catalog.LinkRef(w.ctx, tx, carol, desc.Hash, capture(carol, "entry-9"))
+		return e
+	})
+	if !errors.Is(linkErr, blob.ErrNotFound) {
+		t.Errorf("LinkRef for a stranger = %v, want ErrNotFound", linkErr)
+	}
+}
+
+// A caller cannot improve its own view of bytes by re-describing them under a
+// new source kind.
+func TestLinkRefCannotRaiseTrust(t *testing.T) {
+	t.Parallel()
+
+	w := newCatalogWorld(t)
+	bob := w.person("bob")
+
+	desc := w.publish([]byte("fetched from the web"), blob.RefSpec{
+		Cred: bob, SourceKind: blob.SourceScreenshot, SourceID: "browse-1", Trust: trust.Untrusted,
+	}, originalClass)
+
+	err := pgx.BeginFunc(w.ctx, w.pool, func(tx pgx.Tx) error {
+		_, linkErr := w.catalog.LinkRef(w.ctx, tx, bob, desc.Hash, blob.RefSpec{
+			Cred: bob, SourceKind: blob.SourceCollection, SourceID: "entry-3", Trust: trust.Trusted,
+		})
+		return linkErr
+	})
+	if err != nil {
+		t.Fatalf("LinkRef: %v", err)
+	}
+
+	if _, level, err := w.catalog.Resolve(w.ctx, bob, desc.Hash); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	} else if level != trust.Untrusted {
+		t.Errorf("trust = %q after linking under a new source kind, want untrusted", level)
+	}
 }

@@ -138,6 +138,29 @@ func isNoSuchContainer(output string) bool {
 		strings.Contains(lowered, "no container with name")
 }
 
+// reservedEnvKeys are set by the launcher and refused from a spec.
+//
+// The isolation depends on several of them. HOME must stay on the tmpfs so an
+// injected credential cannot outlive the run; the proxy variables are how a
+// NetworkProxied run reaches anything at all; the socket path is the daemon's
+// API. A spec is caller-controlled today, but the caller will be the workflow
+// engine composing runs from definitions, and credentials arrive through
+// spec.Env by design ... which makes that map attacker-adjacent.
+var reservedEnvKeys = map[string]bool{
+	"HOME":                    true,
+	"NPM_CONFIG_CACHE":        true,
+	"HIVE_SANDBOX_RUN_ID":     true,
+	"HIVE_SANDBOX_MODEL":      true,
+	"HIVE_SANDBOX_SESSION_ID": true,
+	"HIVE_SANDBOX_API_SOCKET": true,
+	"HTTP_PROXY":              true,
+	"HTTPS_PROXY":             true,
+	"http_proxy":              true,
+	"https_proxy":             true,
+	"NO_PROXY":                true,
+	"no_proxy":                true,
+}
+
 // PodmanRunArgs builds the argument list for one run.
 //
 // Exported and pure so the isolation properties can be asserted in a unit test
@@ -238,6 +261,15 @@ func PodmanRunArgs(spec RunSpec, extra []string) ([]string, error) {
 	for key := range spec.Env {
 		if key == "" || strings.ContainsAny(key, "=\x00") {
 			return nil, fmt.Errorf("spec: invalid env key %q", key)
+		}
+		// Podman takes the LAST --env for a key, so a spec key colliding with
+		// one the launcher sets would win. HOME is the one that matters:
+		// `HOME=/workspace` aims a credential that is supposed to die with the
+		// run's tmpfs at the one directory that outlives it. Refuse rather than
+		// reorder, so a caller learns its variable was ignored instead of
+		// silently losing it.
+		if reservedEnvKeys[key] {
+			return nil, fmt.Errorf("spec: %q is set by the launcher and cannot be overridden", key)
 		}
 		envKeys = append(envKeys, key)
 	}

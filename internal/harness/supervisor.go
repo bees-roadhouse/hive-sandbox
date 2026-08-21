@@ -180,8 +180,11 @@ func (s *Supervisor) Run(ctx context.Context, spec RunSpec, onEvent EventFunc) (
 	_ = stderrW.Close()
 
 	d := &drainer{
-		sup:     s,
-		ctx:     ctx,
+		sup: s,
+		// runCtx, not the caller's ctx: a Store.AppendEvent on a wedged
+		// connection has to be bounded by the run's own deadline, or it hangs
+		// the drain with no caller mistake involved.
+		ctx:     runCtx,
 		runID:   spec.RunID,
 		onEvent: onEvent,
 	}
@@ -207,12 +210,29 @@ func (s *Supervisor) Run(ctx context.Context, spec RunSpec, onEvent EventFunc) (
 
 	// The process is gone, but a grandchild may still hold the write end. Give
 	// the readers the buffered data, then take the pipes away from them.
+	var drainStuck bool
 	select {
 	case <-drained:
 	case <-time.After(s.drainGrace()):
 		_ = stdoutR.Close()
 		_ = stderrR.Close()
-		<-drained
+
+		// Bounded, and this bound is load-bearing. Closing the read ends frees
+		// a reader blocked in Read; it does nothing for one blocked
+		// *downstream* of the read, in the caller's callback or in a wedged
+		// Store.AppendEvent. An unbounded wait here means Run never returns,
+		// which means the deferred Terminate never runs, which leaks the
+		// container, the proxy and the run's network ... the exact set this
+		// package exists to reclaim.
+		//
+		// So: give up on the readers and reclaim the containers. Two goroutines
+		// stay parked on the caller's callback, which is a real cost and a
+		// smaller one than an unkillable agent run.
+		select {
+		case <-drained:
+		case <-time.After(s.drainGrace()):
+			drainStuck = true
+		}
 	}
 	_ = stdoutR.Close()
 	_ = stderrR.Close()
@@ -225,9 +245,20 @@ func (s *Supervisor) Run(ctx context.Context, spec RunSpec, onEvent EventFunc) (
 	}
 	result.StderrTail = d.stderrTail()
 	result.ExitCode = exitCode(waitErr)
-	result.State = terminalState(ctx, runCtx, waitErr, d.err())
 
-	return s.finish(ctx, result, d.err())
+	drainErr := d.err()
+	if drainStuck && drainErr == nil {
+		drainErr = errors.New(
+			"harness: output drain did not finish; an event callback or the run store is blocked")
+	}
+	if drainStuck {
+		result.StderrTail = appendTail(result.StderrTail,
+			"\n[supervisor] output drain abandoned; two reader goroutines are parked",
+			s.maxStderrTailBytes())
+	}
+	result.State = terminalState(ctx, runCtx, waitErr, drainErr)
+
+	return s.finish(ctx, result, drainErr)
 }
 
 // finish records the terminal state and returns. Recording failures do not
@@ -291,6 +322,18 @@ type drainer struct {
 	runID   string
 	onEvent EventFunc
 
+	// deliver serializes the callback and the store write, so a caller never
+	// sees two events at once and Seq matches delivery order.
+	//
+	// Separate from mu, and the separation is the point. Holding one lock
+	// across both the bookkeeping and the caller's callback meant a callback
+	// that parked also blocked Run reading its own EventCount, so the
+	// supervisor wedged after it had already given up on the drain ... and its
+	// deferred Terminate never ran.
+	deliver sync.Mutex
+
+	// mu guards the small state below and is never held across a callback, a
+	// store write, or anything else that can block.
 	mu       sync.Mutex
 	seq      int
 	firstErr error
@@ -310,9 +353,11 @@ func (d *drainer) consume(r io.Reader, stream EventStream) {
 }
 
 func (d *drainer) emit(stream EventStream, line string, truncated bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	// Ordering first, so Seq and delivery agree.
+	d.deliver.Lock()
+	defer d.deliver.Unlock()
 
+	d.mu.Lock()
 	d.seq++
 	event := Event{
 		Seq:       d.seq,
@@ -321,38 +366,46 @@ func (d *drainer) emit(stream EventStream, line string, truncated bool) {
 		Text:      line,
 		Truncated: truncated,
 	}
+	d.mu.Unlock()
 
 	// Only stdout carries stream-json. Parsing stderr would turn a stack trace
 	// that happens to start with "{" into a protocol event.
+	var sessionID string
 	if stream == StreamStdout && !truncated {
 		if envelope, ok := parseStreamJSON(line); ok {
 			event.Type = envelope.Type
 			event.JSON = envelope.Raw
-			if envelope.SessionID != "" {
-				d.session = envelope.SessionID
-			}
+			sessionID = envelope.SessionID
 		}
 	}
 
+	// Bookkeeping under mu, briefly, and never across anything that can block.
+	d.mu.Lock()
+	if sessionID != "" {
+		d.session = sessionID
+	}
 	if stream == StreamStderr {
 		d.tail = appendTail(d.tail, line+"\n", d.sup.maxStderrTailBytes())
 	}
+	// Keep READING after the first failure. Stopping the read would fill the
+	// pipe at 64 KiB and block the child forever, which looks exactly like a
+	// hung agent. Only delivery stops.
+	alreadyFailed := d.firstErr != nil
+	d.mu.Unlock()
 
-	// Keep going after the first failure. Returning here would stop reading,
-	// the pipe would fill at 64 KiB, and the child would block forever on a
-	// write ... which looks exactly like a hung agent.
-	if d.firstErr != nil {
+	if alreadyFailed {
 		return
 	}
+
 	if d.sup.Store != nil {
 		if err := d.sup.Store.AppendEvent(d.ctx, d.runID, event); err != nil {
-			d.firstErr = fmt.Errorf("record event %d: %w", event.Seq, err)
+			d.fail(fmt.Errorf("record event %d: %w", event.Seq, err))
 			return
 		}
 	}
 	if d.onEvent != nil {
 		if err := d.onEvent(d.ctx, event); err != nil {
-			d.firstErr = fmt.Errorf("event %d: %w", event.Seq, err)
+			d.fail(fmt.Errorf("event %d: %w", event.Seq, err))
 		}
 	}
 }

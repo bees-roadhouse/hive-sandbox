@@ -244,11 +244,12 @@ func isPrivate(ip net.IP) bool {
 		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
 		return true
 	}
-	// IPv4-mapped IPv6 hides a private v4 address from the checks above on
-	// some paths; normalise and re-check.
-	if v4 := ip.To4(); v4 != nil && !ip.Equal(v4) {
-		return isPrivate(v4)
-	}
+	// No IPv4-mapped re-check here, deliberately. It looks necessary and is
+	// dead code: net.IP.Equal treats a 4-byte address and its 4-in-6 form as
+	// equal, and IsLoopback, IsPrivate and the link-local checks all normalise
+	// internally, so ::ffff:127.0.0.1 is already caught above. A re-check that
+	// cannot fire, with a comment claiming it is the guard, is worse than no
+	// comment at all.
 	// 100.64.0.0/10, carrier-grade NAT, also used by container runtimes.
 	if v4 := ip.To4(); v4 != nil && v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
 		return true

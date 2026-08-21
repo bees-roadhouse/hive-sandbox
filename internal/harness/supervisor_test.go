@@ -481,3 +481,64 @@ func contains(haystack, needle string) bool {
 			return false
 		})()
 }
+
+// Augie's finding 2, the fourth deadlock shape and the only one where the
+// SUPERVISOR cannot make progress rather than the child.
+//
+// A callback that parks holds the drainer's mutex, so the other drainer blocks
+// taking it and `drained` never closes. Closing the read ends frees a reader
+// stuck in Read and does nothing for one stuck downstream, so an unbounded wait
+// there means Run never returns ... and its deferred Terminate never runs, so
+// the container, the proxy and the run's network all survive.
+func TestRunReturnsWhenACallbackBlocksForever(t *testing.T) {
+	t.Parallel()
+
+	launcher := &helperLauncher{mode: "flood"}
+	sup := &harness.Supervisor{
+		Launcher:   launcher,
+		DrainGrace: 300 * time.Millisecond,
+	}
+
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+
+	var once sync.Once
+	onEvent := func(_ context.Context, _ harness.Event) error {
+		once.Do(func() { close(parked) })
+		<-release // never, until the test ends
+		return nil
+	}
+
+	spec := testSpec(t, "run-callback-parked")
+	spec.Deadline = 2 * time.Second
+
+	done := make(chan harness.Result, 1)
+	go func() {
+		res, _ := sup.Run(t.Context(), spec, onEvent)
+		done <- res
+	}()
+
+	select {
+	case <-parked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the callback never ran")
+	}
+
+	select {
+	case res := <-done:
+		// The run must be reported as failed, not quietly successful: nobody
+		// received most of its output.
+		if res.State == harness.StateSucceeded {
+			t.Errorf("state = %q, want a failure; the drain never finished", res.State)
+		}
+		// The whole point. A container that outlives an unkillable Run is the
+		// leak this package exists to prevent.
+		if launcher.terminated.Load() != 1 {
+			t.Errorf("Terminate ran %d times, want 1; the container would have leaked",
+				launcher.terminated.Load())
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned with a parked callback, so Terminate never ran")
+	}
+}

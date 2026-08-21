@@ -252,7 +252,7 @@ func (u *diskUpload) Seal(ctx context.Context) (Sealed, error) {
 	// report a dedup hit. The caller still writes a ref.
 	if existing, err := os.Stat(final); err == nil {
 		_ = os.Remove(tempName)
-		return Sealed{Hash: actual, Size: existing.Size(), Deduped: true}, nil
+		return NewSealed(actual, existing.Size(), true), nil
 	}
 
 	if err := os.Rename(tempName, final); err != nil {
@@ -260,13 +260,13 @@ func (u *diskUpload) Seal(ctx context.Context) (Sealed, error) {
 		// there now, which is the outcome we wanted.
 		if existing, statErr := os.Stat(final); statErr == nil {
 			_ = os.Remove(tempName)
-			return Sealed{Hash: actual, Size: existing.Size(), Deduped: true}, nil
+			return NewSealed(actual, existing.Size(), true), nil
 		}
 		_ = os.Remove(tempName)
 		return Sealed{}, fmt.Errorf("blob: publish %s: %w", actual, err)
 	}
 
-	return Sealed{Hash: actual, Size: u.written}, nil
+	return NewSealed(actual, u.written, false), nil
 }
 
 func (u *diskUpload) Abort(_ context.Context) error {

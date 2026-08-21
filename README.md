@@ -10,9 +10,11 @@ It replaces [`bees-roadhouse/hive`](https://github.com/bees-roadhouse/hive).
 
 ## Status
 
-Phase 0. The daemon boots, serves `/healthz`, and does nothing else yet. The
-design is complete through decision D18; see `CLAUDE.md` for where it lives and
-which invariants are load-bearing.
+Phase 0. The daemon boots and serves `/healthz`. `internal/wasmhost` runs guest
+apps on wazero behind the JSON ABI, with the data layer stubbed until
+`internal/store` lands. Everything else is still to come. The design is complete
+through decision D18; see `CLAUDE.md` for where it lives and which invariants
+are load-bearing.
 
 ## Shape
 
@@ -41,6 +43,29 @@ One process serves every role (D7). `-serve-api` and `-run-workflows` exist from
 day one so a heavy agent run can be split off from interactive traffic later
 without a code change.
 
+## Guest apps
+
+A guest is a WASI preview1 reactor that exports one `func() int32` per manifest
+function and moves JSON through the `hive_abi` host module. The SDK is `guest/`,
+the reference app is `apps/hello/`, and the contract is documented in
+`internal/wasmhost/doc.go`.
+
+Built modules are checked in under `internal/wasmhost/testdata/`, so the test
+suite runs without a wasm toolchain. Rebuild after changing a guest:
+
+```powershell
+.\scripts\build-guests.ps1
+```
+
+```bash
+./scripts/build-guests.sh          # needs tinygo 0.41.1 and binaryen's wasm-opt
+```
+
+Every flag in those scripts is load-bearing and `scripts/guest-build.md` says
+why. The short version: `-scheduler=none` is worth 24x per call, and WASI
+preview1 is forever, because wazero has no component-model support and the host
+rejects wasip2 imports at link time.
+
 ## Development
 
 ```powershell
@@ -63,6 +88,9 @@ cd test/e2e && npm install && npm run browsers && npm test
 
 Integration tests skip themselves when `HIVE_SANDBOX_TEST_DATABASE_URL` is
 unset, so the gate is green on a machine with no database.
+
+wazero numbers that shape the runtime config, and how they were measured, are in
+[`docs/wasmhost-benchmarks.md`](docs/wasmhost-benchmarks.md).
 
 Nothing becomes a red PR. Run the gate locally first and read its output rather
 than a piped exit code. Full setup is in

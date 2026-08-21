@@ -169,8 +169,20 @@ test/                  integration tests, including Playwright-driven HTTP/SSE
      somewhere else entirely.
   2. **It never executes.** Skip conditions no environment satisfies, or a job
      that builds none of what the test needs. Make the environment that promised
-     to run it *fail* on a skipped precondition rather than guessing.
+     to run it *fail* on a skipped precondition rather than guessing. The worst
+     version: **a platform skip added in the same commit as the code it guards
+     is not evidence, it is a blind spot with a comment on it.** Nobody has ever
+     watched that test run, not once. It usually gets in by copying a legitimate
+     skip already in the package without re-earning it.
   3. **Its fixture is too small to reach the failure.** The property is real and
      the assertion is honest, and `n = 12` against a batch limit of 500 means the
      interesting branch never runs. This one hides best, because the test is
      well written. Ask what size makes the loop take its other path.
+- **When arranging the condition changes the outcome, test the decision instead
+  of the mechanism.** Every attempt to stage "process finished, then context
+  cancelled" against a context-bound command kills the process instead ... Linux
+  signals it, Windows poisons `Wait`. The window cannot be arranged, so arranging
+  it proves nothing. The test that worked used a launcher whose command is not
+  context-bound, cancelled before the run started, and asserted the recorded
+  state: deterministic on every platform, no skip, and it fails against the old
+  code.

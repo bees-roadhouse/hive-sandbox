@@ -75,17 +75,25 @@ even if the tests pass.
     harness container runs `--network=none` with the socket bind-mounted, because
     on rootless Podman an `--internal` network has no gateway and cannot reach
     the host at all. Measured, not assumed.
-14. **A cache keyed on less than the policy is a bypass.** Anything reused across
-    calls ... a pool, a memo, a connection, a warm instance, a client-side file
-    ... must be keyed on every dimension the authorization depends on, or the
-    reuse skips the check that the first call passed. **This has happened four
-    times here**, in four subsystems that share no code: a memoization cache
-    without the principal, a warm guest instance without the capability set, a
-    client cache whose presence was read as permission, and an HTTP transport
-    pooling a connection opened under a loose egress rule for a later request
-    under a strict one. The last was found only by making the rule travel with
-    the dial ... reading the code did not reveal it. **When you cache, write down
-    what the key omits and why that is safe.**
+14. **A key that omits a dimension the thing depends on is a bypass.** This
+    started as a rule about caches and is really a rule about keys. Anything
+    reused or addressed across callers ... a pool, a memo, a connection, a warm
+    instance, a client-side file, **a derived name** ... must be keyed on every
+    dimension its correctness depends on, or the reuse skips the check the first
+    caller passed.
+
+    **Five times here**, in five subsystems that share no code: a memoization
+    cache without the principal, a warm guest instance without the capability
+    set, a client cache whose presence was read as permission, an HTTP transport
+    pooling a connection opened under a loose egress rule for a request under a
+    strict one, and a per-app schema **name** derived from the app alone when the
+    schema belongs to an *install* ... so two owners of the same app collided on
+    a unique index, and would have shared one schema and each other's documents
+    if that index had not existed.
+
+    The transport one was found only by making the rule travel with the dial; the
+    schema one only by building on it. Reading did not reveal either. **When you
+    key anything, write down what the key omits and why that is safe.**
 
 ## Born-green gate
 

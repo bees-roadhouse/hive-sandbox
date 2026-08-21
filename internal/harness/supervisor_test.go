@@ -618,26 +618,28 @@ func TestRunIDIsReleasedAfterTheRun(t *testing.T) {
 	}
 }
 
-// blockingStore holds the drain on one event, so a test can arrange the window
-// where the process has exited but the caller's context has since been
-// cancelled.
-type blockingStore struct {
-	blockOnSeq int
-	entered    chan struct{}
-	release    chan struct{}
-	once       sync.Once
+// detachedLauncher builds a command that is NOT bound to the context.
+//
+// Cancelling the caller's context therefore cannot kill the process, which is
+// the only way to construct the case under test: a run that finishes cleanly
+// while the caller's context is already cancelled. Every attempt to arrange
+// that with a context-bound command kills the process instead ... on Linux it
+// is signalled, on Windows Wait itself returns
+// `TerminateProcess: Access is denied` ... so arranging the window changes the
+// answer.
+type detachedLauncher struct {
+	mode       string
+	terminated atomic.Int32
 }
 
-func (b *blockingStore) CreateRun(context.Context, harness.RunRecord) error { return nil }
-func (b *blockingStore) FinishRun(context.Context, string, harness.Result) error {
-	return nil
+func (l *detachedLauncher) Command(_ context.Context, _ harness.RunSpec) (*exec.Cmd, error) {
+	cmd := exec.Command(os.Args[0]) //nolint:gosec // the test binary, re-executed as a helper
+	cmd.Env = append(os.Environ(), helperEnv+"="+l.mode)
+	return cmd, nil
 }
 
-func (b *blockingStore) AppendEvent(_ context.Context, _ string, ev harness.Event) error {
-	if ev.Seq == b.blockOnSeq {
-		b.once.Do(func() { close(b.entered) })
-		<-b.release
-	}
+func (l *detachedLauncher) Terminate(_ context.Context, _ harness.RunSpec) error {
+	l.terminated.Add(1)
 	return nil
 }
 
@@ -647,72 +649,35 @@ func (b *blockingStore) AppendEvent(_ context.Context, _ string, ev harness.Even
 //
 // That is a normal shape ... a caller cancels a group after its work finishes
 // ... and reporting a completed agent run as cancelled is worse than cosmetic:
-// an at-most-once step that reads cancelled may be retried, and the money was
-// already spent.
+// an at-most-once step (invariant 10) that reads cancelled may be retried, and
+// the money was already spent.
 func TestACleanExitIsNotReportedAsCancelled(t *testing.T) {
 	t.Parallel()
 
-	if runtime.GOOS == "windows" {
-		// Measured, not assumed: on Windows, cancelling a context after the
-		// process has already exited makes Wait return
-		// `exec: canceling Cmd: TerminateProcess: Access is denied`, and the
-		// recorded exit code becomes 1 rather than the real 0. So the window
-		// this test needs ... process finished, context cancelled after ...
-		// cannot be constructed here, because arranging it changes the answer.
-		//
-		// The fix it covers is platform-independent and CI runs Linux. What
-		// Windows gets instead is the reason the supervisor reads ProcessState
-		// rather than Wait's error at all.
-		t.Skip("cancelling after exit poisons Wait on Windows; the window is not constructible")
-	}
-
-	// The helper writes four lines and exits. Blocking the store on the last
-	// one holds the drain open past the process's death, which is the window
-	// where the caller's cancellation lands after the work is already done.
-	store := &blockingStore{
-		blockOnSeq: 4,
-		entered:    make(chan struct{}),
-		release:    make(chan struct{}),
-	}
-	sup := &harness.Supervisor{Launcher: &helperLauncher{mode: "clean"}, Store: store}
+	launcher := &detachedLauncher{mode: "clean"}
+	sup := &harness.Supervisor{Launcher: launcher}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Cancelled before the run even starts. The process is detached, so it runs
+	// to completion regardless ... which is precisely the state the old code
+	// misreported.
+	cancel()
 
-	done := make(chan harness.Result, 1)
-	go func() {
-		res, _ := sup.Run(ctx, testSpec(t, "run-clean-then-cancelled"), nil)
-		done <- res
-	}()
-
-	select {
-	case <-store.entered:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the drain never reached the last event")
+	res, err := sup.Run(ctx, testSpec(t, "run-clean-then-cancelled"), nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
 	}
 
-	// Let the process finish dying before cancelling. Without this the cancel
-	// races the exit and CommandContext kills a still-live process, which is a
-	// genuine cancellation and correctly reports one ... so the test would pass
-	// or fail on timing rather than on the behaviour under test.
-	time.Sleep(400 * time.Millisecond)
-
-	// The process has written everything and exited. Cancelling here is the
-	// caller tidying up after work that already finished.
-	cancel()
-	close(store.release)
-
-	select {
-	case res := <-done:
-		if res.State != harness.StateSucceeded {
-			t.Errorf("state = %q, want %q; the process exited 0 and the work was done",
-				res.State, harness.StateSucceeded)
-		}
-		if res.ExitCode != 0 {
-			t.Errorf("exit code = %d, want 0", res.ExitCode)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("Run never returned")
+	if res.State != harness.StateSucceeded {
+		t.Errorf("state = %q, want %q; the process exited 0 and the work was done",
+			res.State, harness.StateSucceeded)
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("exit code = %d, want 0", res.ExitCode)
+	}
+	// Cleanup still runs, cancelled context or not.
+	if launcher.terminated.Load() != 1 {
+		t.Errorf("Terminate ran %d times, want 1", launcher.terminated.Load())
 	}
 }
 

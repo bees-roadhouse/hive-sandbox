@@ -63,6 +63,7 @@ lives.
 | `example.com:8443` | that host, on that port only |
 | `*.example.com` | subdomains, **not** `example.com` itself |
 | `192.0.2.10` | an address literal |
+| `private:printer.home.example.com` | that host, and **this rule alone** may resolve to a non-public address |
 
 Absence is deny. `NetworkProxied` with an empty `EgressAllow` is an **error**,
 not a permissive default ... wanting no egress at all is `NetworkNone`, and
@@ -88,8 +89,25 @@ controls the DNS answer controls the destination. So the proxy resolves once and
 checking a name and then dialling it again leaves a window where the second
 lookup returns something else.
 
-`EgressAllowPrivate` exists because LAN targets are a real need (tools.md's local
-browser driver). It is a deliberate widening and off by default.
+**The permission to reach a private address is per rule**, not per allowlist.
+That matters: one flag for the whole list meant allowing a single LAN printer
+widened the guard for every other entry, so a run that legitimately needed one
+private host also got permission to follow `api.example.com` to
+`169.254.169.254`.
+
+So `private:` marks the one entry that may point inside the network, and every
+other rule keeps the guard. **An address literal that is itself private is its
+own opt-in** ... writing `192.168.1.50` in an allowlist and having it silently
+never match was the other half of the same bug, and an entry that looks
+effective while doing nothing is the worst kind of configuration.
+
+`EgressAllowPrivate` on the spec still widens the whole list, for a deployment
+that genuinely wants that. It is now the exception rather than the mechanism.
+
+One consequence worth knowing: the proxy builds a transport **per request**
+bound to the matching rule, with keep-alives off. A shared pool would let a
+later request under a stricter rule reuse a connection opened under a looser
+one, which is the address check being skipped by the connection pool.
 
 ## 403 versus 502
 

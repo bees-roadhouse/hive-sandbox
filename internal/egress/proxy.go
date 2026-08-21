@@ -66,9 +66,6 @@ type Proxy struct {
 	builtResolver Resolver
 
 	DialTimeout time.Duration
-
-	transportOnce sync.Once
-	transport     *http.Transport
 }
 
 func (p *Proxy) logger() *slog.Logger {
@@ -244,7 +241,8 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !p.Allow.Permits(host, port) {
+	rule, allowed := p.Allow.Match(host, port)
+	if !allowed {
 		p.deny(w, r, host, port, "host not on the run's allowlist")
 		return
 	}
@@ -257,7 +255,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	// Dial before hijacking: once the connection is hijacked there is no
 	// ResponseWriter left to report a failure through.
-	upstream, err := p.dial(r.Context(), host, port)
+	upstream, err := p.dial(r.Context(), rule, host, port)
 	if err != nil {
 		p.reject(w, r, host, port, err)
 		return
@@ -301,7 +299,8 @@ func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
 		p.deny(w, r, r.URL.Host, 0, "malformed target")
 		return
 	}
-	if !p.Allow.Permits(host, port) {
+	rule, allowed := p.Allow.Match(host, port)
+	if !allowed {
 		p.deny(w, r, host, port, "host not on the run's allowlist")
 		return
 	}
@@ -315,7 +314,7 @@ func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
 		outbound.Header.Del(h)
 	}
 
-	resp, err := p.roundTripper().RoundTrip(outbound)
+	resp, err := p.roundTripperFor(rule).RoundTrip(outbound)
 	if err != nil {
 		p.reject(w, r, host, port, err)
 		return
@@ -334,24 +333,26 @@ func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func (p *Proxy) roundTripper() *http.Transport {
-	p.transportOnce.Do(func() {
-		p.transport = &http.Transport{
-			// Every dial goes through the guard, so a redirect or a connection
-			// reuse cannot reach an address the allowlist would refuse.
-			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
-				host, port, err := splitHostPort(addr, 80)
-				if err != nil {
-					return nil, err
-				}
-				return p.dial(ctx, host, port)
-			},
-			ResponseHeaderTimeout: DefaultResponseTimeout,
-			MaxIdleConns:          32,
-			IdleConnTimeout:       90 * time.Second,
-		}
-	})
-	return p.transport
+// roundTripperFor builds a transport whose dialer is bound to one rule.
+//
+// Per request rather than cached, deliberately. A shared transport would pool
+// connections across rules, so a later request under a stricter rule could
+// reuse a connection opened under a looser one ... which is the address check
+// being skipped by the connection pool.
+func (p *Proxy) roundTripperFor(rule Rule) *http.Transport {
+	return &http.Transport{
+		// Every dial goes through the guard, so a redirect cannot reach an
+		// address the rule would refuse.
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			host, port, err := splitHostPort(addr, 80)
+			if err != nil {
+				return nil, err
+			}
+			return p.dial(ctx, rule, host, port)
+		},
+		ResponseHeaderTimeout: DefaultResponseTimeout,
+		DisableKeepAlives:     true,
+	}
 }
 
 // dial resolves a host and connects to an address the allowlist permits.
@@ -361,7 +362,7 @@ func (p *Proxy) roundTripper() *http.Transport {
 // it again leaves a window where the second lookup returns something else, which
 // is exactly how a rebinding attack turns an allowlisted host into a request
 // against the loopback interface.
-func (p *Proxy) dial(ctx context.Context, host string, port int) (net.Conn, error) {
+func (p *Proxy) dial(ctx context.Context, rule Rule, host string, port int) (net.Conn, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, p.dialTimeout())
 	defer cancel()
 
@@ -384,7 +385,7 @@ func (p *Proxy) dial(ctx context.Context, host string, port int) (net.Conn, erro
 	dialer := net.Dialer{Timeout: p.dialTimeout()}
 	var lastErr error
 	for _, ip := range candidates {
-		if err := p.Allow.PermitsAddr(ip); err != nil {
+		if err := p.Allow.PermitsAddr(rule, ip); err != nil {
 			lastErr = err
 			continue
 		}

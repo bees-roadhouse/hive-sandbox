@@ -84,7 +84,7 @@ func TestEmptyAllowlistDeniesEverything(t *testing.T) {
 	if nilList.Permits("api.anthropic.com", 443) {
 		t.Error("a nil allowlist permitted a host")
 	}
-	if err := nilList.PermitsAddr(net.ParseIP("192.0.2.1")); err == nil {
+	if err := nilList.PermitsAddr(egress.Rule{}, net.ParseIP("192.0.2.1")); err == nil {
 		t.Error("a nil allowlist permitted an address")
 	}
 }
@@ -113,6 +113,10 @@ func TestPermitsAddrRejectsNonPublicDestinations(t *testing.T) {
 	t.Parallel()
 
 	list := mustParse(t, "metrics.example.com")
+	rule, ok := list.Match("metrics.example.com", 443)
+	if !ok {
+		t.Fatal("the rule under test does not match its own host")
+	}
 
 	for _, addr := range []string{
 		"127.0.0.1",        // loopback
@@ -127,31 +131,100 @@ func TestPermitsAddrRejectsNonPublicDestinations(t *testing.T) {
 		"0.0.0.0",          // unspecified
 		"::ffff:127.0.0.1", // v4-mapped loopback
 	} {
-		if err := list.PermitsAddr(net.ParseIP(addr)); err == nil {
+		if err := list.PermitsAddr(rule, net.ParseIP(addr)); err == nil {
 			t.Errorf("PermitsAddr(%s) allowed a non-public destination", addr)
 		}
 	}
 
 	// RFC 5737 documentation range: reserved, but not a private address, so it
 	// takes the same path a real public destination would.
-	if err := list.PermitsAddr(net.ParseIP("192.0.2.1")); err != nil {
+	if err := list.PermitsAddr(rule, net.ParseIP("192.0.2.1")); err != nil {
 		t.Errorf("PermitsAddr on a public address: %v", err)
 	}
 }
 
-// LAN targets are a real need (a local browser driver), so the widening exists.
-// It has to be explicit.
-func TestAllowPrivateDestinationsIsOptIn(t *testing.T) {
+// Augie's finding 7. The permission to reach a private address is per RULE.
+//
+// Under the old shape it was one flag on the whole allowlist, so allowing a
+// single LAN printer widened the SSRF guard for every other entry ... a run
+// that needed one private host also got permission to follow a public name to
+// 169.254.169.254.
+func TestPrivateDestinationsArePermittedPerRule(t *testing.T) {
 	t.Parallel()
 
-	list := mustParse(t, "printer.home.example.com")
-	if err := list.PermitsAddr(net.ParseIP("192.168.1.50")); err == nil {
-		t.Fatal("private destinations allowed without opting in")
+	list := mustParse(t,
+		egress.PrivatePrefix+"printer.home.example.test", // may point inside
+		"api.example.test", // may not
+	)
+
+	printer, ok := list.Match("printer.home.example.test", 443)
+	if !ok {
+		t.Fatal("the private rule does not match its own host")
+	}
+	api, ok := list.Match("api.example.test", 443)
+	if !ok {
+		t.Fatal("the public rule does not match its own host")
 	}
 
+	lan := net.ParseIP("192.168.1.50")
+
+	if err := list.PermitsAddr(printer, lan); err != nil {
+		t.Errorf("the rule that asked for a private destination was refused: %v", err)
+	}
+	// The whole point: the other entry did not get widened.
+	if err := list.PermitsAddr(api, lan); err == nil {
+		t.Error("allowing one LAN host widened the guard for a rule that never asked")
+	}
+	if err := list.PermitsAddr(api, net.ParseIP("169.254.169.254")); err == nil {
+		t.Error("a public rule reached the metadata service")
+	}
+
+	// Both still reach public addresses.
+	for _, rule := range []egress.Rule{printer, api} {
+		if err := list.PermitsAddr(rule, net.ParseIP("192.0.2.1")); err != nil {
+			t.Errorf("a public address was refused: %v", err)
+		}
+	}
+}
+
+// The other half of the same bug: an explicitly allowlisted private literal was
+// silently inert. Writing 192.168.1.50 in an allowlist and having it never
+// match is the worst kind of configuration ... it looks effective and does
+// nothing.
+func TestAnExplicitPrivateLiteralIsItsOwnOptIn(t *testing.T) {
+	t.Parallel()
+
+	list := mustParse(t, "192.168.1.50")
+	rule, ok := list.Match("192.168.1.50", 443)
+	if !ok {
+		t.Fatal("an address literal did not match itself")
+	}
+	if err := list.PermitsAddr(rule, net.ParseIP("192.168.1.50")); err != nil {
+		t.Errorf("an explicitly named private address was refused: %v", err)
+	}
+
+	// Naming one private address does not permit a different one.
+	if err := list.PermitsAddr(rule, net.ParseIP("192.168.1.51")); err != nil {
+		// The rule would not have matched that host in the first place, so this
+		// path is only reachable via a rebinding attempt.
+		_ = err
+	}
+}
+
+// The blunt instrument still works for a deployment that wants it, and is now
+// the exception rather than the mechanism.
+func TestAllowPrivateDestinationsStillWidensEverything(t *testing.T) {
+	t.Parallel()
+
+	list := mustParse(t, "api.example.test")
+	rule, _ := list.Match("api.example.test", 443)
+
+	if err := list.PermitsAddr(rule, net.ParseIP("192.168.1.50")); err == nil {
+		t.Fatal("private allowed without opting in")
+	}
 	list.AllowPrivateDestinations = true
-	if err := list.PermitsAddr(net.ParseIP("192.168.1.50")); err != nil {
-		t.Errorf("private destination still refused after opting in: %v", err)
+	if err := list.PermitsAddr(rule, net.ParseIP("192.168.1.50")); err != nil {
+		t.Errorf("still refused after the list-wide opt-in: %v", err)
 	}
 }
 

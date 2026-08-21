@@ -53,6 +53,10 @@ type CallResult struct {
 	// instruction position has no excuse (invariant 9).
 	Trust trust.Level
 
+	// TaintedBy names the operation that first made this invocation untrusted,
+	// or is empty if nothing did. Diagnostic only.
+	TaintedBy string
+
 	// Warm reports whether the instance came from the pool. Useful in tests and
 	// worth a metric later; instantiation latency is the number it explains.
 	Warm bool
@@ -345,14 +349,14 @@ func (h *Host) invoke(ctx context.Context, inst *instance, req CallRequest) (Cal
 				cause = err
 			}
 			// A real termination: wazero's checks fired and the module closed.
-			return CallResult{Trust: st.taint}, terminated(exitErr.ExitCode(), true, cause)
+			return CallResult{Trust: st.taint, TaintedBy: st.taintedBy}, terminated(exitErr.ExitCode(), true, cause)
 		}
 		if ctxErr := callCtx.Err(); ctxErr != nil {
 			// The deadline passed and the guest came back on its own, usually
 			// out of a context-honoring host function. Nothing was terminated.
-			return CallResult{Trust: st.taint}, terminated(0, false, ctxErr)
+			return CallResult{Trust: st.taint, TaintedBy: st.taintedBy}, terminated(0, false, ctxErr)
 		}
-		return CallResult{Trust: st.taint}, &TrapError{App: req.Module.App, Function: req.Function, Cause: err}
+		return CallResult{Trust: st.taint, TaintedBy: st.taintedBy}, &TrapError{App: req.Module.App, Function: req.Function, Cause: err}
 	}
 
 	// A guest can also come back "successfully" after its deadline: it was
@@ -361,7 +365,7 @@ func (h *Host) invoke(ctx context.Context, inst *instance, req CallRequest) (Cal
 	// error's clothes, and reporting it as the app's fault would be a lie.
 	if ctxErr := callCtx.Err(); ctxErr != nil {
 		inst.dead = true
-		return CallResult{Trust: st.taint}, terminated(0, false, ctxErr)
+		return CallResult{Trust: st.taint, TaintedBy: st.taintedBy}, terminated(0, false, ctxErr)
 	}
 
 	if len(results) != 1 {
@@ -385,7 +389,7 @@ func (h *Host) invoke(ctx context.Context, inst *instance, req CallRequest) (Cal
 	}
 
 	if code := api.DecodeI32(results[0]); code != 0 {
-		return CallResult{Trust: st.taint}, &GuestError{
+		return CallResult{Trust: st.taint, TaintedBy: st.taintedBy}, &GuestError{
 			App: req.Module.App, Function: req.Function, Code: code, Message: st.errMsg,
 		}
 	}
@@ -394,7 +398,7 @@ func (h *Host) invoke(ctx context.Context, inst *instance, req CallRequest) (Cal
 	// succeed. The SDK checks this too, but every AI-written guest is a copy of
 	// those SDK lines, so the host does not depend on any of them.
 	if st.outputRejected != StatusOK {
-		return CallResult{Trust: st.taint}, &GuestError{
+		return CallResult{Trust: st.taint, TaintedBy: st.taintedBy}, &GuestError{
 			App: req.Module.App, Function: req.Function, Code: int32(st.outputRejected),
 			Message: fmt.Sprintf("guest reported success but the host refused its result (%s); "+
 				"the limit is %d bytes", st.outputRejected, h.cfg.MaxOutputBytes),
@@ -404,5 +408,5 @@ func (h *Host) invoke(ctx context.Context, inst *instance, req CallRequest) (Cal
 	// The taint at the END of the invocation, not the beginning. A guest that
 	// read untrusted data mid-call returns untrusted output whatever it thinks
 	// it produced, which is the whole of D22.2 in one assignment.
-	return CallResult{Output: st.output, Trust: st.taint}, nil
+	return CallResult{Output: st.output, Trust: st.taint, TaintedBy: st.taintedBy}, nil
 }

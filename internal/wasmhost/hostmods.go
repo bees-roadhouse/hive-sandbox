@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 
 	"github.com/bees-roadhouse/hive-sandbox/internal/trust"
 
@@ -53,10 +54,11 @@ type depFunc func(ctx context.Context, st *callState, req Request) (Response, er
 // instances would mean a wazero.Runtime per app, which fragments the compiled
 // module cache and the instance pool per app for no gain.
 func buildCapabilityModules(ctx context.Context, rt wazero.Runtime) error {
-	domains := []struct {
+	type domain struct {
 		module string
 		verbs  map[string]depFunc
-	}{
+	}
+	domains := []domain{
 		{hostModuleStorage, map[string]depFunc{
 			"insert": func(c context.Context, st *callState, r Request) (Response, error) {
 				return st.deps.Storage.Insert(c, r)
@@ -112,8 +114,11 @@ func buildCapabilityModules(ctx context.Context, rt wazero.Runtime) error {
 		b := rt.NewHostModuleBuilder(d.module)
 		raises := d.module == hostModuleSanitize
 		for name, fn := range d.verbs {
+			// The op name is baked in per verb so a tainted invocation can say
+			// which call tainted it without threading a label through the ABI.
+			op := strings.TrimPrefix(d.module, "hive_") + "." + name
 			b.NewFunctionBuilder().
-				WithGoModuleFunction(capabilityFunc(fn, raises), i32x2, i64).
+				WithGoModuleFunction(capabilityFunc(fn, raises, op), i32x2, i64).
 				WithParameterNames("ptr", "len").Export(name)
 		}
 		if _, err := b.Instantiate(ctx); err != nil {
@@ -152,7 +157,7 @@ type envelope struct {
 // raisesTrust is true only for sanitize, which is the one verb allowed to move
 // taint back up, and only because reaching it at all required a granted
 // capability and an audit row (D22.3).
-func capabilityFunc(fn depFunc, raisesTrust bool) api.GoModuleFunc {
+func capabilityFunc(fn depFunc, raisesTrust bool, op string) api.GoModuleFunc {
 	return func(hostCtx context.Context, mod api.Module, stack []uint64) {
 		fail := func(status Status, msg string) {
 			st := stateFrom(hostCtx)
@@ -166,7 +171,7 @@ func capabilityFunc(fn depFunc, raisesTrust bool) api.GoModuleFunc {
 				// content across the boundary unmarked. Failures are rare and
 				// the cost is one cold instantiation, so this is the cheap side
 				// of the trade.
-				st.taint = trust.Untrusted
+				st.weaken(trust.Untrusted, op+" failed")
 			}
 			stack[0] = packResult(status, trust.Untrusted, len(msg))
 		}
@@ -188,10 +193,11 @@ func capabilityFunc(fn depFunc, raisesTrust bool) api.GoModuleFunc {
 		}
 
 		resp, err := fn(hostCtx, st, Request{
-			Caller: st.caller,
-			App:    st.module.App,
-			Body:   json.RawMessage(body),
-			Trust:  st.taint,
+			Caller:    st.caller,
+			App:       st.module.App,
+			Body:      json.RawMessage(body),
+			Trust:     st.taint,
+			TaintedBy: st.taintedBy,
 		})
 		if err == nil && hostCtx.Err() != nil {
 			err = hostCtx.Err()
@@ -209,8 +215,9 @@ func capabilityFunc(fn depFunc, raisesTrust bool) api.GoModuleFunc {
 			// manifest declared `sanitize` and whose Sanitizer authorised and
 			// audited the call.
 			st.taint = level
+			st.taintedBy = ""
 		} else {
-			st.taint = trust.Weaker(st.taint, level)
+			st.weaken(level, op)
 			// What the guest is told matches what the host recorded. Reporting
 			// the response's own trust while tainting the invocation with
 			// something weaker would give the guest a more optimistic view than

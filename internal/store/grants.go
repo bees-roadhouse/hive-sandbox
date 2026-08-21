@@ -32,7 +32,11 @@ type (
 	// authority they acted under.
 	Credential = identity.Credential
 
-	// Owner is the principal a row belongs to.
+	// Owner is the principal a row belongs to. Ownership is per-row and it is
+	// what keeps an org admin out of a member's personal entries (D18.2).
+	//
+	// It is NOT an input to any access check. The predicate resolves ownership
+	// itself; see Guard.
 	Owner = identity.Owner
 )
 
@@ -110,19 +114,6 @@ func (s Subject) name() any {
 	return s.Name
 }
 
-<<<<<<< HEAD
-// Owner is the principal a row belongs to. Ownership is per-row and it is what
-// keeps an org admin out of a member's personal entries (D18.2).
-//
-// It is NOT an input to any access check. The predicate resolves ownership
-// itself; see Guard.
-type Owner struct {
-	Kind PrincipalKind
-	ID   uuid.UUID
-}
-
-=======
->>>>>>> 50d94dc (feat(wasmhost): trust in the ABI, plus four fixes from Augie's review)
 // Guard answers "may this actor do this" and is the only thing in the platform
 // allowed to. It holds no policy of its own: every decision comes from
 // access_decision(), the SQL function migration one installs.

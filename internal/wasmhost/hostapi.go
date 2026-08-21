@@ -219,7 +219,25 @@ type Request struct {
 	// any row this request writes must be recorded as. It is not a hint. A data
 	// layer that writes 'trusted' when this says Untrusted breaks invariant 9
 	// at the last possible moment, after every other layer got it right.
+	//
+	// The reverse rule matters just as much and is easier to get wrong: on a
+	// READ, the trust of the Response is a property of the row or ref actually
+	// read, and must never be computed, defaulted, or inherited from this
+	// field. "The caller asked for trusted data, so return Trusted" reads as
+	// reasonable and is a laundering machine.
 	Trust trust.Level
+
+	// TaintedBy names the operation that first weakened this invocation's
+	// taint, or is empty if nothing did.
+	//
+	// Purely diagnostic, and it exists because coarse taint produces bug
+	// reports rather than errors: a journal entry the user typed themselves
+	// lands untrusted because something earlier in the same call read a web
+	// page, and without this the row says only that it is untrusted. Worth
+	// storing alongside the trust column so the answer to "why did this lose
+	// egress" is in the row rather than in a log somebody has to still have.
+	// Nothing may branch on it.
+	TaintedBy string
 }
 
 // Response is what a capability verb returns, and it is a struct rather than a

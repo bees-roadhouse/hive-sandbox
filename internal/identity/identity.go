@@ -33,13 +33,28 @@ func (k PrincipalKind) Valid() bool {
 // Credential is the pair D17.4 makes non-negotiable: who acted, and whose
 // authority they acted under. "Nate did this" and "an AI acting for Nate did
 // this" must be distinguishable on every request (invariant 2), so both travel
-// together everywhere and the grant predicate re-checks that they agree.
+// together everywhere.
 //
-// Nothing derives one half from the other. An actor row does record its
-// principal, but resolving it at each layer would give every layer its own
-// answer, and the layer that got it wrong would be the enforcement point.
+// **The two ids are not interchangeable and swapping them is the mistake this
+// comment exists to prevent.** ActorID is the identity that authored the
+// request and may be an AI. PrincipalID is the user or org whose authority is
+// being spent and never is. They are frequently equal (a person acting as
+// themselves) and that is exactly what makes a transposition survive testing.
+//
+// The grant predicate re-derives the actor's principal and denies if the pair
+// disagrees, so a struct filled in wrong yields a denial rather than a wrong
+// answer. That is a backstop, not a licence: it turns a silent authorization
+// bug into a visible failure, and it cannot help at all in the case where the
+// two ids happen to match.
+//
+// Nothing derives one half from the other at any layer. An actor row does
+// record its principal, but resolving it per layer would give every layer its
+// own answer, and the layer that got it wrong would be the enforcement point.
 type Credential struct {
-	ActorID       uuid.UUID
+	// ActorID is who authored the request. May be an AI.
+	ActorID uuid.UUID
+	// PrincipalKind and PrincipalID are whose authority is being spent. Never
+	// an AI (D13.4).
 	PrincipalKind PrincipalKind
 	PrincipalID   uuid.UUID
 }

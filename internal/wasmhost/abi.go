@@ -79,12 +79,36 @@ type callState struct {
 	// the capability can reach it.
 	taint trust.Level
 
+	// taintedBy names the operation that first weakened the taint.
+	//
+	// Coarse taint means a write can land untrusted because of a read it had
+	// nothing to do with, which is the safe direction and also the direction
+	// that produces "this entry mysteriously lost its egress" bug reports. One
+	// string turns that into "untrusted because storage.query returned
+	// untrusted content earlier in this call". It is diagnosis, never policy:
+	// nothing reads it to make a decision.
+	taintedBy string
+
 	// outputRejected records that the guest tried to set a result and the host
 	// refused it. StatusOK means either no attempt or a successful one.
 	outputRejected Status
 
 	maxInput  int
 	maxOutput int
+}
+
+// weaken folds a level into the invocation's taint, monotonically, and records
+// what did it the first time it actually drops.
+//
+// The first cause is the useful one: it is the read that brought untrusted
+// content into the call, and everything after is a consequence. Overwriting it
+// with each later op would name the last domino instead of the first.
+func (st *callState) weaken(level trust.Level, cause string) {
+	next := trust.Weaker(st.taint, level)
+	if next != st.taint && st.taintedBy == "" {
+		st.taintedBy = cause
+	}
+	st.taint = next
 }
 
 type callStateKey struct{}

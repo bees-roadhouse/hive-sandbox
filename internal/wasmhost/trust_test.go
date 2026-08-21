@@ -187,6 +187,41 @@ func TestGuestSeesTheTrustTheHostRecorded(t *testing.T) {
 	})
 }
 
+// TestTaintIsAttributed. Coarse taint means a write lands untrusted because of
+// a read it had nothing to do with, which is the safe direction and also the
+// direction that produces "why did this entry lose its egress" rather than an
+// error. The row has to be able to answer that.
+func TestTaintIsAttributed(t *testing.T) {
+	store := &recordingStorage{readTrust: trust.Untrusted}
+	h := newTestHost(t, Config{}, Deps{Storage: store})
+	wasm, _ := hello(t)
+
+	res, err := h.Call(t.Context(), CallRequest{
+		Module: trustModule(t), Source: BytesSource(wasm),
+		Function: "launder", Caller: testCaller(),
+	})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.TaintedBy != "storage.query" {
+		t.Errorf("TaintedBy = %q, want the read that actually tainted the call", res.TaintedBy)
+	}
+
+	// A clean call names nothing, or the field would be noise on every row.
+	clean := &recordingStorage{readTrust: trust.Trusted}
+	h2 := newTestHost(t, Config{}, Deps{Storage: clean})
+	res2, err := h2.Call(t.Context(), CallRequest{
+		Module: trustModule(t), Source: BytesSource(wasm),
+		Function: "launder", Caller: testCaller(),
+	})
+	if err != nil {
+		t.Fatalf("clean call: %v", err)
+	}
+	if res2.TaintedBy != "" {
+		t.Errorf("TaintedBy = %q on a trusted call, want empty", res2.TaintedBy)
+	}
+}
+
 // TestSanitizeNeedsTheCapability. A guest that did not declare `sanitize` must
 // not be able to link it, so the refusal happens before anything runs.
 func TestSanitizeNeedsTheCapability(t *testing.T) {

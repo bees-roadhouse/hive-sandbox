@@ -2,7 +2,18 @@
 #
 # The flags are not incidental. Read scripts/guest-build.md before changing one.
 $ErrorActionPreference = "Stop"
-$env:Path = "C:\Program Files\Go\bin;G:\tools\tinygo\bin;G:\tools\binaryen\bin;" + $env:Path
+# Prepend the usual install locations, but only ones that actually exist, so the
+# script works on a machine laid out differently and does not hard-code anybody's
+# drive letters. Set TINYGO_BIN or WASMOPT_BIN to point somewhere else.
+$candidates = @(
+    "C:\Program Files\Go\bin",
+    $env:TINYGO_BIN,
+    $env:WASMOPT_BIN,
+    "$env:LOCALAPPDATA\tinygo\bin",
+    "G:\tools\tinygo\bin",
+    "G:\tools\binaryen\bin"
+) | Where-Object { $_ -and (Test-Path $_) }
+if ($candidates) { $env:Path = ($candidates -join ";") + ";" + $env:Path }
 Set-Location (Split-Path $PSScriptRoot -Parent)
 
 if (-not (Get-Command tinygo -ErrorAction SilentlyContinue)) {

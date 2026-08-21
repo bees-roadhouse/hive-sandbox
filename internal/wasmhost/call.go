@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bees-roadhouse/hive-sandbox/internal/trust"
+
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/sys"
@@ -33,11 +35,28 @@ type CallRequest struct {
 	Caller Caller
 	// Timeout overrides Config.CallTimeout for this call.
 	Timeout time.Duration
+
+	// Trust seeds the invocation's taint. A workflow feeding a guest the output
+	// of a `browse` step passes Untrusted here, and everything the guest writes
+	// during the call inherits it (invariant 12). The zero value normalizes to
+	// Trusted, matching the schema's DEFAULT.
+	Trust trust.Level
 }
 
 // CallResult is what the guest produced.
 type CallResult struct {
 	Output []byte
+
+	// Trust is the invocation's taint when the call finished, and it applies to
+	// Output regardless of what the guest believes. If the guest read anything
+	// untrusted, this is Untrusted, so a caller that puts Output into
+	// instruction position has no excuse (invariant 9).
+	Trust trust.Level
+
+	// TaintedBy names the operation that first made this invocation untrusted,
+	// or is empty if nothing did. Diagnostic only.
+	TaintedBy string
+
 	// Warm reports whether the instance came from the pool. Useful in tests and
 	// worth a metric later; instantiation latency is the number it explains.
 	Warm bool
@@ -59,17 +78,60 @@ func (e *GuestError) Error() string {
 	return fmt.Sprintf("guest %s.%s: %s", e.App, e.Function, e.Message)
 }
 
-// TerminatedError is the host killing a guest: a deadline, a cancellation, or
-// an explicit close. The instance is dead, never paused, and never reused.
+// TerminatedError is a call that did not finish inside its deadline. The
+// instance is dead either way, never paused, and never reused.
+//
+// Enforced is the field that matters and it exists because the type used to lie.
+// True means wazero's termination checks fired and the module was closed, so
+// the deadline was actually imposed. False means the deadline passed and the
+// guest came back on its own afterwards, which is a call that OVERRAN rather
+// than one that was stopped, and Elapsed says by how much.
+//
+// Reporting both as "terminated (exit 100)" asserted an enforcement that had
+// not happened, and made a three-second overrun on a 200 ms deadline look like
+// a deadline working correctly. Anything reading these for latency needs the
+// distinction, and so does anyone debugging a hang.
 type TerminatedError struct {
 	App      string
 	Function string
 	ExitCode uint32
+	Enforced bool
+	Deadline time.Duration
+	Elapsed  time.Duration
 	Cause    error
 }
 
+// LateBy is how far past the deadline the call actually ran. Zero when the
+// deadline held.
+//
+// It is not always zero for an Enforced termination, and that is the subtle
+// case worth naming: termination checks live in guest code, so if the guest is
+// inside a host function when the deadline fires, the close does not take
+// effect until it comes back. The termination is real and it is also late, and
+// how late is the only number that reveals a host function ignoring its
+// context (invariant 7).
+func (e *TerminatedError) LateBy() time.Duration {
+	if e.Deadline <= 0 || e.Elapsed <= e.Deadline {
+		return 0
+	}
+	return e.Elapsed - e.Deadline
+}
+
 func (e *TerminatedError) Error() string {
-	return fmt.Sprintf("guest %s.%s terminated (exit %d): %v", e.App, e.Function, e.ExitCode, e.Cause)
+	switch {
+	case !e.Enforced:
+		return fmt.Sprintf("guest %s.%s overran its %s deadline and returned on its own after %s "+
+			"(not terminated): %v",
+			e.App, e.Function, e.Deadline, e.Elapsed.Round(time.Millisecond), e.Cause)
+	case e.LateBy() > e.Deadline/4:
+		return fmt.Sprintf("guest %s.%s terminated after %s, %s past its %s deadline "+
+			"(exit %d, the close could not land until the guest returned from a host call): %v",
+			e.App, e.Function, e.Elapsed.Round(time.Millisecond),
+			e.LateBy().Round(time.Millisecond), e.Deadline, e.ExitCode, e.Cause)
+	default:
+		return fmt.Sprintf("guest %s.%s terminated after %s (deadline %s, exit %d): %v",
+			e.App, e.Function, e.Elapsed.Round(time.Millisecond), e.Deadline, e.ExitCode, e.Cause)
+	}
 }
 
 func (e *TerminatedError) Unwrap() error { return e.Cause }
@@ -106,6 +168,13 @@ func (h *Host) Call(ctx context.Context, req CallRequest) (CallResult, error) {
 		return CallResult{}, fmt.Errorf("call: input is %d bytes, limit is %d", len(req.Input), h.cfg.MaxInputBytes)
 	}
 
+	if req.Module.Residency == ResidencyPinned {
+		// A pinned instance outlives a single call by construction, so it
+		// cannot be borrowed and returned inside one. AcquirePinned is the door.
+		return CallResult{}, fmt.Errorf(
+			"app %s: pinned residency: use AcquirePinned rather than Call", req.Module.App)
+	}
+
 	t, err := h.tierFor(ctx, req.Module)
 	if err != nil {
 		return CallResult{}, err
@@ -116,7 +185,29 @@ func (h *Host) Call(ctx context.Context, req CallRequest) (CallResult, error) {
 		return CallResult{}, err
 	}
 
-	key := instanceKey{moduleHash: req.Module.Hash, principal: req.Caller.OwnerPrincipal, tier: t.key}
+	// Unconditionally, on every call, warm or cold. This used to run only
+	// inside instantiate, which meant a pool hit skipped it entirely and a
+	// revoked capability kept working for as long as the instance stayed warm.
+	if verr := t.modules.verify(compiled, req.Module.Hash, req.Module.Capabilities); verr != nil {
+		return CallResult{}, fmt.Errorf("app %s (%s): %w", req.Module.App, req.Module.Version, verr)
+	}
+
+	// The limiter bounds LIVE instances, which the pool does not: a pooled
+	// instance is still a live instance while a call holds it, and a cold call
+	// makes a new one. Held across the whole call, released after the instance
+	// goes back.
+	lease, err := h.cfg.Limiter.Acquire(ctx, req.Caller.Credential, req.Module)
+	if err != nil {
+		return CallResult{}, err
+	}
+	defer lease.Release()
+
+	key := instanceKey{
+		moduleHash: req.Module.Hash,
+		principal:  req.Caller.PrincipalID,
+		tier:       t.key,
+		caps:       req.Module.Capabilities.bits(),
+	}
 	inst := h.pool.acquire(key)
 	warm := inst != nil
 	if inst == nil {
@@ -186,6 +277,7 @@ func (h *Host) invoke(ctx context.Context, inst *instance, req CallRequest) (Cal
 		deps:      h.deps,
 		log:       h.cfg.Logger,
 		input:     req.Input,
+		taint:     req.Trust.Normalize(),
 		maxInput:  h.cfg.MaxInputBytes,
 		maxOutput: h.cfg.MaxOutputBytes,
 	}
@@ -202,36 +294,51 @@ func (h *Host) invoke(ctx context.Context, inst *instance, req CallRequest) (Cal
 	// back into the pool, so a watchdog still running after its own call
 	// returned would close somebody else's live instance. A benchmark found
 	// exactly that, because `defer cancel()` fires the context the watchdog is
-	// waiting on: the goroutine has to be joined, not just signalled.
+	// waiting on: it has to be joined, not just signalled.
+	//
+	// context.AfterFunc rather than a goroutine per call. The goroutine version
+	// cost ~2.3 us and 7 allocations on EVERY call, which was 92% of what the
+	// benchmark was attributing to wazero's termination checks (those are 206
+	// ns). AfterFunc registers a callback and spawns nothing unless the deadline
+	// actually fires, which for the overwhelming majority of calls is never.
 	if inst.key.tier.terminate {
-		stop := make(chan struct{})
-		watching := make(chan struct{})
-		go func() {
-			defer close(watching)
-			select {
-			case <-callCtx.Done():
-			case <-stop:
-				return
-			}
-			select {
-			case <-stop:
-				// The call came back on its own between the deadline and here.
-				return
-			default:
-			}
+		fired := make(chan struct{})
+		stop := context.AfterFunc(callCtx, func() {
+			defer close(fired)
 			// Detached context: the call's context is exactly what expired, so
 			// closing with it would fail immediately.
 			closeCtx, closeCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer closeCancel()
 			_ = inst.mod.CloseWithExitCode(closeCtx, exitCodeDeadline)
-		}()
+		})
 		defer func() {
-			close(stop)
-			<-watching
+			if !stop() {
+				// Already running. Join it, or the close could land on an
+				// instance that has gone back to the pool.
+				<-fired
+			}
 		}()
 	}
 
+	start := time.Now()
 	results, err := fn.Call(callCtx)
+	elapsed := time.Since(start)
+
+	// terminated builds the honest version of "this call did not finish".
+	//
+	// The previous version reported every overrun as `terminated (exit 100)`
+	// even when nothing had been terminated. Augie measured a 200 ms deadline
+	// returning after 3.06 s under that error, which asserts an enforcement
+	// that did not happen and quietly poisons every latency metric derived from
+	// it. Worse, it is exactly what would have hidden the poll_oneoff hang.
+	terminated := func(exitCode uint32, enforced bool, cause error) error {
+		return &TerminatedError{
+			App: req.Module.App, Function: req.Function,
+			ExitCode: exitCode, Enforced: enforced,
+			Deadline: timeout, Elapsed: elapsed, Cause: cause,
+		}
+	}
+
 	if err != nil {
 		inst.dead = true
 
@@ -241,31 +348,24 @@ func (h *Host) invoke(ctx context.Context, inst *instance, req CallRequest) (Cal
 			if cause == nil {
 				cause = err
 			}
-			return CallResult{}, &TerminatedError{
-				App: req.Module.App, Function: req.Function,
-				ExitCode: exitErr.ExitCode(), Cause: cause,
-			}
+			// A real termination: wazero's checks fired and the module closed.
+			return CallResult{Trust: st.taint, TaintedBy: st.taintedBy}, terminated(exitErr.ExitCode(), true, cause)
 		}
 		if ctxErr := callCtx.Err(); ctxErr != nil {
-			// Reached when termination is off: the guest came back on its own
-			// (usually out of a context-honoring host function) after the
-			// deadline passed.
-			return CallResult{}, &TerminatedError{
-				App: req.Module.App, Function: req.Function, ExitCode: 0, Cause: ctxErr,
-			}
+			// The deadline passed and the guest came back on its own, usually
+			// out of a context-honoring host function. Nothing was terminated.
+			return CallResult{Trust: st.taint, TaintedBy: st.taintedBy}, terminated(0, false, ctxErr)
 		}
-		return CallResult{}, &TrapError{App: req.Module.App, Function: req.Function, Cause: err}
+		return CallResult{Trust: st.taint, TaintedBy: st.taintedBy}, &TrapError{App: req.Module.App, Function: req.Function, Cause: err}
 	}
 
 	// A guest can also come back "successfully" after its deadline: it was
 	// parked inside a context-honoring host function, got StatusCanceled, and
-	// returned an ordinary guest error. That is a terminated call wearing a
-	// guest error's clothes, and reporting it as the app's fault would be a lie.
+	// returned an ordinary guest error. That is an overrun wearing a guest
+	// error's clothes, and reporting it as the app's fault would be a lie.
 	if ctxErr := callCtx.Err(); ctxErr != nil {
 		inst.dead = true
-		return CallResult{}, &TerminatedError{
-			App: req.Module.App, Function: req.Function, ExitCode: 0, Cause: ctxErr,
-		}
+		return CallResult{Trust: st.taint, TaintedBy: st.taintedBy}, terminated(0, false, ctxErr)
 	}
 
 	if len(results) != 1 {
@@ -276,10 +376,37 @@ func (h *Host) invoke(ctx context.Context, inst *instance, req CallRequest) (Cal
 
 	// DecodeI32 rather than a cast: a wasm i32 arrives zero-extended in a
 	// uint64, so a guest returning -1 is 0xffffffff here.
+	// An instance that touched untrusted bytes never goes back in the pool.
+	//
+	// Taint is per-invocation, but guest MEMORY is not: whatever the guest
+	// parsed, buffered or left in a global is still sitting in linear memory
+	// when the next call borrows it. Within one principal that means a call
+	// handling untrusted content shares an instance with one handling trusted
+	// content. Costs one cold instantiation (83 us), and it fails in the right
+	// direction ... forgetting to taint leaks, forgetting to destroy does not.
+	if st.taint.Normalize() == trust.Untrusted {
+		inst.dead = true
+	}
+
 	if code := api.DecodeI32(results[0]); code != 0 {
-		return CallResult{}, &GuestError{
+		return CallResult{Trust: st.taint, TaintedBy: st.taintedBy}, &GuestError{
 			App: req.Module.App, Function: req.Function, Code: code, Message: st.errMsg,
 		}
 	}
-	return CallResult{Output: st.output}, nil
+
+	// A guest that returned success after the host refused its result did not
+	// succeed. The SDK checks this too, but every AI-written guest is a copy of
+	// those SDK lines, so the host does not depend on any of them.
+	if st.outputRejected != StatusOK {
+		return CallResult{Trust: st.taint, TaintedBy: st.taintedBy}, &GuestError{
+			App: req.Module.App, Function: req.Function, Code: int32(st.outputRejected),
+			Message: fmt.Sprintf("guest reported success but the host refused its result (%s); "+
+				"the limit is %d bytes", st.outputRejected, h.cfg.MaxOutputBytes),
+		}
+	}
+
+	// The taint at the END of the invocation, not the beginning. A guest that
+	// read untrusted data mid-call returns untrusted output whatever it thinks
+	// it produced, which is the whole of D22.2 in one assignment.
+	return CallResult{Output: st.output, Trust: st.taint, TaintedBy: st.taintedBy}, nil
 }

@@ -79,6 +79,20 @@ short calls. Size and speed point the same way, so leave it alone.
   spells out every capability verb instead of routing them through one helper.
   It is the better shape anyway: the linker drops the import for every verb the
   app does not call, so a guest links exactly the capabilities it uses.
+- **Check what `Output` returns.** A result over the host's size limit is
+  refused, and a guest that returns success anyway turns it into a silent empty
+  response. `guest.Handle` does this for you.
+- **Trust is not yours to set.** Every capability response is a
+  `guest.Response{Trust, Data}`, and the host tracks the invocation's taint
+  independently: read anything untrusted and everything you write afterwards is
+  recorded untrusted, whatever you claim. `guest.InputTrust()` exists so an app
+  can refuse before putting text into instruction position, not so it can
+  argue. Raising trust needs the `sanitize` capability, a grant, and an audit
+  row.
+- **No `time.Sleep`, and it will not compile past the host's link check.**
+  `poll_oneoff` is not on the WASI allowlist because nothing in the host can
+  interrupt it. A guest that needs to wait is a workflow step that needs a
+  timer.
 
 ## Toolchain
 

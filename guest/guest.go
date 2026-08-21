@@ -18,6 +18,7 @@
 package guest
 
 import (
+	"encoding/json"
 	"errors"
 	"runtime"
 	"unsafe"
@@ -39,7 +40,10 @@ func abiVersion() int32
 func inputSize() int32
 
 //go:wasmimport hive_abi input_read
-func inputRead(ptr unsafe.Pointer)
+func inputRead(ptr unsafe.Pointer, size int32) int32
+
+//go:wasmimport hive_abi input_trust
+func inputTrust() int32
 
 //go:wasmimport hive_abi output_write
 func outputWrite(ptr unsafe.Pointer, size int32) int32
@@ -47,11 +51,8 @@ func outputWrite(ptr unsafe.Pointer, size int32) int32
 //go:wasmimport hive_abi error_write
 func errorWrite(ptr unsafe.Pointer, size int32) int32
 
-//go:wasmimport hive_abi result_size
-func resultSize() int32
-
 //go:wasmimport hive_abi result_read
-func resultRead(ptr unsafe.Pointer)
+func resultRead(ptr unsafe.Pointer, size int32) int32
 
 // ABIVersion is the host's ABI revision. Check it in an init if an app cares.
 func ABIVersion() int32 { return abiVersion() }
@@ -63,18 +64,42 @@ func Input() []byte {
 		return nil
 	}
 	buf := make([]byte, n)
-	inputRead(unsafe.Pointer(&buf[0]))
+	got := inputRead(unsafe.Pointer(&buf[0]), n)
 	runtime.KeepAlive(buf)
-	return buf
+	if got < 0 || got > n {
+		return nil
+	}
+	return buf[:got]
 }
 
-// Output sets this call's JSON result. The last call wins.
-func Output(b []byte) {
-	if len(b) == 0 {
-		return
+// InputTrust reports whether this invocation's input is trusted.
+//
+// It is for a guest that wants to refuse: an app about to put text into
+// instruction position should look first. It is NOT how trust is enforced. The
+// host tracks taint whatever the guest does, so ignoring this cannot launder
+// anything ... it only means the app made a decision blind.
+func InputTrust() Trust {
+	if inputTrust() == int32(Untrusted) {
+		return Untrusted
 	}
-	outputWrite(unsafe.Pointer(&b[0]), int32(len(b)))
+	return Trusted
+}
+
+// Output sets this call's JSON result and reports whether the host took it.
+// The last successful call wins.
+//
+// Check the status. A result over the host's size limit is refused, and a guest
+// that returns success anyway turns an oversized response into a silent empty
+// one. Handle does this for you; if you are writing an export by hand, do not
+// drop it. (The host also refuses to report success behind your back, but the
+// error a guest raises itself is a far better one than the host's.)
+func Output(b []byte) Status {
+	if len(b) == 0 {
+		return StatusOK
+	}
+	s := Status(outputWrite(unsafe.Pointer(&b[0]), int32(len(b))))
 	runtime.KeepAlive(b)
+	return s
 }
 
 // Fail records an error message for this call. Handle does this for you.
@@ -90,13 +115,21 @@ func Fail(msg string) {
 // Handle is the body of every exported guest function: read the input, run the
 // app's code, hand back either output or an error, return the status the host
 // expects.
+//
+// These twelve lines are the ones every AI-written guest will copy, so they
+// check everything they can. In particular Output's status is not discarded:
+// dropping it turned a result over the host's size limit into a successful
+// empty response, which is the worst shape a failure can take.
 func Handle(fn func(input []byte) ([]byte, error)) int32 {
 	out, err := fn(Input())
 	if err != nil {
 		Fail(err.Error())
 		return 1
 	}
-	Output(out)
+	if s := Output(out); s != StatusOK {
+		Fail("host refused the result: " + s.String())
+		return 1
+	}
 	return 0
 }
 
@@ -132,6 +165,27 @@ func Log(level int32, msg string) {
 // the app fail to load, so an app links only what it declared.
 // ---------------------------------------------------------------------------
 
+// Trust is where content came from.
+//
+// A guest cannot set it, cannot clear it, and cannot avoid receiving it: every
+// capability response carries one, and the host tracks the invocation's taint
+// independently of anything the guest does with it. Reading untrusted data
+// means everything this invocation writes is recorded untrusted, whether or not
+// the guest ever looks at this value.
+type Trust int32
+
+const (
+	Trusted   Trust = 0
+	Untrusted Trust = 1
+)
+
+func (t Trust) String() string {
+	if t == Untrusted {
+		return "untrusted"
+	}
+	return "trusted"
+}
+
 // Status is what a capability call returns.
 type Status int32
 
@@ -166,6 +220,16 @@ func (s Status) String() string {
 	}
 }
 
+// Response is what a capability call returns.
+//
+// Trust and Data arrive together and there is no way to obtain one without the
+// other, which is the point (D22.1). A guest that wants the bytes has the
+// provenance in the same value.
+type Response struct {
+	Trust Trust
+	Data  []byte
+}
+
 // HostError is a failed capability call. Status carries the reason; Message is
 // the host's text.
 type HostError struct {
@@ -185,37 +249,37 @@ func Denied(err error) bool {
 }
 
 //go:wasmimport hive_storage insert
-func storageInsert(ptr unsafe.Pointer, size int32) int32
+func storageInsert(ptr unsafe.Pointer, size int32) uint64
 
 //go:wasmimport hive_storage get
-func storageGet(ptr unsafe.Pointer, size int32) int32
+func storageGet(ptr unsafe.Pointer, size int32) uint64
 
 //go:wasmimport hive_storage update
-func storageUpdate(ptr unsafe.Pointer, size int32) int32
+func storageUpdate(ptr unsafe.Pointer, size int32) uint64
 
 //go:wasmimport hive_storage delete
-func storageDelete(ptr unsafe.Pointer, size int32) int32
+func storageDelete(ptr unsafe.Pointer, size int32) uint64
 
 //go:wasmimport hive_storage query
-func storageQuery(ptr unsafe.Pointer, size int32) int32
+func storageQuery(ptr unsafe.Pointer, size int32) uint64
 
 //go:wasmimport hive_kv get
-func kvGet(ptr unsafe.Pointer, size int32) int32
+func kvGet(ptr unsafe.Pointer, size int32) uint64
 
 //go:wasmimport hive_kv set
-func kvSet(ptr unsafe.Pointer, size int32) int32
+func kvSet(ptr unsafe.Pointer, size int32) uint64
 
 //go:wasmimport hive_kv delete
-func kvDelete(ptr unsafe.Pointer, size int32) int32
+func kvDelete(ptr unsafe.Pointer, size int32) uint64
 
 //go:wasmimport hive_blob read
-func blobRead(ptr unsafe.Pointer, size int32) int32
+func blobRead(ptr unsafe.Pointer, size int32) uint64
 
 //go:wasmimport hive_blob append
-func blobAppend(ptr unsafe.Pointer, size int32) int32
+func blobAppend(ptr unsafe.Pointer, size int32) uint64
 
 //go:wasmimport hive_events emit
-func eventsEmit(ptr unsafe.Pointer, size int32) int32
+func eventsEmit(ptr unsafe.Pointer, size int32) uint64
 
 // Each verb is spelled out rather than routed through one helper taking a
 // function value: a //go:wasmimport function cannot be used as a value. That
@@ -226,86 +290,104 @@ func eventsEmit(ptr unsafe.Pointer, size int32) int32
 // Storage verbs. One call is one transaction. The host resolves who is asking
 // from the credential, so a request body carries data and never identity.
 
-func StorageInsert(req []byte) ([]byte, error) {
+func StorageInsert(req []byte) (Response, error) {
 	req = orEmpty(req)
-	s := Status(storageInsert(unsafe.Pointer(&req[0]), int32(len(req))))
+	packed := storageInsert(unsafe.Pointer(&req[0]), int32(len(req)))
 	runtime.KeepAlive(req)
-	return finish("storage.insert", s)
+	return finish("storage.insert", packed)
 }
 
-func StorageGet(req []byte) ([]byte, error) {
+func StorageGet(req []byte) (Response, error) {
 	req = orEmpty(req)
-	s := Status(storageGet(unsafe.Pointer(&req[0]), int32(len(req))))
+	packed := storageGet(unsafe.Pointer(&req[0]), int32(len(req)))
 	runtime.KeepAlive(req)
-	return finish("storage.get", s)
+	return finish("storage.get", packed)
 }
 
-func StorageUpdate(req []byte) ([]byte, error) {
+func StorageUpdate(req []byte) (Response, error) {
 	req = orEmpty(req)
-	s := Status(storageUpdate(unsafe.Pointer(&req[0]), int32(len(req))))
+	packed := storageUpdate(unsafe.Pointer(&req[0]), int32(len(req)))
 	runtime.KeepAlive(req)
-	return finish("storage.update", s)
+	return finish("storage.update", packed)
 }
 
-func StorageDelete(req []byte) ([]byte, error) {
+func StorageDelete(req []byte) (Response, error) {
 	req = orEmpty(req)
-	s := Status(storageDelete(unsafe.Pointer(&req[0]), int32(len(req))))
+	packed := storageDelete(unsafe.Pointer(&req[0]), int32(len(req)))
 	runtime.KeepAlive(req)
-	return finish("storage.delete", s)
+	return finish("storage.delete", packed)
 }
 
-func StorageQuery(req []byte) ([]byte, error) {
+func StorageQuery(req []byte) (Response, error) {
 	req = orEmpty(req)
-	s := Status(storageQuery(unsafe.Pointer(&req[0]), int32(len(req))))
+	packed := storageQuery(unsafe.Pointer(&req[0]), int32(len(req)))
 	runtime.KeepAlive(req)
-	return finish("storage.query", s)
+	return finish("storage.query", packed)
 }
 
 // KV is a per-install best-effort cache: TTL'd, flushable, never truth.
 
-func KVGet(req []byte) ([]byte, error) {
+func KVGet(req []byte) (Response, error) {
 	req = orEmpty(req)
-	s := Status(kvGet(unsafe.Pointer(&req[0]), int32(len(req))))
+	packed := kvGet(unsafe.Pointer(&req[0]), int32(len(req)))
 	runtime.KeepAlive(req)
-	return finish("kv.get", s)
+	return finish("kv.get", packed)
 }
 
-func KVSet(req []byte) ([]byte, error) {
+func KVSet(req []byte) (Response, error) {
 	req = orEmpty(req)
-	s := Status(kvSet(unsafe.Pointer(&req[0]), int32(len(req))))
+	packed := kvSet(unsafe.Pointer(&req[0]), int32(len(req)))
 	runtime.KeepAlive(req)
-	return finish("kv.set", s)
+	return finish("kv.set", packed)
 }
 
-func KVDelete(req []byte) ([]byte, error) {
+func KVDelete(req []byte) (Response, error) {
 	req = orEmpty(req)
-	s := Status(kvDelete(unsafe.Pointer(&req[0]), int32(len(req))))
+	packed := kvDelete(unsafe.Pointer(&req[0]), int32(len(req)))
 	runtime.KeepAlive(req)
-	return finish("kv.delete", s)
+	return finish("kv.delete", packed)
 }
 
 // Blob is windowed access to content-addressed bytes.
 
-func BlobRead(req []byte) ([]byte, error) {
+func BlobRead(req []byte) (Response, error) {
 	req = orEmpty(req)
-	s := Status(blobRead(unsafe.Pointer(&req[0]), int32(len(req))))
+	packed := blobRead(unsafe.Pointer(&req[0]), int32(len(req)))
 	runtime.KeepAlive(req)
-	return finish("blob.read", s)
+	return finish("blob.read", packed)
 }
 
-func BlobAppend(req []byte) ([]byte, error) {
+func BlobAppend(req []byte) (Response, error) {
 	req = orEmpty(req)
-	s := Status(blobAppend(unsafe.Pointer(&req[0]), int32(len(req))))
+	packed := blobAppend(unsafe.Pointer(&req[0]), int32(len(req)))
 	runtime.KeepAlive(req)
-	return finish("blob.append", s)
+	return finish("blob.append", packed)
 }
 
 // EventsEmit appends to the platform event log.
-func EventsEmit(req []byte) ([]byte, error) {
+func EventsEmit(req []byte) (Response, error) {
 	req = orEmpty(req)
-	s := Status(eventsEmit(unsafe.Pointer(&req[0]), int32(len(req))))
+	packed := eventsEmit(unsafe.Pointer(&req[0]), int32(len(req)))
 	runtime.KeepAlive(req)
-	return finish("events.emit", s)
+	return finish("events.emit", packed)
+}
+
+//go:wasmimport hive_sanitize sanitize
+func hostSanitize(ptr unsafe.Pointer, size int32) uint64
+
+// Sanitize is the only path from untrusted to trusted, and the only thing that
+// can clear this invocation's taint.
+//
+// It is not a function most apps should link. Declaring `sanitize` in a
+// manifest requires a grant, every call writes an audit row, and the host
+// resolves both rather than believing anything the guest says. If you are
+// reaching for this to make a warning go away, the answer is no: the taint is
+// telling the truth about where your data came from.
+func Sanitize(req []byte) (Response, error) {
+	req = orEmpty(req)
+	packed := hostSanitize(unsafe.Pointer(&req[0]), int32(len(req)))
+	runtime.KeepAlive(req)
+	return finish("sanitize", packed)
 }
 
 func orEmpty(req []byte) []byte {
@@ -315,23 +397,64 @@ func orEmpty(req []byte) []byte {
 	return req
 }
 
-// finish reads the result slot straight away, because the next host call
-// overwrites it.
-func finish(op string, status Status) ([]byte, error) {
-	body := readResult()
-	if status != StatusOK {
-		return nil, &HostError{Op: op, Status: status, Message: string(body)}
+// Layout of the i64 a capability call returns:
+//
+//	bits  0..31  size of the response, in bytes
+//	bits 32..39  trust: 0 trusted, 1 untrusted
+//	bits 40..47  status
+//
+// The size comes back WITH the status, which is the fix for ABI v1's worst
+// footgun. Asking the host how big the last result was, in a separate call,
+// against a slot the next host call overwrites, failed silently the moment two
+// calls got reordered.
+const (
+	statusShift = 40
+	trustShift  = 32
+	sizeMask    = uint64(1)<<32 - 1
+	byteMask    = uint64(0xff)
+)
+
+// finish unpacks the header and reads the envelope straight away, because the
+// next host call overwrites the slot.
+func finish(op string, packed uint64) (Response, error) {
+	status := Status(uint8(packed >> statusShift & byteMask))
+	level := Trusted
+	if packed>>trustShift&byteMask == uint64(Untrusted) {
+		level = Untrusted
 	}
-	return body, nil
+	size := int32(packed & sizeMask)
+
+	body := readResult(size)
+	if status != StatusOK {
+		// A failure carries the host's message as plain text, not an envelope.
+		return Response{Trust: Untrusted}, &HostError{Op: op, Status: status, Message: string(body)}
+	}
+
+	var env struct {
+		Trust string          `json:"trust"`
+		Data  json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return Response{Trust: Untrusted}, &HostError{
+			Op: op, Status: StatusError, Message: "malformed response envelope: " + err.Error(),
+		}
+	}
+	// The header wins over the envelope field. Both come from the host and
+	// agree, but the header cannot be reshaped by anything downstream, and when
+	// two sources of a security property disagree the less malleable one is the
+	// right answer.
+	return Response{Trust: level, Data: env.Data}, nil
 }
 
-func readResult() []byte {
-	n := resultSize()
-	if n <= 0 {
+func readResult(size int32) []byte {
+	if size <= 0 {
 		return nil
 	}
-	buf := make([]byte, n)
-	resultRead(unsafe.Pointer(&buf[0]))
+	buf := make([]byte, size)
+	got := resultRead(unsafe.Pointer(&buf[0]), size)
 	runtime.KeepAlive(buf)
-	return buf
+	if got < 0 || got > size {
+		return nil
+	}
+	return buf[:got]
 }

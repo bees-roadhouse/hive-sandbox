@@ -13,6 +13,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/bees-roadhouse/hive-sandbox/internal/identity"
 )
 
 // helloWasm is the reference guest, built by scripts/build-guests.{ps1,sh}.
@@ -54,8 +58,28 @@ func helloModule(t *testing.T, caps ...Capability) Module {
 	}
 }
 
+// Fixed ids rather than fresh ones per call, so the pool key is stable across a
+// test and "was this warm" means what it looks like.
+var (
+	actorPia     = uuid.MustParse("11111111-1111-4111-8111-111111111111")
+	principNate  = uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	principMagg  = uuid.MustParse("33333333-3333-4333-8333-333333333333")
+	installHello = uuid.MustParse("44444444-4444-4444-8444-444444444444")
+)
+
 func testCaller() Caller {
-	return Caller{AuthorActor: "actor:pia", OwnerPrincipal: "user:nate", InstallID: "install:1"}
+	return testCallerFor(principNate)
+}
+
+func testCallerFor(principal uuid.UUID) Caller {
+	return Caller{
+		Credential: identity.Credential{
+			ActorID:       actorPia,
+			PrincipalKind: identity.PrincipalUser,
+			PrincipalID:   principal,
+		},
+		InstallID: installHello,
+	}
 }
 
 func quietLogger() *slog.Logger {
@@ -167,15 +191,36 @@ func TestConformanceGuestError(t *testing.T) {
 
 func TestConformanceMemoryCapIsGuestSideFailure(t *testing.T) {
 	forEachEngine(t, func(t *testing.T, cfg Config) {
-		cfg.MemoryTiers = []uint32{256}
+		// 24 pages, 1.5MB, not the 256-page default.
+		//
+		// The guest reaches its ceiling by allocating 1MB at a time, and the
+		// interpreter walks every one of those memory.grow calls at roughly 60x
+		// the compiler's cost. At 256 pages this one case took 30 seconds of CI
+		// and was most of the wasmhost package's 45 second runtime, which is how
+		// a gate stops getting run locally. The ceiling is not what is under
+		// test ... that memory.grow returning -1 is a GUEST-side allocation
+		// failure and not a host crash is, and 24 pages proves it in under a
+		// second. It has to stay above the ~2 pages a TinyGo reactor starts
+		// with, or the guest would fail before reaching the code being tested.
+		cfg.MemoryTiers = []uint32{24}
 		h := newTestHost(t, cfg, Deps{})
-		_, err := call(t, h, "grow", "")
+		mod := helloModule(t)
+		mod.MemoryPages = 24
+		wasm, _ := hello(t)
+		_, err := h.Call(t.Context(), CallRequest{
+			Module: mod, Source: BytesSource(wasm), Function: "grow", Caller: testCaller(),
+		})
 		if err == nil {
-			t.Fatal("grow past a 16MB ceiling returned no error")
+			t.Fatal("grow past the ceiling returned no error")
 		}
 		// Whatever shape it takes, the point is that the host is still alive
 		// and serving: the ceiling is an allocation failure inside the guest.
-		if _, err := call(t, h, "hello", `{"name":"after"}`); err != nil {
+		after := helloModule(t)
+		after.MemoryPages = 24
+		if _, err := h.Call(t.Context(), CallRequest{
+			Module: after, Source: BytesSource(wasm), Function: "hello",
+			Input: []byte(`{"name":"after"}`), Caller: testCaller(),
+		}); err != nil {
 			t.Fatalf("host did not survive a guest OOM: %v", err)
 		}
 	})
@@ -185,9 +230,9 @@ func TestConformanceStorageCapabilityRoundTrip(t *testing.T) {
 	forEachEngine(t, func(t *testing.T, cfg Config) {
 		var got Request
 		h := newTestHost(t, cfg, Deps{Storage: fakeStorage{
-			query: func(_ context.Context, req Request) (json.RawMessage, error) {
+			query: func(_ context.Context, req Request) (Response, error) {
 				got = req
-				return json.RawMessage(`{"rows":[{"id":"e1"}]}`), nil
+				return Trusted(json.RawMessage(`{"rows":[{"id":"e1"}]}`)), nil
 			},
 		}})
 
@@ -199,7 +244,7 @@ func TestConformanceStorageCapabilityRoundTrip(t *testing.T) {
 			t.Errorf("output = %s", res.Output)
 		}
 		// Identity is the host's, never the guest's (invariants 1 and 2).
-		if got.Caller.AuthorActor != "actor:pia" || got.Caller.OwnerPrincipal != "user:nate" {
+		if got.Caller.ActorID != actorPia || got.Caller.PrincipalID != principNate {
 			t.Errorf("caller = %+v, want the credential's pair", got.Caller)
 		}
 		if got.App != "hello" {
@@ -246,11 +291,11 @@ func TestHostFunctionHonorsContext(t *testing.T) {
 		var sawCancel atomic.Bool
 
 		h := newTestHost(t, cfg, Deps{Storage: fakeStorage{
-			query: func(ctx context.Context, _ Request) (json.RawMessage, error) {
+			query: func(ctx context.Context, _ Request) (Response, error) {
 				close(entered)
 				<-ctx.Done() // exactly what a well-behaved data layer does
 				sawCancel.Store(true)
-				return nil, ctx.Err()
+				return Response{}, ctx.Err()
 			},
 		}})
 
@@ -346,11 +391,11 @@ func TestPoolIsolatesByPrincipal(t *testing.T) {
 	h := newTestHost(t, Config{}, Deps{})
 	wasm, _ := hello(t)
 
-	callAs := func(principal PrincipalID) CallResult {
+	callAs := func(principal uuid.UUID) CallResult {
 		t.Helper()
 		res, err := h.Call(t.Context(), CallRequest{
 			Module: helloModule(t), Source: BytesSource(wasm),
-			Function: "hello", Caller: Caller{AuthorActor: "actor:pia", OwnerPrincipal: principal, InstallID: "i"},
+			Function: "hello", Caller: testCallerFor(principal),
 		})
 		if err != nil {
 			t.Fatalf("call as %s: %v", principal, err)
@@ -358,11 +403,11 @@ func TestPoolIsolatesByPrincipal(t *testing.T) {
 		return res
 	}
 
-	callAs("user:nate")
-	if res := callAs("user:maggie"); res.Warm {
+	callAs(principNate)
+	if res := callAs(principMagg); res.Warm {
 		t.Error("a second principal was handed the first principal's warm instance")
 	}
-	if res := callAs("user:nate"); !res.Warm {
+	if res := callAs(principNate); !res.Warm {
 		t.Error("the first principal lost its own warm instance")
 	}
 }
@@ -443,8 +488,9 @@ func TestCredentialMustPinBothHalves(t *testing.T) {
 		name   string
 		caller Caller
 	}{
-		{"no actor", Caller{OwnerPrincipal: "user:nate"}},
-		{"no principal", Caller{AuthorActor: "actor:pia"}},
+		{"no actor", Caller{Credential: identity.Credential{PrincipalKind: identity.PrincipalUser, PrincipalID: principNate}, InstallID: installHello}},
+		{"no principal", Caller{Credential: identity.Credential{ActorID: actorPia}, InstallID: installHello}},
+		{"no install", Caller{Credential: identity.Credential{ActorID: actorPia, PrincipalKind: identity.PrincipalUser, PrincipalID: principNate}}},
 		{"neither", Caller{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -562,26 +608,26 @@ func (s *countingSource) ModuleBytes(context.Context, string) ([]byte, error) {
 }
 
 type fakeStorage struct {
-	query func(context.Context, Request) (json.RawMessage, error)
+	query func(context.Context, Request) (Response, error)
 }
 
-func (f fakeStorage) Insert(ctx context.Context, _ Request) (json.RawMessage, error) {
+func (f fakeStorage) Insert(ctx context.Context, _ Request) (Response, error) {
 	return unimplemented(ctx, "storage.insert")
 }
 
-func (f fakeStorage) Get(ctx context.Context, _ Request) (json.RawMessage, error) {
+func (f fakeStorage) Get(ctx context.Context, _ Request) (Response, error) {
 	return unimplemented(ctx, "storage.get")
 }
 
-func (f fakeStorage) Update(ctx context.Context, _ Request) (json.RawMessage, error) {
+func (f fakeStorage) Update(ctx context.Context, _ Request) (Response, error) {
 	return unimplemented(ctx, "storage.update")
 }
 
-func (f fakeStorage) Delete(ctx context.Context, _ Request) (json.RawMessage, error) {
+func (f fakeStorage) Delete(ctx context.Context, _ Request) (Response, error) {
 	return unimplemented(ctx, "storage.delete")
 }
 
-func (f fakeStorage) Query(ctx context.Context, req Request) (json.RawMessage, error) {
+func (f fakeStorage) Query(ctx context.Context, req Request) (Response, error) {
 	if f.query == nil {
 		return unimplemented(ctx, "storage.query")
 	}

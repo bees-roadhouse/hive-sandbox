@@ -1,0 +1,8 @@
+# Normalize to LF in the repo. Shell scripts and CI workflows break on Linux if
+# they land with CRLF, and this box is Windows.
+* text=auto eol=lf
+
+*.ps1 text eol=crlf
+*.wasm binary
+*.png binary
+*.jpg binary

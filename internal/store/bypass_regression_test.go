@@ -28,29 +28,29 @@ import (
 // assert is that resolution is actually happening.
 func TestPredicateResolvesOwnershipItself(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
-	maggie := w.human("maggie")
-	house := w.org("house", nate)
-	w.member(house, maggie, "member", nate)
+	alice := w.human("alice")
+	bob := w.human("bob")
+	acme := w.org("acme", alice)
+	w.member(acme, bob, "member", alice)
 
-	houseOwner := store.Owner{Kind: store.PrincipalOrg, ID: house}
-	inst := w.install("shared", houseOwner, nate)
-	orgRow := store.Subject{Kind: store.SubjectEntity, ID: w.entity(inst, "entries", "o", houseOwner, nate)}
+	acmeOwner := store.Owner{Kind: store.PrincipalOrg, ID: acme}
+	inst := w.install("shared", acmeOwner, alice)
+	orgRow := store.Subject{Kind: store.SubjectEntity, ID: w.entity(inst, "entries", "o", acmeOwner, alice)}
 
 	g := w.s.Guard()
-	maggieCred := cred(maggie, store.PrincipalUser, maggie)
+	bobCred := cred(bob, store.PrincipalUser, bob)
 
 	// A plain member of the owning org, with no grant, on an org-owned row.
 	// The old signature let her claim the row was hers and get write.
 	for _, access := range []store.Access{store.AccessRead, store.AccessWrite} {
-		if r := reasonOf(w.ctx, t, g, maggieCred, orgRow, access); r != store.Deny {
+		if r := reasonOf(w.ctx, t, g, bobCred, orgRow, access); r != store.Deny {
 			t.Fatalf("%s on an org-owned row returned %q for a plain member", access, r)
 		}
 	}
 
 	// Ownership is real when it is real: an AI acting for the org reads owner.
-	orgAI := w.ai("house-assistant", "melli", store.PrincipalOrg, house, nate)
-	orgCred := cred(orgAI, store.PrincipalOrg, house)
+	orgAI := w.ai("acme-assistant", "nova", store.PrincipalOrg, acme, alice)
+	orgCred := cred(orgAI, store.PrincipalOrg, acme)
 	if r := reasonOf(w.ctx, t, g, orgCred, orgRow, store.AccessRead); r != store.ReasonOwner {
 		t.Fatalf("the owning principal got %q, want owner", r)
 	}
@@ -67,19 +67,19 @@ func TestPredicateResolvesOwnershipItself(t *testing.T) {
 
 func TestVisibleEntityIDsAuditsOverrides(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
-	house := w.org("house", nate)
-	houseOwner := store.Owner{Kind: store.PrincipalOrg, ID: house}
-	nateCred := cred(nate, store.PrincipalUser, nate)
+	alice := w.human("alice")
+	acme := w.org("acme", alice)
+	acmeOwner := store.Owner{Kind: store.PrincipalOrg, ID: acme}
+	aliceCred := cred(alice, store.PrincipalUser, alice)
 
-	inst := w.install("shared", houseOwner, nate)
-	entityID := w.entity(inst, "entries", "o", houseOwner, nate)
+	inst := w.install("shared", acmeOwner, alice)
+	entityID := w.entity(inst, "entries", "o", acmeOwner, alice)
 	row := store.Subject{Kind: store.SubjectEntity, ID: entityID}
 
 	g := w.s.Guard()
 
 	// Before break-glass the admin cannot see it at all.
-	ids, err := g.VisibleEntityIDs(w.ctx, nateCred, store.AccessRead, "", 100)
+	ids, err := g.VisibleEntityIDs(w.ctx, aliceCred, store.AccessRead, "", 100)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -87,11 +87,11 @@ func TestVisibleEntityIDsAuditsOverrides(t *testing.T) {
 		t.Fatalf("an admin listed %d org-owned rows with no grant", len(ids))
 	}
 
-	if _, bgErr := store.EnterBreakGlass(w.ctx, w.s.Pool(), row, nateCred, time.Hour, "incident"); bgErr != nil {
+	if _, bgErr := store.EnterBreakGlass(w.ctx, w.s.Pool(), row, aliceCred, time.Hour, "incident"); bgErr != nil {
 		t.Fatalf("break-glass: %v", bgErr)
 	}
 
-	ids, err = g.VisibleEntityIDs(w.ctx, nateCred, store.AccessRead, "", 100)
+	ids, err = g.VisibleEntityIDs(w.ctx, aliceCred, store.AccessRead, "", 100)
 	if err != nil {
 		t.Fatalf("list after break-glass: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestVisibleEntityIDsAuditsOverrides(t *testing.T) {
 	// graph query there will ever be.
 	var audits int
 	if err := w.s.Pool().QueryRow(w.ctx,
-		"SELECT count(*) FROM grant_override_audit WHERE actor_id = $1", nate).Scan(&audits); err != nil {
+		"SELECT count(*) FROM grant_override_audit WHERE actor_id = $1", alice).Scan(&audits); err != nil {
 		t.Fatalf("count audits: %v", err)
 	}
 	if audits == 0 {
@@ -121,8 +121,8 @@ func TestVisibleEntityIDsAuditsOverrides(t *testing.T) {
 		Scan(&ownerKind, &ownerID); err != nil {
 		t.Fatalf("read audit row: %v", err)
 	}
-	if ownerKind != "org" || ownerID != house {
-		t.Fatalf("audit named owner %s/%s, want org/%s", ownerKind, ownerID, house)
+	if ownerKind != "org" || ownerID != acme {
+		t.Fatalf("audit named owner %s/%s, want org/%s", ownerKind, ownerID, acme)
 	}
 }
 
@@ -131,14 +131,14 @@ func TestVisibleEntityIDsAuditsOverrides(t *testing.T) {
 // stream rows to a client and roll the evidence back with everything else.
 func TestOverrideAuditSurvivesACallerRollback(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
-	house := w.org("house", nate)
-	houseOwner := store.Owner{Kind: store.PrincipalOrg, ID: house}
-	nateCred := cred(nate, store.PrincipalUser, nate)
+	alice := w.human("alice")
+	acme := w.org("acme", alice)
+	acmeOwner := store.Owner{Kind: store.PrincipalOrg, ID: acme}
+	aliceCred := cred(alice, store.PrincipalUser, alice)
 
-	inst := w.install("shared", houseOwner, nate)
-	row := store.Subject{Kind: store.SubjectEntity, ID: w.entity(inst, "entries", "o", houseOwner, nate)}
-	if _, err := store.EnterBreakGlass(w.ctx, w.s.Pool(), row, nateCred, time.Hour, "incident"); err != nil {
+	inst := w.install("shared", acmeOwner, alice)
+	row := store.Subject{Kind: store.SubjectEntity, ID: w.entity(inst, "entries", "o", acmeOwner, alice)}
+	if _, err := store.EnterBreakGlass(w.ctx, w.s.Pool(), row, aliceCred, time.Hour, "incident"); err != nil {
 		t.Fatalf("break-glass: %v", err)
 	}
 
@@ -147,7 +147,7 @@ func TestOverrideAuditSurvivesACallerRollback(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 	g := w.s.GuardTx(tx)
-	if _, err := g.Authorize(w.ctx, nateCred, row, store.AccessRead, "incident"); err != nil {
+	if _, err := g.Authorize(w.ctx, aliceCred, row, store.AccessRead, "incident"); err != nil {
 		_ = tx.Rollback(w.ctx)
 		t.Fatalf("authorize in tx: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestOverrideAuditSurvivesACallerRollback(t *testing.T) {
 
 	var audits int
 	if err := w.s.Pool().QueryRow(w.ctx,
-		"SELECT count(*) FROM grant_override_audit WHERE actor_id = $1", nate).Scan(&audits); err != nil {
+		"SELECT count(*) FROM grant_override_audit WHERE actor_id = $1", alice).Scan(&audits); err != nil {
 		t.Fatalf("count audits: %v", err)
 	}
 	if audits != 1 {
@@ -169,19 +169,19 @@ func TestOverrideAuditSurvivesACallerRollback(t *testing.T) {
 
 func TestGrantsCannotBeRewrittenByUpdate(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
-	maggie := w.human("maggie")
-	stranger := w.human("stranger")
-	pia := w.ai("pia", "pia", store.PrincipalUser, nate, nate)
+	alice := w.human("alice")
+	bob := w.human("bob")
+	carol := w.human("carol")
+	ava := w.ai("ava", "ava", store.PrincipalUser, alice, alice)
 
-	nateOwner := store.Owner{Kind: store.PrincipalUser, ID: nate}
-	nateCred := cred(nate, store.PrincipalUser, nate)
-	inst := w.install("journal", nateOwner, nate)
-	entry := store.Subject{Kind: store.SubjectEntity, ID: w.entity(inst, "entries", "e", nateOwner, nate)}
+	aliceOwner := store.Owner{Kind: store.PrincipalUser, ID: alice}
+	aliceCred := cred(alice, store.PrincipalUser, alice)
+	inst := w.install("journal", aliceOwner, alice)
+	entry := store.Subject{Kind: store.SubjectEntity, ID: w.entity(inst, "entries", "e", aliceOwner, alice)}
 
 	id, err := store.WriteGrant(w.ctx, w.s.Pool(), store.GrantSpec{
-		Subject: entry, Target: store.Owner{Kind: store.PrincipalUser, ID: maggie},
-		Access: store.AccessRead, Source: store.SourceDirect, By: nateCred,
+		Subject: entry, Target: store.Owner{Kind: store.PrincipalUser, ID: bob},
+		Access: store.AccessRead, Source: store.SourceDirect, By: aliceCred,
 	})
 	if err != nil {
 		t.Fatalf("share: %v", err)
@@ -195,9 +195,9 @@ func TestGrantsCannotBeRewrittenByUpdate(t *testing.T) {
 		sql  string
 		args []any
 	}{
-		{"retarget", "UPDATE grants SET target_id = $2 WHERE id = $1", []any{id, stranger}},
+		{"retarget", "UPDATE grants SET target_id = $2 WHERE id = $1", []any{id, carol}},
 		{"widen", "UPDATE grants SET access = 'write' WHERE id = $1", []any{id}},
-		{"reattribute to an AI", "UPDATE grants SET granted_by_actor = $2 WHERE id = $1", []any{id, pia}},
+		{"reattribute to an AI", "UPDATE grants SET granted_by_actor = $2 WHERE id = $1", []any{id, ava}},
 		{"promote to override", "UPDATE grants SET source = 'override', expires_at = now() + interval '1 day' WHERE id = $1", []any{id}},
 		{"move the subject", "UPDATE grants SET subject_id = $2 WHERE id = $1", []any{id, uuid.New()}},
 		{"extend the window", "UPDATE grants SET expires_at = now() + interval '1 year' WHERE id = $1", []any{id}},
@@ -213,7 +213,7 @@ func TestGrantsCannotBeRewrittenByUpdate(t *testing.T) {
 	// Revocation is the one thing an UPDATE may do, because that is what the
 	// tombstone mechanism needs.
 	if _, err := w.s.Pool().Exec(w.ctx,
-		"UPDATE grants SET revoked_at = now(), revoked_by = $2 WHERE id = $1", id, nate); err != nil {
+		"UPDATE grants SET revoked_at = now(), revoked_by = $2 WHERE id = $1", id, alice); err != nil {
 		t.Fatalf("revocation was refused: %v", err)
 	}
 }
@@ -222,20 +222,20 @@ func TestGrantsCannotBeRewrittenByUpdate(t *testing.T) {
 
 func TestOrgMemberCannotMintCredentialsForAnotherActor(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
-	maggie := w.human("maggie")
-	house := w.org("house", nate)
-	w.member(house, maggie, "member", nate)
+	alice := w.human("alice")
+	bob := w.human("bob")
+	acme := w.org("acme", alice)
+	w.member(acme, bob, "member", alice)
 
-	// Maggie legitimately holds (actor = maggie, principal = house), because a
+	// Bob legitimately holds (actor = bob, principal = acme), because a
 	// human may act for an org they belong to. Presenting that pair used to
 	// read as "the principal issuing for itself", which let her mint a
-	// credential naming NATE as author_actor ... forging "Nate did this", the
+	// credential naming ALICE as author_actor ... forging "Alice did this", the
 	// one distinction invariant 2 exists to preserve.
 	_, err := w.s.Pool().Exec(w.ctx, `
 		INSERT INTO credentials (actor_id, principal_kind, principal_id, token_sha256,
 		                         issued_by_actor, issued_by_principal_kind, issued_by_principal_id)
-		VALUES ($1, 'org', $2, repeat('a', 64), $3, 'org', $2)`, nate, house, maggie)
+		VALUES ($1, 'org', $2, repeat('a', 64), $3, 'org', $2)`, alice, acme, bob)
 	if err == nil {
 		t.Fatal("a plain member minted a credential for another member's actor")
 	}
@@ -244,15 +244,15 @@ func TestOrgMemberCannotMintCredentialsForAnotherActor(t *testing.T) {
 	if _, err := w.s.Pool().Exec(w.ctx, `
 		INSERT INTO credentials (actor_id, principal_kind, principal_id, token_sha256,
 		                         issued_by_actor, issued_by_principal_kind, issued_by_principal_id)
-		VALUES ($1, 'org', $2, repeat('b', 64), $3, 'user', $3)`, maggie, house, nate); err != nil {
+		VALUES ($1, 'org', $2, repeat('b', 64), $3, 'user', $3)`, bob, acme, alice); err != nil {
 		t.Fatalf("an org admin could not issue for a member: %v", err)
 	}
 
 	// And a person still issues for themselves and for an AI they own.
-	pia := w.ai("pia", "pia", store.PrincipalUser, nate, nate)
-	if _, _, err := store.IssueCredential(w.ctx, w.s.Pool(), pia,
-		store.Owner{Kind: store.PrincipalUser, ID: nate},
-		cred(nate, store.PrincipalUser, nate), "pia", nil); err != nil {
+	ava := w.ai("ava", "ava", store.PrincipalUser, alice, alice)
+	if _, _, err := store.IssueCredential(w.ctx, w.s.Pool(), ava,
+		store.Owner{Kind: store.PrincipalUser, ID: alice},
+		cred(alice, store.PrincipalUser, alice), "ava", nil); err != nil {
 		t.Fatalf("a person could not issue for their own AI: %v", err)
 	}
 }
@@ -261,25 +261,25 @@ func TestOrgMemberCannotMintCredentialsForAnotherActor(t *testing.T) {
 
 func TestAICannotActivateItsOwnBuild(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
-	pia := w.ai("pia", "pia", store.PrincipalUser, nate, nate)
-	nateOwner := store.Owner{Kind: store.PrincipalUser, ID: nate}
-	piaCred := cred(pia, store.PrincipalUser, nate)
-	nateCred := cred(nate, store.PrincipalUser, nate)
+	alice := w.human("alice")
+	ava := w.ai("ava", "ava", store.PrincipalUser, alice, alice)
+	aliceOwner := store.Owner{Kind: store.PrincipalUser, ID: alice}
+	avaCred := cred(ava, store.PrincipalUser, alice)
+	aliceCred := cred(alice, store.PrincipalUser, alice)
 
 	var buildID uuid.UUID
 	if err := w.s.Pool().QueryRow(w.ctx, `
 		INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
 		                        author_actor, owner_kind, owner_id, visibility, trust, status)
 		VALUES ('extract', 'tool', 'host', '{}', repeat('b', 64), $1, 'user', $2, 'private', 'local', 'registered')
-		RETURNING id`, pia, nate).Scan(&buildID); err != nil {
+		RETURNING id`, ava, alice).Scan(&buildID); err != nil {
 		t.Fatalf("an AI could not register a build, which D19.4 allows: %v", err)
 	}
 
 	// Staging is the unprivileged half and the loop may do it.
 	installID, err := store.StageInstall(w.ctx, w.s.Pool(), store.InstallSpec{
-		BuildID: buildID, Slug: "extract", Owner: nateOwner, SchemaName: "app_extract",
-	}, piaCred)
+		BuildID: buildID, Slug: "extract", Owner: aliceOwner, SchemaName: "app_extract",
+	}, avaCred)
 	if err != nil {
 		t.Fatalf("stage: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestAICannotActivateItsOwnBuild(t *testing.T) {
 	// THE ATTACK: the trigger checks kind='human' on a column the writer
 	// supplies, so an AI acting for the owner could name a human and promote
 	// its own output. The trigger cannot see a credential; the writer can.
-	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, piaCred); err == nil {
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, avaCred); err == nil {
 		t.Fatal("an AI activated its own build")
 	} else if !errors.Is(err, store.ErrNotHuman) {
 		t.Fatalf("refused for the wrong reason: %v", err)
@@ -302,7 +302,7 @@ func TestAICannotActivateItsOwnBuild(t *testing.T) {
 	}
 
 	// A human activates it, and the row records who actually did it.
-	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, nateCred); err != nil {
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, aliceCred); err != nil {
 		t.Fatalf("a human could not activate: %v", err)
 	}
 	var activator uuid.UUID
@@ -310,7 +310,7 @@ func TestAICannotActivateItsOwnBuild(t *testing.T) {
 		"SELECT activated_by_actor FROM installs WHERE id = $1", installID).Scan(&activator); err != nil {
 		t.Fatalf("read activator: %v", err)
 	}
-	if activator != nate {
+	if activator != alice {
 		t.Fatalf("activated_by_actor is %s, want the actor on the credential", activator)
 	}
 }
@@ -320,54 +320,54 @@ func TestAICannotActivateItsOwnBuild(t *testing.T) {
 // human may delegate it.
 func TestStandingAuthorityMustBeHumanDelegated(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
-	pia := w.ai("pia", "pia", store.PrincipalUser, nate, nate)
-	nateOwner := store.Owner{Kind: store.PrincipalUser, ID: nate}
-	piaCred := cred(pia, store.PrincipalUser, nate)
-	nateCred := cred(nate, store.PrincipalUser, nate)
+	alice := w.human("alice")
+	ava := w.ai("ava", "ava", store.PrincipalUser, alice, alice)
+	aliceOwner := store.Owner{Kind: store.PrincipalUser, ID: alice}
+	avaCred := cred(ava, store.PrincipalUser, alice)
+	aliceCred := cred(alice, store.PrincipalUser, alice)
 
-	installID := stageBuild(t, w, "extract", pia, nateOwner)
+	installID := stageBuild(t, w, "extract", ava, aliceOwner)
 
-	// Pia acts for the owner, so she may write plenty of things. Not this.
-	if _, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, nateOwner,
-		store.CapabilityActivate, piaCred, "self-service", nil); err == nil {
+	// Ava acts for the owner, so she may write plenty of things. Not this.
+	if _, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, aliceOwner,
+		store.CapabilityActivate, avaCred, "self-service", nil); err == nil {
 		t.Fatal("an AI delegated install authority to itself")
 	}
-	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, piaCred); err == nil {
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, avaCred); err == nil {
 		t.Fatal("an AI activated with no authority")
 	}
 
 	// Nor may a human who does not own the install. Being a person is one of
 	// the two conditions, not the only one: without the ownership test, any
 	// human could delegate activation on anybody's app to themselves.
-	stranger := w.human("stranger")
-	strangerCred := cred(stranger, store.PrincipalUser, stranger)
-	strangerOwner := store.Owner{Kind: store.PrincipalUser, ID: stranger}
+	carol := w.human("carol")
+	carolCred := cred(carol, store.PrincipalUser, carol)
+	carolOwner := store.Owner{Kind: store.PrincipalUser, ID: carol}
 
 	// Staging is the unprivileged half, and unprivileged is not the same as
 	// unscoped: it still writes a row into a principal's own namespace.
 	if _, err := store.StageInstall(w.ctx, w.s.Pool(), store.InstallSpec{
 		BuildID: buildIDOf(t, w, installID), Slug: "squatter",
-		Owner: nateOwner, SchemaName: "app_squatter",
-	}, strangerCred); err == nil {
-		t.Fatal("a stranger staged an install owned by somebody else")
+		Owner: aliceOwner, SchemaName: "app_squatter",
+	}, carolCred); err == nil {
+		t.Fatal("a carol staged an install owned by somebody else")
 	}
-	if _, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, strangerOwner,
-		store.CapabilityActivate, strangerCred, "helping myself", nil); err == nil {
+	if _, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, carolOwner,
+		store.CapabilityActivate, carolCred, "helping myself", nil); err == nil {
 		t.Fatal("a human who does not own the install delegated authority over it")
 	}
-	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, strangerCred); err == nil {
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, carolCred); err == nil {
 		// A human activator is bound to the credential, so this would be a
-		// stranger promoting somebody else's build into somebody else's app.
-		t.Fatal("a stranger activated an install they do not own")
+		// carol promoting somebody else's build into somebody else's app.
+		t.Fatal("a carol activated an install they do not own")
 	}
 
 	// A human delegates it, and the loop rolls builds from then on.
-	if _, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, nateOwner,
-		store.CapabilityActivate, nateCred, "roll rebuilt tools unattended", nil); err != nil {
+	if _, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, aliceOwner,
+		store.CapabilityActivate, aliceCred, "roll rebuilt tools unattended", nil); err != nil {
 		t.Fatalf("human delegation: %v", err)
 	}
-	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, piaCred); err != nil {
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, avaCred); err != nil {
 		t.Fatalf("the loop could not roll a build under a standing authority: %v", err)
 	}
 }
@@ -382,35 +382,35 @@ func TestStandingAuthorityMustBeHumanDelegated(t *testing.T) {
 // confers no visibility at all. This is the test that says so.
 func TestInstallAuthorityConfersNoVisibility(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
-	delegate := w.human("delegate")
-	nateOwner := store.Owner{Kind: store.PrincipalUser, ID: nate}
-	nateCred := cred(nate, store.PrincipalUser, nate)
-	delegateCred := cred(delegate, store.PrincipalUser, delegate)
-	delegateOwner := store.Owner{Kind: store.PrincipalUser, ID: delegate}
+	alice := w.human("alice")
+	dave := w.human("dave")
+	aliceOwner := store.Owner{Kind: store.PrincipalUser, ID: alice}
+	aliceCred := cred(alice, store.PrincipalUser, alice)
+	daveCred := cred(dave, store.PrincipalUser, dave)
+	daveOwner := store.Owner{Kind: store.PrincipalUser, ID: dave}
 
-	installID := stageBuild(t, w, "extract", nate, nateOwner)
+	installID := stageBuild(t, w, "extract", alice, aliceOwner)
 	install := store.Subject{Kind: store.SubjectInstall, ID: installID}
 
-	if _, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, delegateOwner,
-		store.CapabilityActivate, nateCred, "a trusted delegate rolls builds", nil); err != nil {
+	if _, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, daveOwner,
+		store.CapabilityActivate, aliceCred, "a trusted delegate rolls builds", nil); err != nil {
 		t.Fatalf("delegate authority: %v", err)
 	}
 
 	g := w.s.Guard()
 	for _, access := range []store.Access{store.AccessRead, store.AccessWrite, store.AccessCall} {
-		if r := reasonOf(w.ctx, t, g, delegateCred, install, access); r != store.Deny {
+		if r := reasonOf(w.ctx, t, g, daveCred, install, access); r != store.Deny {
 			t.Fatalf("holding an install authority granted %s on the install (%q)", access, r)
 		}
 	}
 
 	// And nothing inside the app either.
 	entity := store.Subject{Kind: store.SubjectEntity,
-		ID: w.entity(installID, "entries", "e", nateOwner, nate)}
-	if r := reasonOf(w.ctx, t, g, delegateCred, entity, store.AccessRead); r != store.Deny {
+		ID: w.entity(installID, "entries", "e", aliceOwner, alice)}
+	if r := reasonOf(w.ctx, t, g, daveCred, entity, store.AccessRead); r != store.Deny {
 		t.Fatalf("holding an install authority granted read on the app's data (%q)", r)
 	}
-	ids, err := g.VisibleEntityIDs(w.ctx, delegateCred, store.AccessRead, "", 100)
+	ids, err := g.VisibleEntityIDs(w.ctx, daveCred, store.AccessRead, "", 100)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -419,30 +419,30 @@ func TestInstallAuthorityConfersNoVisibility(t *testing.T) {
 	}
 
 	// The capability itself still works, which is the point of separating them.
-	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, delegateCred); err != nil {
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, daveCred); err != nil {
 		t.Fatalf("the delegate could not activate: %v", err)
 	}
 }
 
 func TestRevokedInstallAuthorityStopsActivating(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
-	pia := w.ai("pia", "pia", store.PrincipalUser, nate, nate)
-	nateOwner := store.Owner{Kind: store.PrincipalUser, ID: nate}
-	nateCred := cred(nate, store.PrincipalUser, nate)
-	piaCred := cred(pia, store.PrincipalUser, nate)
+	alice := w.human("alice")
+	ava := w.ai("ava", "ava", store.PrincipalUser, alice, alice)
+	aliceOwner := store.Owner{Kind: store.PrincipalUser, ID: alice}
+	aliceCred := cred(alice, store.PrincipalUser, alice)
+	avaCred := cred(ava, store.PrincipalUser, alice)
 
-	installID := stageBuild(t, w, "extract", pia, nateOwner)
-	authorityID, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, nateOwner,
-		store.CapabilityActivate, nateCred, "roll builds", nil)
+	installID := stageBuild(t, w, "extract", ava, aliceOwner)
+	authorityID, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, aliceOwner,
+		store.CapabilityActivate, aliceCred, "roll builds", nil)
 	if err != nil {
 		t.Fatalf("delegate: %v", err)
 	}
-	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, piaCred); err != nil {
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, avaCred); err != nil {
 		t.Fatalf("activate: %v", err)
 	}
 
-	if err := store.RevokeInstallAuthority(w.ctx, w.s.Pool(), authorityID, nate); err != nil {
+	if err := store.RevokeInstallAuthority(w.ctx, w.s.Pool(), authorityID, alice); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
 	if _, err := w.s.Pool().Exec(w.ctx,
@@ -450,7 +450,7 @@ func TestRevokedInstallAuthorityStopsActivating(t *testing.T) {
 		installID); err != nil {
 		t.Fatalf("disable: %v", err)
 	}
-	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, piaCred); err == nil {
+	if err := store.ActivateInstall(w.ctx, w.s.Pool(), installID, avaCred); err == nil {
 		t.Fatal("a revoked authority still activated")
 	}
 }
@@ -458,23 +458,23 @@ func TestRevokedInstallAuthorityStopsActivating(t *testing.T) {
 // Same rule as grants: an UPDATE must not walk around the issue policy.
 func TestInstallAuthorityIsImmutableExceptRevocation(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
-	stranger := w.human("stranger")
-	nateOwner := store.Owner{Kind: store.PrincipalUser, ID: nate}
-	nateCred := cred(nate, store.PrincipalUser, nate)
+	alice := w.human("alice")
+	carol := w.human("carol")
+	aliceOwner := store.Owner{Kind: store.PrincipalUser, ID: alice}
+	aliceCred := cred(alice, store.PrincipalUser, alice)
 
-	installID := stageBuild(t, w, "extract", nate, nateOwner)
-	id, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, nateOwner,
-		store.CapabilityActivate, nateCred, "roll builds", nil)
+	installID := stageBuild(t, w, "extract", alice, aliceOwner)
+	id, err := store.GrantInstallAuthority(w.ctx, w.s.Pool(), installID, aliceOwner,
+		store.CapabilityActivate, aliceCred, "roll builds", nil)
 	if err != nil {
 		t.Fatalf("delegate: %v", err)
 	}
 
 	if _, err := w.s.Pool().Exec(w.ctx,
-		"UPDATE install_authorities SET holder_id = $2 WHERE id = $1", id, stranger); err == nil {
+		"UPDATE install_authorities SET holder_id = $2 WHERE id = $1", id, carol); err == nil {
 		t.Fatal("an install authority was retargeted by UPDATE")
 	}
-	if err := store.RevokeInstallAuthority(w.ctx, w.s.Pool(), id, nate); err != nil {
+	if err := store.RevokeInstallAuthority(w.ctx, w.s.Pool(), id, alice); err != nil {
 		t.Fatalf("revocation was refused: %v", err)
 	}
 }
@@ -508,20 +508,20 @@ func stageBuild(t *testing.T, w *world, slug string, author uuid.UUID, owner sto
 
 func TestToolAllowlist(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
-	maggie := w.human("maggie")
-	house := w.org("house", nate)
-	w.member(house, maggie, "member", nate)
+	alice := w.human("alice")
+	bob := w.human("bob")
+	acme := w.org("acme", alice)
+	w.member(acme, bob, "member", alice)
 
-	houseOwner := store.Owner{Kind: store.PrincipalOrg, ID: house}
-	inst := w.install("journal", houseOwner, nate)
-	orgTarget := store.Owner{Kind: store.PrincipalOrg, ID: house}
-	nateCred := cred(nate, store.PrincipalUser, nate)
-	maggieCred := cred(maggie, store.PrincipalUser, maggie)
-	orgCred := cred(w.ai("house-ai", "melli", store.PrincipalOrg, house, nate), store.PrincipalOrg, house)
+	acmeOwner := store.Owner{Kind: store.PrincipalOrg, ID: acme}
+	inst := w.install("journal", acmeOwner, alice)
+	orgTarget := store.Owner{Kind: store.PrincipalOrg, ID: acme}
+	aliceCred := cred(alice, store.PrincipalUser, alice)
+	bobCred := cred(bob, store.PrincipalUser, bob)
+	orgCred := cred(w.ai("acme-ai", "nova", store.PrincipalOrg, acme, alice), store.PrincipalOrg, acme)
 	// The install is org-owned, so only the org principal may grant on it.
-	// Nate acts for house because he belongs to it.
-	nateForHouse := cred(nate, store.PrincipalOrg, house)
+	// Alice acts for acme because he belongs to it.
+	aliceForAcme := cred(alice, store.PrincipalOrg, acme)
 
 	g := w.s.Guard()
 	call := func(c store.Credential, tool string) store.Reason {
@@ -534,7 +534,7 @@ func TestToolAllowlist(t *testing.T) {
 	}
 
 	// Absence is deny, before anything is granted.
-	if r := call(maggieCred, "search"); r != store.Deny {
+	if r := call(bobCred, "search"); r != store.Deny {
 		t.Fatalf("an ungranted tool returned %q", r)
 	}
 	// The owning principal reads owner on the install, so it holds the full set.
@@ -546,12 +546,12 @@ func TestToolAllowlist(t *testing.T) {
 	if _, err := store.WriteGrant(w.ctx, w.s.Pool(), store.GrantSpec{
 		Subject: store.Subject{Kind: store.SubjectInstall, ID: inst},
 		Target:  orgTarget, Access: store.AccessCall, Source: store.SourceDirect,
-		By: nateForHouse,
+		By: aliceForAcme,
 	}); err != nil {
 		t.Fatalf("install grant: %v", err)
 	}
 	for _, tool := range []string{"search", "add_entry", "delete"} {
-		for who, c := range map[string]store.Credential{"maggie": maggieCred, "nate": nateCred} {
+		for who, c := range map[string]store.Credential{"bob": bobCred, "alice": aliceCred} {
 			if r := call(c, tool); r != store.ReasonOrg {
 				t.Fatalf("with no allowlist, %s returned %q for %s", tool, r, who)
 			}
@@ -565,18 +565,18 @@ func TestToolAllowlist(t *testing.T) {
 	// moment he was trying to fix something.
 	if _, err := store.EnterBreakGlass(w.ctx, w.s.Pool(),
 		store.Subject{Kind: store.SubjectTool, ID: inst, Name: "summarize"},
-		nateCred, time.Hour, "incident"); err != nil {
+		aliceCred, time.Hour, "incident"); err != nil {
 		t.Fatalf("break-glass on a tool: %v", err)
 	}
 	// The admin who broke the glass is the one who loses, so he is the one to
 	// assert on: the override row targets HIM, so it is his allowlist probe
 	// that the override flips.
 	for _, tool := range []string{"search", "add_entry", "delete"} {
-		if r := call(nateCred, tool); r != store.ReasonOrg {
+		if r := call(aliceCred, tool); r != store.ReasonOrg {
 			t.Fatalf("break-glass on tool %q revoked the admin's own access to %s (%q)",
 				"summarize", tool, r)
 		}
-		if r := call(maggieCred, tool); r != store.ReasonOrg {
+		if r := call(bobCred, tool); r != store.ReasonOrg {
 			t.Fatalf("break-glass on an unrelated tool changed %s to %q for another member", tool, r)
 		}
 	}
@@ -585,14 +585,14 @@ func TestToolAllowlist(t *testing.T) {
 	if _, err := store.WriteGrant(w.ctx, w.s.Pool(), store.GrantSpec{
 		Subject: store.Subject{Kind: store.SubjectTool, ID: inst, Name: "search"},
 		Target:  orgTarget, Access: store.AccessCall, Source: store.SourceDirect,
-		By: nateForHouse,
+		By: aliceForAcme,
 	}); err != nil {
 		t.Fatalf("tool grant: %v", err)
 	}
-	if r := call(maggieCred, "search"); r != store.ReasonOrg {
+	if r := call(bobCred, "search"); r != store.ReasonOrg {
 		t.Fatalf("an allowlisted tool returned %q", r)
 	}
-	if r := call(maggieCred, "delete"); r != store.Deny {
+	if r := call(bobCred, "delete"); r != store.Deny {
 		t.Fatalf("a tool outside the allowlist returned %q", r)
 	}
 }
@@ -609,13 +609,13 @@ func TestToolAllowlist(t *testing.T) {
 // the override rule.
 func TestOrgMembersAreHuman(t *testing.T) {
 	w := newWorld(t)
-	nate := w.human("nate")
-	house := w.org("house", nate)
-	pia := w.ai("pia", "pia", store.PrincipalUser, nate, nate)
+	alice := w.human("alice")
+	acme := w.org("acme", alice)
+	ava := w.ai("ava", "ava", store.PrincipalUser, alice, alice)
 
 	_, err := w.s.Pool().Exec(w.ctx,
 		"INSERT INTO org_members (org_id, user_id, role, added_by_actor) VALUES ($1,$2,'admin',$3)",
-		house, pia, nate)
+		acme, ava, alice)
 	if err == nil {
 		t.Fatal("an AI actor was seated in an org; the override rule is now unenforced")
 	}
@@ -624,18 +624,18 @@ func TestOrgMembersAreHuman(t *testing.T) {
 	}
 
 	// An org cannot be seated in an org either.
-	other := w.org("other", nate)
+	other := w.org("other", alice)
 	if _, err := w.s.Pool().Exec(w.ctx,
 		"INSERT INTO org_members (org_id, user_id, role, added_by_actor) VALUES ($1,$2,'member',$3)",
-		house, other, nate); err == nil {
+		acme, other, alice); err == nil {
 		t.Fatal("an org was seated as a member of another org")
 	}
 
 	// And an AI cannot seat anyone, which is the other half of D19.2.
-	maggie := w.human("maggie")
+	bob := w.human("bob")
 	if _, err := w.s.Pool().Exec(w.ctx,
 		"INSERT INTO org_members (org_id, user_id, role, added_by_actor) VALUES ($1,$2,'member',$3)",
-		house, maggie, pia); err == nil {
+		acme, bob, ava); err == nil {
 		t.Fatal("an AI seated a member in an org")
 	}
 }
@@ -646,7 +646,7 @@ func TestBootstrapCapsTheOrgToo(t *testing.T) {
 	s, ctx := testStore(t)
 
 	first, err := s.BootstrapInTx(ctx, store.BootstrapConfig{
-		RootHandle: "nate", RootName: "Nate", OrgHandle: "roadhouse", OrgName: "Roadhouse",
+		RootHandle: "alice", RootName: "Alice", OrgHandle: "acme-co", OrgName: "Acme Co",
 	})
 	if err != nil {
 		t.Fatalf("bootstrap: %v", err)
@@ -657,7 +657,7 @@ func TestBootstrapCapsTheOrgToo(t *testing.T) {
 
 	// Restart-safe with the same config.
 	again, err := s.BootstrapInTx(ctx, store.BootstrapConfig{
-		RootHandle: "nate", RootName: "Nate", OrgHandle: "roadhouse", OrgName: "Roadhouse",
+		RootHandle: "alice", RootName: "Alice", OrgHandle: "acme-co", OrgName: "Acme Co",
 	})
 	if err != nil {
 		t.Fatalf("second bootstrap: %v", err)
@@ -670,7 +670,7 @@ func TestBootstrapCapsTheOrgToo(t *testing.T) {
 	// passing the existing root handle with a new org handle, over and over,
 	// with no credential anywhere.
 	if _, err := s.BootstrapInTx(ctx, store.BootstrapConfig{
-		RootHandle: "nate", RootName: "Nate", OrgHandle: "second-org", OrgName: "Second",
+		RootHandle: "alice", RootName: "Alice", OrgHandle: "second-org", OrgName: "Second",
 	}); err == nil {
 		t.Fatal("bootstrap created a second org")
 	}
@@ -689,7 +689,7 @@ func TestBootstrapCapsTheOrgToo(t *testing.T) {
 func TestBootstrapIsAtomic(t *testing.T) {
 	s, ctx := testStore(t)
 
-	if _, err := s.BootstrapInTx(ctx, store.BootstrapConfig{RootHandle: "nate"}); err != nil {
+	if _, err := s.BootstrapInTx(ctx, store.BootstrapConfig{RootHandle: "alice"}); err != nil {
 		t.Fatalf("seed root: %v", err)
 	}
 	var root uuid.UUID
@@ -718,7 +718,7 @@ func TestBootstrapIsAtomic(t *testing.T) {
 	beforeOrgs := countOrgs(ctx, t, s)
 
 	if _, err := s.BootstrapInTx(ctx, store.BootstrapConfig{
-		RootHandle: "nate", OrgHandle: "clash", OrgName: "clash",
+		RootHandle: "alice", OrgHandle: "clash", OrgName: "clash",
 	}); err == nil {
 		t.Fatal("a colliding org handle was accepted")
 	}

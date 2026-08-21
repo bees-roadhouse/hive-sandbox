@@ -1021,7 +1021,7 @@ CREATE TABLE mentions (
     state            text NOT NULL DEFAULT 'pending'
         CHECK (state IN ('pending', 'delivered', 'acknowledged', 'actioned', 'dropped')),
     -- A denied cross-boundary tag is recorded with a reason, not dropped
-    -- silently: the AI should be able to say "I wanted to loop in Apis and
+    -- silently: the AI should be able to say "I wanted to loop in the other assistant and
     -- could not" (D13.14).
     drop_reason      text,
 

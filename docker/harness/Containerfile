@@ -1,0 +1,85 @@
+# The hosted agent harness (D12).
+#
+# One base, three entrypoints. Three tags off one Containerfile keeps claude,
+# codex and opencode separable without three pipelines, and keeps the shared
+# layer ... git, ripgrep, node ... built and cached once.
+#
+# NEVER bake a credential into this image. Credentials are injected per run from
+# the vault (D12.7), and an image is a shared, digest-addressed, long-lived
+# artifact. The `harness` user has no home-directory config for the same reason:
+# whatever a run is allowed to see arrives at spawn or does not arrive.
+#
+# Built by scripts/harness-build.ps1 (or .sh), which resolves each tag to a
+# digest and writes docker/harness/digests.json. Runs pin the digest, never the
+# tag (D12.5): upgrading is changing that file, rollback is changing it back.
+
+# Pinned by tag rather than digest for now. The build script records the digest
+# it actually produced, which is what a run pins, so a moving base tag shows up
+# as a changed harness digest rather than as a silent behaviour change.
+FROM docker.io/library/node:24-bookworm-slim AS base
+
+# git: the agents work in a worktree and commit. ripgrep: every one of these
+# CLIs shells out to it and is markedly worse without it. ca-certificates: TLS
+# to the model API. The rest is what an agent reaches for often enough that its
+# absence becomes a wasted turn.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        jq \
+        less \
+        openssh-client \
+        ripgrep \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root inside the container as well as rootless outside it. The workspace is
+# bind-mounted at runtime and must be writable by this uid.
+ARG HARNESS_UID=1001
+ARG HARNESS_GID=1001
+RUN groupadd --gid "${HARNESS_GID}" harness \
+    && useradd --uid "${HARNESS_UID}" --gid "${HARNESS_GID}" --create-home --shell /bin/bash harness \
+    && mkdir -p /workspace \
+    && chown harness:harness /workspace
+
+# npm's global prefix defaults under /usr/local, which root owns. Point it at a
+# directory the harness user owns so the CLI layers install without root.
+#
+# Deliberately NOT under /home/harness: the supervisor mounts a tmpfs over the
+# home directory so no run leaves state or a cached credential behind, and a
+# tmpfs there would shadow the CLI install and make the entrypoint vanish.
+ENV NPM_CONFIG_PREFIX=/opt/harness/npm
+ENV PATH=/opt/harness/npm/bin:$PATH
+RUN mkdir -p /opt/harness/npm && chown -R harness:harness /opt/harness
+
+WORKDIR /workspace
+USER harness
+
+# tini reaps the zombies these CLIs leave behind when they spawn subprocesses,
+# so a container does not linger on a defunct child after the agent exits.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# --- claude ------------------------------------------------------------------
+FROM base AS claude
+ARG CLAUDE_VERSION=2.1.238
+RUN npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@${CLAUDE_VERSION}"
+LABEL org.beesroadhouse.harness.runtime=claude
+LABEL org.beesroadhouse.harness.cli-version=${CLAUDE_VERSION}
+ENTRYPOINT ["/usr/bin/tini", "--", "claude"]
+
+# --- codex -------------------------------------------------------------------
+FROM base AS codex
+ARG CODEX_VERSION=0.149.0
+RUN npm install -g --no-fund --no-audit "@openai/codex@${CODEX_VERSION}"
+LABEL org.beesroadhouse.harness.runtime=codex
+LABEL org.beesroadhouse.harness.cli-version=${CODEX_VERSION}
+ENTRYPOINT ["/usr/bin/tini", "--", "codex"]
+
+# --- opencode ----------------------------------------------------------------
+FROM base AS opencode
+ARG OPENCODE_VERSION=1.18.19
+RUN npm install -g --no-fund --no-audit "opencode-ai@${OPENCODE_VERSION}"
+LABEL org.beesroadhouse.harness.runtime=opencode
+LABEL org.beesroadhouse.harness.cli-version=${OPENCODE_VERSION}
+ENTRYPOINT ["/usr/bin/tini", "--", "opencode"]

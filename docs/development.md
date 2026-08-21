@@ -133,6 +133,23 @@ npm run typecheck                     # tsc --noEmit
 
 `test/e2e/README.md` covers the fixtures and how to write an SSE spec.
 
+## Build the agent harness images
+
+Optional. Only needed to run an agent, or to exercise the harness integration
+test ... everything else skips without them.
+
+```powershell
+.\scripts\harness-build.ps1
+```
+
+```bash
+./scripts/harness-build.sh
+```
+
+Three tags off one Containerfile under rootless Podman, taking a few minutes the
+first time and seconds after. See [`harness.md`](harness.md) for the isolation
+defaults, the network modes and the run-record seam.
+
 ## Tear down
 
 ```powershell

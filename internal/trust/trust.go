@@ -6,7 +6,7 @@
 //
 // Trust is a property of a REFERENCE, never of bytes (invariant 3). Two
 // references to identical bytes may disagree about trust and that is correct:
-// Nate's upload and a fetched web page can be the same sha256, and global dedup
+// An upload and a fetched web page can be the same sha256, and global dedup
 // would otherwise let trusted-first win and launder the web page (D17.1). So
 // nothing in this package hashes, compares or caches by content.
 package trust

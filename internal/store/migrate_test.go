@@ -122,12 +122,12 @@ func TestEventPartitions(t *testing.T) {
 func TestFutureEventCannotWedgeAPartition(t *testing.T) {
 	s, ctx := testStore(t)
 	w := newWorld(t)
-	nate := w.human("nate")
+	alice := w.human("alice")
 
 	_, err := s.Pool().Exec(ctx, `
 		INSERT INTO events (created_at, kind, owner_kind, owner_id, author_actor,
 		                    principal_kind, principal_id)
-		VALUES (now() + interval '3 months', 'probe', 'user', $1, $1, 'user', $1)`, nate)
+		VALUES (now() + interval '3 months', 'probe', 'user', $1, $1, 'user', $1)`, alice)
 	if err == nil {
 		t.Fatal("an event dated three months out was accepted; it would wedge that month's partition")
 	}
@@ -137,7 +137,7 @@ func TestFutureEventCannotWedgeAPartition(t *testing.T) {
 	if _, err := s.Pool().Exec(ctx, `
 		INSERT INTO events (created_at, kind, owner_kind, owner_id, author_actor,
 		                    principal_kind, principal_id)
-		VALUES (now() + interval '1 minute', 'probe', 'user', $1, $1, 'user', $1)`, nate); err != nil {
+		VALUES (now() + interval '1 minute', 'probe', 'user', $1, $1, 'user', $1)`, alice); err != nil {
 		t.Fatalf("a minute of clock skew was rejected: %v", err)
 	}
 }
@@ -147,7 +147,7 @@ func TestFutureEventCannotWedgeAPartition(t *testing.T) {
 func TestBlockedPartitionIsReportedNotFatal(t *testing.T) {
 	s, ctx := testStore(t)
 	w := newWorld(t)
-	nate := w.human("nate")
+	alice := w.human("alice")
 
 	// Reach past the trigger the way only a backfill could: a past month whose
 	// partition does not exist yet.
@@ -155,7 +155,7 @@ func TestBlockedPartitionIsReportedNotFatal(t *testing.T) {
 		INSERT INTO events (created_at, kind, owner_kind, owner_id, author_actor,
 		                    principal_kind, principal_id)
 		VALUES (date_trunc('month', now()) - interval '2 months', 'backfill',
-		        'user', $1, $1, 'user', $1)`, nate); err != nil {
+		        'user', $1, $1, 'user', $1)`, alice); err != nil {
 		t.Fatalf("insert backfill row: %v", err)
 	}
 

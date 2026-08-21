@@ -136,7 +136,7 @@ func forEachEngine(t *testing.T, body func(t *testing.T, cfg Config)) {
 func TestConformanceHelloRoundTrip(t *testing.T) {
 	forEachEngine(t, func(t *testing.T, cfg Config) {
 		h := newTestHost(t, cfg, Deps{})
-		res, err := call(t, h, "hello", `{"name":"Nate"}`)
+		res, err := call(t, h, "hello", `{"name":"Alice"}`)
 		if err != nil {
 			t.Fatalf("call: %v", err)
 		}
@@ -147,8 +147,8 @@ func TestConformanceHelloRoundTrip(t *testing.T) {
 		if err := json.Unmarshal(res.Output, &out); err != nil {
 			t.Fatalf("output %q: %v", res.Output, err)
 		}
-		if out.Message != "hello, Nate" {
-			t.Errorf("message = %q, want %q", out.Message, "hello, Nate")
+		if out.Message != "hello, Alice" {
+			t.Errorf("message = %q, want %q", out.Message, "hello, Alice")
 		}
 		if out.ABI != ABIVersion {
 			t.Errorf("abi = %d, want %d", out.ABI, ABIVersion)

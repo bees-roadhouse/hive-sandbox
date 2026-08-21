@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,6 +20,16 @@ const (
 	DefaultDialTimeout       = 10 * time.Second
 	DefaultReadHeaderTimeout = 15 * time.Second
 	DefaultResponseTimeout   = 5 * time.Minute
+
+	// DefaultTunnelIdleTimeout closes a CONNECT tunnel that has carried no bytes
+	// in either direction for this long.
+	//
+	// Generous, because an agent holding a streaming response open is normal and
+	// cutting it would be worse than the leak. What it stops is the unbounded
+	// case: a tunnel that neither side ever closes, which previously ran until
+	// the harness deadline killed the container ... so a proxy outliving its run,
+	// or serving a client that is not a harness, held sockets forever.
+	DefaultTunnelIdleTimeout = 10 * time.Minute
 )
 
 // DenyHeader names the reason on a refused request, so a run's own logs say
@@ -66,6 +77,17 @@ type Proxy struct {
 	builtResolver Resolver
 
 	DialTimeout time.Duration
+
+	// TunnelIdleTimeout bounds an idle CONNECT tunnel. Zero uses
+	// DefaultTunnelIdleTimeout.
+	TunnelIdleTimeout time.Duration
+}
+
+func (p *Proxy) tunnelIdleTimeout() time.Duration {
+	if p.TunnelIdleTimeout > 0 {
+		return p.TunnelIdleTimeout
+	}
+	return DefaultTunnelIdleTimeout
 }
 
 func (p *Proxy) logger() *slog.Logger {
@@ -279,7 +301,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	// Anything the client pipelined behind the CONNECT is already in the
 	// buffered reader and would be lost by reading the socket directly.
-	go tunnel(client, buffered, upstream)
+	go tunnel(client, buffered, upstream, p.tunnelIdleTimeout())
 }
 
 func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
@@ -403,30 +425,68 @@ func (p *Proxy) dial(ctx context.Context, rule Rule, host string, port int) (net
 	return nil, lastErr
 }
 
-// tunnel copies bytes both ways until either side is done.
-func tunnel(client net.Conn, buffered io.Reader, upstream net.Conn) {
+// tunnel copies bytes both ways until either side is done or the tunnel goes
+// idle.
+//
+// The idle bound is the point. Without it a tunnel neither side ever closes
+// runs forever, and the only thing that ended one was the harness deadline
+// killing the whole container ... which is not a bound the proxy owns, and is
+// no bound at all for a proxy that outlives its run.
+//
+// Idleness is measured by activity, not by total duration: a long download and
+// a long-polling stream both keep resetting it, so the timeout only fires on a
+// tunnel that has genuinely stopped.
+func tunnel(client net.Conn, buffered io.Reader, upstream net.Conn, idle time.Duration) {
 	defer func() { _ = client.Close() }()
 	defer func() { _ = upstream.Close() }()
 
+	var active atomic.Bool
 	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = io.Copy(upstream, buffered)
-		// Half-close so the origin sees end-of-request rather than waiting.
-		if cw, ok := upstream.(interface{ CloseWrite() error }); ok {
-			_ = cw.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = io.Copy(client, upstream)
-		if cw, ok := client.(interface{ CloseWrite() error }); ok {
-			_ = cw.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
 
-	<-done
-	<-done
+	copyWithActivity := func(dst io.Writer, src io.Reader, closeWrite any) {
+		buf := make([]byte, 32<<10)
+		for {
+			n, err := src.Read(buf)
+			if n > 0 {
+				active.Store(true)
+				if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		// Half-close so the far side sees end-of-stream rather than waiting.
+		if cw, ok := closeWrite.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		}
+		done <- struct{}{}
+	}
+
+	go copyWithActivity(upstream, buffered, upstream)
+	go copyWithActivity(client, upstream, client)
+
+	// Watch for a tunnel that has stopped moving bytes. Closing both sides
+	// unblocks the two copies, which then finish normally.
+	watchdog := time.NewTicker(idle)
+	defer watchdog.Stop()
+
+	finished := 0
+	for finished < 2 {
+		select {
+		case <-done:
+			finished++
+		case <-watchdog.C:
+			// Swap-and-test: any byte since the last tick resets the clock.
+			if active.Swap(false) {
+				continue
+			}
+			_ = client.Close()
+			_ = upstream.Close()
+			// Both copies will now fail their reads and report in.
+		}
+	}
 }
 
 // splitHostPort accepts "host", "host:port" and "[::1]:port".

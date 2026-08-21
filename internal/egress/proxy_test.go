@@ -1,8 +1,10 @@
 package egress_test
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -353,5 +356,98 @@ func TestProxyRefusesOriginFormRequests(t *testing.T) {
 
 	if res.StatusCode != http.StatusForbidden {
 		t.Errorf("status = %d, want 403", res.StatusCode)
+	}
+}
+
+// Augie's finding 10, first item. A CONNECT tunnel ran until both sides closed,
+// and the server set only ReadHeaderTimeout ... so a tunnel neither side ever
+// closed was bounded only by the harness deadline killing the container. That
+// is not a bound the proxy owns, and it is no bound at all for a proxy serving
+// anything other than a harness.
+func TestIdleTunnelIsClosed(t *testing.T) {
+	t.Parallel()
+
+	// An origin that accepts the tunnel and then says nothing at all, which is
+	// the shape that used to hang forever.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- conn
+		}
+	}()
+
+	_, portText, _ := net.SplitHostPort(listener.Addr().String())
+	allow := mustParse(t, "silent.example.test:"+portText)
+	allow.AllowPrivateDestinations = true
+
+	proxyURL := startProxy(t, &egress.Proxy{
+		Allow:             allow,
+		RunID:             "run-idle-tunnel",
+		Logger:            quietLogger(),
+		Resolver:          stubResolver{"silent.example.test": {"127.0.0.1"}},
+		TunnelIdleTimeout: 500 * time.Millisecond,
+	})
+
+	// Speak CONNECT by hand: an http.Client would impose its own timeouts and
+	// hide whose bound actually fired.
+	conn, err := net.Dial("tcp", proxyURL.Host)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	target := "silent.example.test:" + portText
+	if _, writeErr := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); writeErr != nil {
+		t.Fatalf("write CONNECT: %v", writeErr)
+	}
+
+	reader := bufio.NewReader(conn)
+	status, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	if !strings.Contains(status, "200") {
+		t.Fatalf("CONNECT status = %q, want 200", strings.TrimSpace(status))
+	}
+	// Drain the rest of the CONNECT response. Without this the blank line
+	// terminating it is still buffered, and the read below returns it
+	// immediately ... which looks exactly like a tunnel that carried data.
+	for {
+		line, lineErr := reader.ReadString('\n')
+		if lineErr != nil {
+			t.Fatalf("read CONNECT headers: %v", lineErr)
+		}
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the proxy never dialled the origin")
+	}
+
+	// Neither side sends anything. The idle bound has to be what ends it.
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	buf := make([]byte, 1)
+	start := time.Now()
+	_, readErr := reader.Read(buf)
+	elapsed := time.Since(start)
+
+	if readErr == nil {
+		t.Fatal("read returned data from a silent tunnel")
+	}
+	if errors.Is(readErr, os.ErrDeadlineExceeded) {
+		t.Fatalf("the tunnel was still open after %s; the idle bound never fired", elapsed)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("tunnel closed after %s, want roughly the 500ms idle bound", elapsed)
 	}
 }

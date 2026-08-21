@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -142,6 +143,80 @@ func TestApplySchemaPlanProvisionsCollections(t *testing.T) {
 	// btree + gin + fts + owner + the primary key.
 	if indexes < 5 {
 		t.Errorf("entries has %d indexes, want at least 5", indexes)
+	}
+}
+
+// updated_at is maintained by a trigger, so a writer cannot forget it.
+//
+// This is the test Megan asked for, and it asserts the property rather than the
+// convention: an UPDATE that says nothing about updated_at still moves it. The
+// trigger is correct here specifically because now() is a clock read rather
+// than a fact the writer supplies, which is the distinction D21 is about.
+func TestUpdatedAtIsMaintainedWithoutTheWriter(t *testing.T) {
+	pool := testdb.Pool(t)
+	ctx := t.Context()
+	plan := planFor(t, uniqueApp(t), manifest.Collection{Name: "entries"})
+	if err := apply(t, pool, plan); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	table := pgx.Identifier{plan.Schema, "entries"}.Sanitize()
+
+	var id string
+	var created, firstUpdated time.Time
+	if err := pool.QueryRow(ctx, `INSERT INTO `+table+`
+		(owner_kind, owner_id, author_actor, doc)
+		VALUES ('user', gen_random_uuid(), gen_random_uuid(), '{"a":1}')
+		RETURNING id, created_at, updated_at`,
+	).Scan(&id, &created, &firstUpdated); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	// A writer that touches only doc, exactly as a forgetful one would.
+	var secondUpdated time.Time
+	if err := pool.QueryRow(ctx,
+		`UPDATE `+table+` SET doc = '{"a":2}' WHERE id = $1 RETURNING updated_at`, id,
+	).Scan(&secondUpdated); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if !secondUpdated.After(firstUpdated) {
+		t.Errorf("updated_at did not move on an update that ignored it: %s -> %s",
+			firstUpdated, secondUpdated)
+	}
+
+	// created_at stays put, or the column means nothing.
+	var afterCreated time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT created_at FROM `+table+` WHERE id = $1`, id).Scan(&afterCreated); err != nil {
+		t.Fatalf("reselect: %v", err)
+	}
+	if !afterCreated.Equal(created) {
+		t.Errorf("created_at moved: %s -> %s", created, afterCreated)
+	}
+}
+
+// The trigger function lives in the app's own schema, so uninstall stays one
+// statement and no app's triggers depend on an object outside their blast
+// radius.
+func TestTouchFunctionLivesInTheAppSchema(t *testing.T) {
+	pool := testdb.Pool(t)
+	plan := planFor(t, uniqueApp(t), manifest.Collection{Name: "entries"})
+	if err := apply(t, pool, plan); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	var exists bool
+	if err := pool.QueryRow(t.Context(), `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_proc p
+			JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = $1 AND p.proname = 'set_updated_at')`,
+		plan.Schema,
+	).Scan(&exists); err != nil {
+		t.Fatalf("check function: %v", err)
+	}
+	if !exists {
+		t.Errorf("set_updated_at is not in %s", plan.Schema)
 	}
 }
 

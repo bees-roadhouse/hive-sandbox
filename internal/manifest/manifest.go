@@ -15,10 +15,31 @@
 // that could express them would be a second enforcement point in a file the app
 // author controls (invariant 1).
 //
-// Capabilities are the apparent exception and are not one: declaring a
-// capability is a request, not a grant. The manifest says which host modules the
-// guest links; whether the install may actually use them is a grant, and the
-// host refuses to link an undeclared one at load time either way.
+// # Capabilities are the exception, and declaring one IS granting it
+//
+// An earlier version of this comment said a declared capability was "a request,
+// not a grant," and that whether an install could use it was decided by a grant.
+// **There is no such grant.** No capability subject exists in the grants table
+// and nothing sits between the manifest and the runtime's capability set.
+// Claiming a check that does not exist is worse than admitting where the real
+// one is, so: declaring is granting, at install granularity, and **promotion is
+// the capability decision** (D25).
+//
+// That is deliberate rather than unfinished. Per-capability grants sound right
+// by analogy to per-tool grants and are not the same shape: capabilities are
+// content-addressed with the build, so "install it but deny egress" produces an
+// app that does not work as built. The granularity people actually want is
+// finer and already exists elsewhere ... the egress allowlist rather than the
+// egress capability, the agent budget rather than the agent_run capability.
+//
+// The weight therefore falls on the promotion surface, which must show the
+// capability set and must surface a build whose capabilities differ from the
+// live install as a CHANGE rather than an equivalent promotion. The risk it
+// defends against is an app that has never had egress gaining it in v2 and
+// being promoted as routine.
+//
+// Independently of any of that, the host refuses at load time to link a host
+// module the manifest did not declare.
 package manifest
 
 import (
@@ -216,6 +237,18 @@ func (m *Manifest) Validate() error {
 		}
 		collections[c.Name] = true
 
+		// The name has to survive being SUFFIXED, not just being a name. The
+		// platform derives index and trigger identifiers from it, Postgres
+		// truncates rather than rejecting, and a truncated index name collides
+		// with the table's own entry in pg_class where IF NOT EXISTS reports
+		// the collision as success.
+		if len(c.Name) > MaxCollectionName() {
+			errs = append(errs, fmt.Errorf(
+				"%w: collection %q is %d characters; %d or fewer, because index and trigger "+
+					"names are derived from it and Postgres truncates at %d",
+				ErrName, c.Name, len(c.Name), MaxCollectionName(), MaxIdentifier()))
+		}
+
 		// Index declarations are parsed here rather than trusted, because they
 		// end up inside CREATE INDEX and a manifest is a file an AI writes.
 		// Validating at the DDL end would be too late: by then the dangerous
@@ -260,10 +293,21 @@ func (m *Manifest) Validate() error {
 		}
 	}
 
+	// Routes get the same duplicate check tools get. Without it the last
+	// declaration silently won and which one that was depended on file order,
+	// which is the same mistake refused on one surface and tolerated on the
+	// other.
+	seenRoutes := make(map[string]bool, len(m.Routes))
 	for _, r := range m.Routes {
 		if err := r.validate(funcs); err != nil {
 			errs = append(errs, err)
+			continue
 		}
+		key := r.Method + " " + r.Path
+		if seenRoutes[key] {
+			errs = append(errs, fmt.Errorf("%w: route %s", ErrDuplicate, key))
+		}
+		seenRoutes[key] = true
 	}
 
 	for _, s := range m.Subscriptions {
@@ -290,11 +334,84 @@ func (r RouteDef) validate(funcs map[string]bool) error {
 	if !strings.HasPrefix(r.Path, "/") {
 		return fmt.Errorf("%w: path %q must start with /", ErrRoute, r.Path)
 	}
-	if strings.Contains(r.Path, "..") {
-		return fmt.Errorf("%w: path %q", ErrRoute, r.Path)
+	// No blunt strings.Contains(path, "..") here, deliberately.
+	//
+	// That check used to be the traversal defence and it was wrong in both
+	// directions. It rejected `/x..y`, which is a perfectly good segment, and it
+	// caught `/{...}` only by ACCIDENT ... a coincidence that would have
+	// stopped being true the day somebody made it smarter about real traversal.
+	// checkPattern rejects a segment that IS "." or "..", which is what
+	// traversal actually looks like, and refuses wildcards by name.
+	if err := checkPattern(r.Path); err != nil {
+		return err
 	}
 	if r.Function != "" && !funcs[r.Function] {
 		return fmt.Errorf("%w: route %s %s -> %q", ErrUnknownFunc, r.Method, r.Path, r.Function)
+	}
+	return nil
+}
+
+// checkPattern rejects paths that http.ServeMux PANICS on at mount.
+//
+// This package's whole claim is that everything decidable from a manifest is
+// decided here, and pattern validity is decidable. Without it, `/a{b`,
+// `/{id}/{id}`, `//double` and `/./dot` all validate cleanly and then take down
+// whatever mounts them ... a trap laid for a consumer that does not exist yet,
+// which is the worst time to lay one.
+//
+// The `..` check above happens to catch `/{...}` as well, and that is a
+// COINCIDENCE rather than a defence: it stops being true the moment somebody
+// makes the traversal check smarter about real traversal. Wildcards are refused
+// here on purpose, by name.
+func checkPattern(path string) error {
+	// A trailing slash is a ServeMux subtree pattern; it is legal, and the
+	// segment walk below has to know the empty final segment is expected.
+	trimmed := strings.TrimSuffix(path, "/")
+
+	seen := make(map[string]bool)
+	for i, seg := range strings.Split(trimmed, "/") {
+		if i == 0 {
+			continue // the empty piece before the leading slash
+		}
+		if seg == "" {
+			return fmt.Errorf("%w: path %q has an empty segment", ErrRoute, path)
+		}
+		if seg == "." || seg == ".." {
+			return fmt.Errorf("%w: path %q has a relative segment %q", ErrRoute, path, seg)
+		}
+
+		open := strings.Count(seg, "{")
+		if open == 0 {
+			if strings.Contains(seg, "}") {
+				return fmt.Errorf("%w: path %q has an unmatched } in %q", ErrRoute, path, seg)
+			}
+			continue
+		}
+
+		// A wildcard is the whole segment or nothing. ServeMux panics on
+		// `/a{b}` as much as on `/a{b`, so partial segments are refused rather
+		// than only unterminated ones.
+		if open > 1 || !strings.HasPrefix(seg, "{") || !strings.HasSuffix(seg, "}") {
+			return fmt.Errorf(
+				"%w: path %q: a wildcard must be a whole segment, as /{id}, not %q",
+				ErrRoute, path, seg)
+		}
+
+		name := seg[1 : len(seg)-1]
+		if strings.HasSuffix(name, "...") {
+			// Legal in ServeMux and refused here: a trailing match swallows
+			// every path below it, which would let one route shadow the rest of
+			// an install's surface, including generated CRUD.
+			return fmt.Errorf("%w: path %q: {name...} matches everything below it", ErrRoute, path)
+		}
+		if !segmentRE.MatchString(name) {
+			return fmt.Errorf("%w: path %q has an unusable wildcard name %q", ErrRoute, path, name)
+		}
+		if seen[name] {
+			// ServeMux panics on a repeated wildcard name.
+			return fmt.Errorf("%w: path %q repeats the wildcard %q", ErrRoute, path, name)
+		}
+		seen[name] = true
 	}
 	return nil
 }

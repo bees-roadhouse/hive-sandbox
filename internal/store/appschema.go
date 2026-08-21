@@ -115,7 +115,7 @@ func applyCollection(ctx context.Context, tx pgx.Tx, schema string, c manifest.C
 
 	// trust travels with the row, not with the bytes in it (invariant 3), and
 	// it defaults trusted to match every other content table in migration one.
-	_, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+table+` (
+	if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+table+` (
 		id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
 		owner_kind  text NOT NULL CHECK (owner_kind IN ('user', 'org')),
 		owner_id    uuid NOT NULL,
@@ -125,14 +125,16 @@ func applyCollection(ctx context.Context, tx pgx.Tx, schema string, c manifest.C
 		tainted_by  text,
 		created_at  timestamptz NOT NULL DEFAULT now(),
 		updated_at  timestamptz NOT NULL DEFAULT now()
-	)`)
-	if err != nil {
+	)`); err != nil {
 		return fmt.Errorf("create table %s.%s: %w", schema, c.Name, err)
 	}
 
 	// Every grant-filtered read starts from the owner pair, so it is indexed
 	// unconditionally rather than left to an app to remember.
-	ownerIdx := quoteIdent(c.Name + "_owner_idx")
+	ownerIdx, nameErr := derivedIdent(c.Name, "_owner_idx")
+	if nameErr != nil {
+		return nameErr
+	}
 	if _, err := tx.Exec(ctx,
 		"CREATE INDEX IF NOT EXISTS "+ownerIdx+" ON "+table+" (owner_kind, owner_id)"); err != nil {
 		return fmt.Errorf("create owner index on %s.%s: %w", schema, c.Name, err)
@@ -152,7 +154,10 @@ func applyCollection(ctx context.Context, tx pgx.Tx, schema string, c manifest.C
 	// happened: a column that is right in the code one person wrote and wrong
 	// in the code the next person writes. A column that is sometimes maintained
 	// is worse than one that always is, so it always is.
-	trigger := quoteIdent(c.Name + "_touch")
+	trigger, triggerErr := derivedIdent(c.Name, "_touch")
+	if triggerErr != nil {
+		return triggerErr
+	}
 	if _, err := tx.Exec(ctx,
 		"DROP TRIGGER IF EXISTS "+trigger+" ON "+table); err != nil {
 		return fmt.Errorf("drop touch trigger on %s.%s: %w", schema, c.Name, err)
@@ -183,7 +188,10 @@ func applyIndex(
 	// The index name is derived rather than taken from the manifest, so two
 	// apps cannot argue about it and an app cannot name one after something
 	// that already exists.
-	name := quoteIdent(fmt.Sprintf("%s_%s_%d_idx", collection, idx.Method, ordinal))
+	name, err := derivedIdent(collection, fmt.Sprintf("_%s_%d_idx", idx.Method, ordinal))
+	if err != nil {
+		return err
+	}
 
 	var stmt string
 	switch idx.Method {
@@ -289,6 +297,31 @@ func checkIdent(s string) error {
 	}
 	return nil
 }
+
+// derivedIdent builds an identifier the platform derives from a manifest name,
+// and REFUSES one that would not fit rather than letting Postgres truncate it.
+//
+// Truncation is the dangerous half. An over-long index name collapses onto the
+// collection name, which the table already occupies in pg_class, and the
+// IF NOT EXISTS that makes re-apply idempotent turns that collision into a
+// NOTICE. pgx does not surface NOTICEs, so the statement reports success and
+// the index does not exist. manifest.Validate bounds these names already; this
+// is the check at the point of use, for the caller that skipped it.
+func derivedIdent(base, suffix string) (string, error) {
+	if err := checkIdent(base); err != nil {
+		return "", err
+	}
+	name := base + suffix
+	if len(name) > maxIdentifier {
+		return "", fmt.Errorf(
+			"%w: %q is %d characters and Postgres truncates at %d, which would silently "+
+				"collide with an existing object", ErrUnsafeIdentifier, name, len(name), maxIdentifier)
+	}
+	return quoteIdent(name), nil
+}
+
+// maxIdentifier is Postgres's limit, and the reason derivedIdent exists.
+const maxIdentifier = 63
 
 // quoteIdent double-quotes an identifier. Everything reaching it has already
 // passed checkIdent, so the doubling is belt on brace.

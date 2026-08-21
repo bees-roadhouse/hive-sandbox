@@ -116,6 +116,44 @@ func TestValidateBoundsTheDerivedSchemaName(t *testing.T) {
 	}
 }
 
+// The same class as the schema-name bound, one level down. checkIdent bounds
+// what it is given; nothing bounded what the applier DERIVES, and Postgres
+// truncates rather than rejecting, so `<collection>_owner_idx` collapsed onto
+// the collection name and IF NOT EXISTS reported success.
+func TestValidateBoundsDerivedCollectionNames(t *testing.T) {
+	fits := "c" + strings.Repeat("x", MaxCollectionName()-1)
+	m := journalish()
+	m.Storage.Collections[0].Name = fits
+	if err := m.Validate(); err != nil {
+		t.Fatalf("a collection name that fits was rejected: %v", err)
+	}
+
+	tooLong := "c" + strings.Repeat("x", MaxCollectionName())
+	m = journalish()
+	m.Storage.Collections[0].Name = tooLong
+	err := m.Validate()
+	if !errors.Is(err, ErrName) {
+		t.Fatalf("err = %v, want ErrName", err)
+	}
+	// The error has to say what it is reserving for, or the fix is a guess.
+	if !strings.Contains(err.Error(), "index") {
+		t.Errorf("the error should explain that suffixed names need the room: %v", err)
+	}
+}
+
+// Every name the applier derives has to fit once the longest suffix is applied.
+// Stated as a test so that adding a longer suffix fails here rather than in
+// Postgres, silently.
+func TestDerivedNameBudgetCoversEverySuffix(t *testing.T) {
+	base := strings.Repeat("c", MaxCollectionName())
+	for _, suffix := range DerivedSuffixes() {
+		if got := len(base + suffix); got > MaxIdentifier() {
+			t.Errorf("%q + %q is %d characters, over the %d limit",
+				base, suffix, got, MaxIdentifier())
+		}
+	}
+}
+
 func TestSchemaPlanDerivesStructureNotSyntax(t *testing.T) {
 	m := journalish()
 	m.Storage.Collections[0].Indexes = []string{

@@ -136,4 +136,22 @@ test/                  integration tests, including Playwright-driven HTTP/SSE
   except `Sealed` was a plain struct, so `Sealed{Hash: stolenHash}` satisfied the
   new signature and changed nothing. It carries an unexported marker now. If a
   type stands in for a capability, make sure a caller cannot simply write one
-  down.
+  down. The same goes for helpers: `FullPath` was concatenation that turned
+  `/../other` into `/apps/other`, and the fix was making its doc say it is not a
+  boundary rather than making it silently rewrite routes. **A helper that looks
+  protective and is not is worse than an obviously blunt one, because the next
+  person builds on the appearance.**
+- **A green test proves nothing until you know which way it can go wrong.**
+  Nine tests here have passed for reasons unrelated to what they claimed, in
+  three distinct shapes, and each shape needs a different question:
+  1. **It cannot fail.** The assertion cannot distinguish the working case from
+     the broken one ... a missing map key read as success, a prefix asserted
+     against a fixture that never escapes, a rule whose real enforcement is
+     somewhere else entirely.
+  2. **It never executes.** Skip conditions no environment satisfies, or a job
+     that builds none of what the test needs. Make the environment that promised
+     to run it *fail* on a skipped precondition rather than guessing.
+  3. **Its fixture is too small to reach the failure.** The property is real and
+     the assertion is honest, and `n = 12` against a batch limit of 500 means the
+     interesting branch never runs. This one hides best, because the test is
+     well written. Ask what size makes the loop take its other path.

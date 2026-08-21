@@ -24,7 +24,12 @@ import (
 // A human remembering to check a file after every merge is not a control.
 const minInvariants = 13
 
-var invariantLine = regexp.MustCompile(`(?m)^\s*(\d+)\.\s+\*\*`)
+// Anchored at column zero on purpose. The invariants are a top-level numbered
+// list; nested numbered lists elsewhere in the file are indented, and matching
+// those made the guard fail on a sub-list inside a convention. A guard that
+// fires on ordinary prose edits gets disabled, which is worse than not having
+// one.
+var invariantLine = regexp.MustCompile(`(?m)^(\d+)\.\s+\*\*`)
 
 // TestInvariantsAreIntact fails if CLAUDE.md loses an invariant or the list
 // stops being contiguous. A gap means a merge took one out of the middle, which
@@ -86,6 +91,8 @@ var requiredPhrases = []string{
 	"ask what stops someone who only knows it",
 	"NOTIFY is only a wakeup bell",
 	"never a replay tape",
+	"which way it can go wrong",
+	"Its fixture is too small to reach the failure",
 }
 
 // TestRequiredGuidanceSurvives fails when a merge drops guidance the numbered

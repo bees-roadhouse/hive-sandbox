@@ -84,15 +84,21 @@ rejects wasip2 imports at link time.
 ## Development
 
 ```powershell
-.\scripts\db-up.ps1    # Postgres on 127.0.0.1:55432, prints the connection string
-.\scripts\gate.ps1     # build, vet, lint, gofmt, test -race
-.\scripts\db-down.ps1  # -Purge also deletes the volume
+.\scripts\db-up.ps1      # Postgres on 127.0.0.1:55432, prints the connection string
+.\scripts\gate.ps1       # build, vet, lint, gofmt, test -race
+.\scripts\db-down.ps1    # -Purge also deletes the volume
+
+.\scripts\garage-up.ps1  # S3 on 127.0.0.1:53900, for the blob driver tests
+.\scripts\garage-down.ps1
 ```
 
 ```bash
 ./scripts/db-up.sh
 ./scripts/gate.sh
 ./scripts/db-down.sh
+
+./scripts/garage-up.sh
+./scripts/garage-down.sh
 ```
 
 End-to-end tests live in `test/e2e` and drive a real daemon over HTTP:
@@ -102,7 +108,11 @@ cd test/e2e && npm install && npm run browsers && npm test
 ```
 
 Integration tests skip themselves when `HIVE_SANDBOX_TEST_DATABASE_URL` is
-unset, so the gate is green on a machine with no database.
+unset, so the gate is green on a machine with no database. The S3 driver tests
+do the same for the four `HIVE_SANDBOX_TEST_S3_*` variables `garage-up` prints.
+In CI those skips are failures — the jobs that promise a backend set
+`HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS=1`, because a test that never executes
+proves nothing.
 
 wazero numbers that shape the runtime config, and how they were measured, are in
 [`docs/wasmhost-benchmarks.md`](docs/wasmhost-benchmarks.md).

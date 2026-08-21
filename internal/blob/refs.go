@@ -245,15 +245,25 @@ func insertRef(ctx context.Context, tx pgx.Tx, h Hash, spec RefSpec, level trust
 			-- Revive rather than leave a tombstone that makes live bytes look
 			-- collectable.
 			SET released_at = NULL,
+			    -- Attribution follows the act, and reviving a RELEASED
+			    -- reference is a new act by whoever revived it. Re-referencing
+			    -- one that is still live is not, so the original author keeps
+			    -- it. Invariant 2 says who did this must be answerable; leaving
+			    -- this out meant the first producer kept the credit for an act
+			    -- a different actor performed, which is the wrong answer rather
+			    -- than a missing one.
+			    author_actor = CASE
+			        WHEN blob_refs.released_at IS NOT NULL THEN EXCLUDED.author_actor
+			        ELSE blob_refs.author_actor END,
 			    -- Never upward. Re-referencing must not launder untrusted bytes
 			    -- into trusted ones (D17.1, invariant 9).
 			    trust = CASE
 			        WHEN blob_refs.trust = 'untrusted' OR EXCLUDED.trust = 'untrusted'
 			        THEN 'untrusted' ELSE 'trusted' END
-		RETURNING id, trust, created_at`,
+		RETURNING id, trust, author_actor, created_at`,
 		h.String(), string(owner.Kind), owner.ID, spec.Cred.ActorID,
 		string(spec.SourceKind), spec.SourceID, string(level),
-	).Scan(&ref.ID, &ref.Trust, &ref.CreatedAt)
+	).Scan(&ref.ID, &ref.Trust, &ref.AuthorActor, &ref.CreatedAt)
 	if err != nil {
 		return Ref{}, fmt.Errorf("blob: write ref for %s: %w", h, err)
 	}

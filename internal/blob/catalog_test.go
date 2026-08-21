@@ -69,6 +69,26 @@ func (w *world) person(handle string) identity.Credential {
 	return identity.Credential{ActorID: id, PrincipalKind: identity.PrincipalUser, PrincipalID: id}
 }
 
+// aiActor creates an AI identity owned by a principal, so a test can act as an
+// assistant without the assistant becoming an owner.
+//
+// The principal creates it, not root: D19.2 says a person creates AI-persona
+// instances owned by themselves, and an org admin creates actors within their
+// org. Root creating an AI for someone else is refused by a trigger, which is
+// the rule having teeth rather than being written down.
+func (w *world) aiActor(handle string, principal uuid.UUID) uuid.UUID {
+	w.t.Helper()
+
+	id := uuid.New()
+	_, err := w.pool.Exec(w.ctx, `
+		INSERT INTO actors (id, kind, handle, display_name, persona, principal_kind, principal_id, created_by_actor)
+		VALUES ($1, 'ai', $2, $2, $2, 'user', $3, $3)`, id, handle, principal)
+	if err != nil {
+		w.t.Fatalf("create ai %s: %v", handle, err)
+	}
+	return id
+}
+
 // seal writes bytes through the driver and returns what was published.
 func (w *world) seal(content []byte) blob.Sealed {
 	w.t.Helper()
@@ -910,5 +930,69 @@ func TestLinkRefCannotDistinguishAbsentFromUnheld(t *testing.T) {
 	if maskedUnheld != maskedMissing {
 		t.Errorf("LinkRef distinguishes unheld from absent:\n unheld:  %q\n missing: %q",
 			maskedUnheld, maskedMissing)
+	}
+}
+
+// Augie's finding 10, second item. Attribution follows the act: reviving a
+// RELEASED reference is a new act by whoever revived it, while re-referencing a
+// live one is not.
+//
+// Leaving this to ON CONFLICT's default meant the first producer kept credit
+// for an act a different actor performed, which is the wrong answer rather than
+// a missing one (invariant 2).
+func TestRefAttributionFollowsTheAct(t *testing.T) {
+	t.Parallel()
+
+	w := newCatalogWorld(t)
+	alice := w.person("alice")
+
+	// An AI acting for alice. The owner is alice either way; the author is not.
+	assistant := identity.Credential{
+		ActorID:       w.aiActor("pia", alice.PrincipalID),
+		PrincipalKind: identity.PrincipalUser,
+		PrincipalID:   alice.PrincipalID,
+	}
+
+	spec := capture(alice, "upload-1")
+	desc := w.publish([]byte("a document alice uploaded"), spec, originalClass)
+
+	byAssistant := spec
+	byAssistant.Cred = assistant
+
+	// Still live: re-referencing does not transfer credit for the original act.
+	var ref blob.Ref
+	if err := pgx.BeginFunc(w.ctx, w.pool, func(tx pgx.Tx) error {
+		var addErr error
+		sealed := w.seal([]byte("a document alice uploaded"))
+		ref, addErr = w.catalog.AddRef(w.ctx, tx, sealed, byAssistant)
+		return addErr
+	}); err != nil {
+		t.Fatalf("AddRef: %v", err)
+	}
+	if ref.AuthorActor != alice.ActorID {
+		t.Errorf("author = %v after re-referencing a live ref, want the original author %v",
+			ref.AuthorActor, alice.ActorID)
+	}
+
+	// Released, then revived by the assistant: that is a new act, and the
+	// record should say who performed it.
+	if err := w.catalog.Release(w.ctx, w.pool, alice, desc.Hash, blob.SourceUpload, "upload-1"); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if err := pgx.BeginFunc(w.ctx, w.pool, func(tx pgx.Tx) error {
+		var addErr error
+		sealed := w.seal([]byte("a document alice uploaded"))
+		ref, addErr = w.catalog.AddRef(w.ctx, tx, sealed, byAssistant)
+		return addErr
+	}); err != nil {
+		t.Fatalf("AddRef after release: %v", err)
+	}
+	if ref.AuthorActor != assistant.ActorID {
+		t.Errorf("author = %v after reviving a released ref, want the reviver %v",
+			ref.AuthorActor, assistant.ActorID)
+	}
+	// The owner never moves: an AI authors, its principal owns (D13.4).
+	if ref.Owner.ID != alice.PrincipalID {
+		t.Errorf("owner = %v, want alice; an AI never becomes the owner", ref.Owner.ID)
 	}
 }

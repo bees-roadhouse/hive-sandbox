@@ -290,7 +290,26 @@ func (s *Supervisor) Run(ctx context.Context, spec RunSpec, onEvent EventFunc) (
 		result.SessionID = spec.SessionID
 	}
 	result.StderrTail = d.stderrTail()
-	result.ExitCode = exitCode(waitErr)
+
+	// The recorded ProcessState, not the error from Wait, is what the process
+	// actually did.
+	//
+	// On Windows, cancelling the context AFTER the process has already exited
+	// makes Wait return `exec: canceling Cmd: TerminateProcess: Access is
+	// denied` ... a cancellation artefact describing a process that finished
+	// cleanly. Reading the error alone reports a completed agent run as failed
+	// or cancelled, and an at-most-once step (invariant 10) that reads either
+	// may be retried after the money was already spent.
+	//
+	// A genuinely killed process has no clean exit to report: signalled on
+	// POSIX (Exited false), terminated with a non-zero code on Windows.
+	exited := cmd.ProcessState != nil && cmd.ProcessState.Exited()
+	if exited {
+		result.ExitCode = cmd.ProcessState.ExitCode()
+	} else {
+		result.ExitCode = exitCode(waitErr)
+	}
+	cleanExit := exited && result.ExitCode == 0
 
 	drainErr := d.err()
 	if drainStuck && drainErr == nil {
@@ -302,7 +321,7 @@ func (s *Supervisor) Run(ctx context.Context, spec RunSpec, onEvent EventFunc) (
 			"\n[supervisor] output drain abandoned; two reader goroutines are parked",
 			s.maxStderrTailBytes())
 	}
-	result.State = terminalState(ctx, runCtx, waitErr, drainErr)
+	result.State = terminalState(ctx, runCtx, cleanExit, drainErr)
 
 	return s.finish(ctx, result, drainErr)
 }
@@ -331,18 +350,29 @@ func (s *Supervisor) finish(ctx context.Context, result Result, runErr error) (R
 // The caller's context winning yields cancelled even when it expired on its own
 // deadline: something above decided to stop, which is different from the run
 // outliving the budget it was given.
-func terminalState(ctx, runCtx context.Context, waitErr, drainErr error) TerminalState {
+func terminalState(ctx, runCtx context.Context, cleanExit bool, drainErr error) TerminalState {
+	// A process that exited 0 did the work, whatever happened to the caller's
+	// context afterwards.
+	//
+	// The old order asked ctx first, so a run that exited 0 reported cancelled
+	// when the caller's context had been cancelled by the time the state was
+	// computed ... a normal shape when a caller cancels a group after its work
+	// finishes.
+	//
+	// cleanExit comes from the recorded ProcessState rather than from Wait's
+	// error, because on Windows a late cancellation poisons that error while
+	// the process exited perfectly well.
+	if cleanExit && drainErr == nil {
+		return StateSucceeded
+	}
+
 	switch {
 	case ctx.Err() != nil:
 		return StateCancelled
 	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
 		return StateDeadlineExceeded
-	case drainErr != nil:
-		return StateFailed
-	case waitErr != nil:
-		return StateFailed
 	default:
-		return StateSucceeded
+		return StateFailed
 	}
 }
 

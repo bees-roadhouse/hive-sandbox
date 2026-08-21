@@ -617,3 +617,122 @@ func TestRunIDIsReleasedAfterTheRun(t *testing.T) {
 		}
 	}
 }
+
+// blockingStore holds the drain on one event, so a test can arrange the window
+// where the process has exited but the caller's context has since been
+// cancelled.
+type blockingStore struct {
+	blockOnSeq int
+	entered    chan struct{}
+	release    chan struct{}
+	once       sync.Once
+}
+
+func (b *blockingStore) CreateRun(context.Context, harness.RunRecord) error { return nil }
+func (b *blockingStore) FinishRun(context.Context, string, harness.Result) error {
+	return nil
+}
+
+func (b *blockingStore) AppendEvent(_ context.Context, _ string, ev harness.Event) error {
+	if ev.Seq == b.blockOnSeq {
+		b.once.Do(func() { close(b.entered) })
+		<-b.release
+	}
+	return nil
+}
+
+// Augie's finding 10, third item. terminalState asked ctx.Err() first, so a run
+// that exited 0 reported cancelled when the caller's context happened to be
+// cancelled by the time the state was computed.
+//
+// That is a normal shape ... a caller cancels a group after its work finishes
+// ... and reporting a completed agent run as cancelled is worse than cosmetic:
+// an at-most-once step that reads cancelled may be retried, and the money was
+// already spent.
+func TestACleanExitIsNotReportedAsCancelled(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		// Measured, not assumed: on Windows, cancelling a context after the
+		// process has already exited makes Wait return
+		// `exec: canceling Cmd: TerminateProcess: Access is denied`, and the
+		// recorded exit code becomes 1 rather than the real 0. So the window
+		// this test needs ... process finished, context cancelled after ...
+		// cannot be constructed here, because arranging it changes the answer.
+		//
+		// The fix it covers is platform-independent and CI runs Linux. What
+		// Windows gets instead is the reason the supervisor reads ProcessState
+		// rather than Wait's error at all.
+		t.Skip("cancelling after exit poisons Wait on Windows; the window is not constructible")
+	}
+
+	// The helper writes four lines and exits. Blocking the store on the last
+	// one holds the drain open past the process's death, which is the window
+	// where the caller's cancellation lands after the work is already done.
+	store := &blockingStore{
+		blockOnSeq: 4,
+		entered:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	sup := &harness.Supervisor{Launcher: &helperLauncher{mode: "clean"}, Store: store}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan harness.Result, 1)
+	go func() {
+		res, _ := sup.Run(ctx, testSpec(t, "run-clean-then-cancelled"), nil)
+		done <- res
+	}()
+
+	select {
+	case <-store.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the drain never reached the last event")
+	}
+
+	// Let the process finish dying before cancelling. Without this the cancel
+	// races the exit and CommandContext kills a still-live process, which is a
+	// genuine cancellation and correctly reports one ... so the test would pass
+	// or fail on timing rather than on the behaviour under test.
+	time.Sleep(400 * time.Millisecond)
+
+	// The process has written everything and exited. Cancelling here is the
+	// caller tidying up after work that already finished.
+	cancel()
+	close(store.release)
+
+	select {
+	case res := <-done:
+		if res.State != harness.StateSucceeded {
+			t.Errorf("state = %q, want %q; the process exited 0 and the work was done",
+				res.State, harness.StateSucceeded)
+		}
+		if res.ExitCode != 0 {
+			t.Errorf("exit code = %d, want 0", res.ExitCode)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned")
+	}
+}
+
+// And a run actually stopped by cancellation still reports cancelled, because a
+// killed process never exits 0.
+func TestCancellationStillReportsCancelled(t *testing.T) {
+	t.Parallel()
+
+	sup := &harness.Supervisor{Launcher: &helperLauncher{mode: "hang"}}
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel()
+	}()
+
+	res, err := sup.Run(ctx, testSpec(t, "run-really-cancelled"), nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.State != harness.StateCancelled {
+		t.Errorf("state = %q, want %q", res.State, harness.StateCancelled)
+	}
+}

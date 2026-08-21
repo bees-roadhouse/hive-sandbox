@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/tetratelabs/wazero"
@@ -90,6 +91,46 @@ func (c *moduleCache) verify(mod wazero.CompiledModule, hash string, caps Capabi
 	c.checks[key] = err
 	c.mu.Unlock()
 	return err
+}
+
+// ModuleExports reports the functions a module actually exports, so a registry
+// can check a manifest's promises against the bytes at install.
+//
+// This exists because a manifest is a claim and the module is the fact. An app
+// that declares `add_entry` and ships a module without it installs fine today
+// and fails on a user's first call, with an error that arrives long after the
+// person who could fix it has moved on. Deciding it at install is the whole
+// difference between a bad manifest and a bad afternoon.
+//
+// It compiles through the same cache the call path uses, so an install pays for
+// a compile the first call would have paid for anyway.
+func (h *Host) ModuleExports(ctx context.Context, mod Module, src ModuleSource) ([]string, error) {
+	if err := mod.validate(); err != nil {
+		return nil, err
+	}
+	t, err := h.tierFor(ctx, mod)
+	if err != nil {
+		return nil, err
+	}
+	compiled, err := t.modules.get(ctx, mod.Hash, src)
+	if err != nil {
+		return nil, err
+	}
+	// The capability and WASI checks too: a module that cannot link is not
+	// installable, and finding that out here beats finding it out on the first
+	// call, for the same reason the export check exists at all.
+	if err := t.modules.verify(compiled, mod.Hash, mod.Capabilities); err != nil {
+		return nil, fmt.Errorf("app %s (%s): %w", mod.App, mod.Version, err)
+	}
+
+	names := make([]string, 0, len(compiled.ExportedFunctions()))
+	for name := range compiled.ExportedFunctions() {
+		names = append(names, name)
+	}
+	// Sorted, because a registry content-addresses what it installs and map
+	// iteration order would make that quietly untrue.
+	sort.Strings(names)
+	return names, nil
 }
 
 // get returns the CompiledModule for hash, compiling it on first use. Callers

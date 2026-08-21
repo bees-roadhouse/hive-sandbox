@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,6 +41,30 @@ type frame struct {
 type frameStream struct {
 	t  *testing.T
 	ch chan frame
+
+	// What the reader saw but did not hand over, so a timeout can say WHICH
+	// silence it was.
+	//
+	// "No frame arrived" has at least three causes that look identical from an
+	// assertion: the handler returned, the handler is alive but every keepalive
+	// took the comment branch, or a frame was written that this parser cannot
+	// represent. A bare timeout cannot tell them apart, and a CI-only failure
+	// is exactly where that distinction is the whole investigation.
+	//
+	// Counted under a mutex because the reader goroutine writes them and the
+	// test goroutine reads them on the failure path.
+	mu        sync.Mutex
+	comments  int // `: keepalive` blocks
+	discarded int // blocks that parsed to an empty frame
+	blocks    int // every terminated block, whatever became of it
+}
+
+// seen renders the counters for a failure message.
+func (f *frameStream) seen() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return fmt.Sprintf("%d blocks, %d keepalive comments, %d discarded as empty",
+		f.blocks, f.comments, f.discarded)
 }
 
 func newFrameStream(t *testing.T, body *bufio.Reader) *frameStream {
@@ -59,6 +85,12 @@ func newFrameStream(t *testing.T, body *bufio.Reader) *frameStream {
 			line = strings.TrimRight(line, "\r\n")
 			switch {
 			case line == "":
+				f.mu.Lock()
+				f.blocks++
+				if cur == (frame{}) {
+					f.discarded++
+				}
+				f.mu.Unlock()
 				if cur == (frame{}) {
 					continue
 				}
@@ -72,6 +104,9 @@ func newFrameStream(t *testing.T, body *bufio.Reader) *frameStream {
 				cur = frame{}
 			case strings.HasPrefix(line, ":"):
 				// comment / keepalive
+				f.mu.Lock()
+				f.comments++
+				f.mu.Unlock()
 			case strings.HasPrefix(line, "id: "):
 				cur.id = strings.TrimPrefix(line, "id: ")
 			case strings.HasPrefix(line, "event: "):
@@ -128,7 +163,7 @@ func (f *frameStream) mustEvent(within time.Duration) frame {
 	f.t.Helper()
 	fr, ok := f.nextEvent(within)
 	if !ok {
-		f.t.Fatal("no event frame arrived")
+		f.t.Fatalf("no event frame arrived within %s; the reader saw %s", within, f.seen())
 	}
 	return fr
 }
@@ -137,7 +172,7 @@ func (f *frameStream) mustNext(within time.Duration) frame {
 	f.t.Helper()
 	fr, ok := f.next(within)
 	if !ok {
-		f.t.Fatal("no frame arrived")
+		f.t.Fatalf("no frame arrived within %s; the reader saw %s", within, f.seen())
 	}
 	return fr
 }
@@ -153,7 +188,7 @@ func (f *frameStream) waitClosed(d time.Duration) bool {
 	select {
 	case fr, ok := <-f.ch:
 		if ok {
-			f.t.Fatalf("the stream was still delivering: %+v", fr)
+			f.t.Fatalf("the stream was still delivering: %+v (reader saw %s)", fr, f.seen())
 		}
 		return true
 	case <-time.After(d):

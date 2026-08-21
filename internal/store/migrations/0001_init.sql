@@ -520,6 +520,26 @@ CREATE TABLE app_builds (
     manifest      jsonb NOT NULL,
     content_hash  char(64) NOT NULL UNIQUE CHECK (content_hash ~ '^[0-9a-f]{64}$'),
 
+    -- The surface this build exposes: its tools and routes after generated CRUD
+    -- and overrides resolve. Recorded rather than recomputed, and the
+    -- distinction is the whole point ... a recomputed hash says "this is what we
+    -- would derive now", where a promotion reviewer needs "this is what a human
+    -- approved". If the deriver ever changes, every historical hash silently
+    -- changes meaning and the comparison starts measuring today's deriver
+    -- against itself.
+    surface_hash  char(64) CHECK (surface_hash ~ '^[0-9a-f]{64}$'),
+
+    -- WHICH deriver produced it. Without this, two hashes that differ are
+    -- ambiguous between "the app changed" and "we changed", which is exactly
+    -- the question the hash exists to answer. Unanswerable after the fact,
+    -- because a historical row cannot be re-derived once the deriver moved on.
+    derive_version int,
+
+    -- Both or neither. A hash with no deriver is a number nobody can interpret,
+    -- and recording one without the other is how the ambiguity gets in.
+    CONSTRAINT app_builds_surface_is_attributable
+        CHECK ((surface_hash IS NULL) = (derive_version IS NULL)),
+
     -- What produced it. A build with no run is hand-written and first-party;
     -- a build with one came from the builder loop and says so.
     built_by_run_id uuid,
@@ -828,7 +848,26 @@ SELECT b.id            AS build_id,
             ELSE (SELECT coalesce(jsonb_agg(c ORDER BY c), '[]'::jsonb)
                     FROM jsonb_array_elements_text(capability_set(b.manifest)) AS c
                    WHERE NOT capability_set(cb.manifest) ? c)
-       END AS capabilities_gained
+       END AS capabilities_gained,
+
+       b.surface_hash,
+       b.derive_version,
+       cb.surface_hash   AS current_surface_hash,
+       cb.derive_version AS current_derive_version,
+
+       -- Whether the tool and route surface moved.
+       --
+       -- Three-valued on purpose, and the null is the interesting one. If the
+       -- two builds were derived by DIFFERENT derivers, the hashes are not
+       -- comparable and saying "changed" would be a guess dressed as a fact ...
+       -- the reviewer cannot tell "the app changed" from "we changed", which is
+       -- precisely what derive_version exists to expose. Null means unanswerable
+       -- and should read as "look at the surface yourself", not as "no change".
+       CASE WHEN i.build_id IS NULL THEN NULL
+            WHEN b.surface_hash IS NULL OR cb.surface_hash IS NULL THEN NULL
+            WHEN b.derive_version IS DISTINCT FROM cb.derive_version THEN NULL
+            ELSE b.surface_hash IS DISTINCT FROM cb.surface_hash
+       END AS surface_change
   FROM app_builds b
   LEFT JOIN installs i
          ON i.slug = b.slug

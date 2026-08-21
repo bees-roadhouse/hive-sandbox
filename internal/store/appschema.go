@@ -54,6 +54,12 @@ func ApplySchemaPlan(ctx context.Context, tx pgx.Tx, plan manifest.SchemaPlan) e
 		return fmt.Errorf("create schema %s: %w", plan.Schema, err)
 	}
 
+	if len(plan.Collections) > 0 {
+		if err := applyTouchFunction(ctx, tx, schema); err != nil {
+			return err
+		}
+	}
+
 	for _, c := range plan.Collections {
 		if err := applyCollection(ctx, tx, plan.Schema, c); err != nil {
 			return err
@@ -70,6 +76,27 @@ func DropSchemaPlan(ctx context.Context, tx pgx.Tx, plan manifest.SchemaPlan) er
 	}
 	if _, err := tx.Exec(ctx, "DROP SCHEMA IF EXISTS "+quoteIdent(plan.Schema)+" CASCADE"); err != nil {
 		return fmt.Errorf("drop schema %s: %w", plan.Schema, err)
+	}
+	return nil
+}
+
+// applyTouchFunction installs the updated_at trigger function into the app's
+// own schema.
+//
+// Per-app rather than platform-wide so that DROP SCHEMA CASCADE remains the
+// whole of uninstall (D3.2). A shared function would make every app's triggers
+// depend on an object outside their blast radius, which is the same dependency
+// inversion that keeps foreign keys to `actors` out of these tables.
+func applyTouchFunction(ctx context.Context, tx pgx.Tx, quotedSchema string) error {
+	_, err := tx.Exec(ctx, `CREATE OR REPLACE FUNCTION `+quotedSchema+`.set_updated_at()
+		RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.updated_at = now();
+			RETURN NEW;
+		END;
+		$$`)
+	if err != nil {
+		return fmt.Errorf("create set_updated_at in %s: %w", quotedSchema, err)
 	}
 	return nil
 }
@@ -111,6 +138,31 @@ func applyCollection(ctx context.Context, tx pgx.Tx, schema string, c manifest.C
 		return fmt.Errorf("create owner index on %s.%s: %w", schema, c.Name, err)
 	}
 
+	// updated_at IS maintained by a trigger, and this is the one place the
+	// project's usual "no triggers" instinct does not apply.
+	//
+	// That instinct comes from D21: a trigger cannot enforce what the writer
+	// supplies, because a trigger has no credential in scope. Every rule about
+	// WHO did something needs a Go writer that pins the value from the
+	// credential. Entirely correct, and it says nothing about this column,
+	// because `now()` is not a fact the writer supplies ... it is a clock read,
+	// identical whoever is asking.
+	//
+	// Leaving it to writers had one failure mode and Megan named it before it
+	// happened: a column that is right in the code one person wrote and wrong
+	// in the code the next person writes. A column that is sometimes maintained
+	// is worse than one that always is, so it always is.
+	trigger := quoteIdent(c.Name + "_touch")
+	if _, err := tx.Exec(ctx,
+		"DROP TRIGGER IF EXISTS "+trigger+" ON "+table); err != nil {
+		return fmt.Errorf("drop touch trigger on %s.%s: %w", schema, c.Name, err)
+	}
+	if _, err := tx.Exec(ctx,
+		"CREATE TRIGGER "+trigger+" BEFORE UPDATE ON "+table+
+			" FOR EACH ROW EXECUTE FUNCTION "+quoteIdent(schema)+".set_updated_at()"); err != nil {
+		return fmt.Errorf("create touch trigger on %s.%s: %w", schema, c.Name, err)
+	}
+
 	for i, idx := range c.Indexes {
 		if err := applyIndex(ctx, tx, schema, c.Name, table, i, idx); err != nil {
 			return err
@@ -147,11 +199,18 @@ func applyIndex(
 		stmt = "CREATE INDEX IF NOT EXISTS " + name + " ON " + table +
 			" USING gin (to_tsvector('english', " + expr + "))"
 	case manifest.IndexVector:
-		// Vector wants a typed column rather than a jsonb expression, and
-		// choosing between ivfflat and hnsw is a decision with real tradeoffs
-		// that nobody has made. Refused loudly rather than half-built: a
-		// silently skipped index is a query plan that quietly falls back to a
-		// sequential scan over someone's whole memory.
+		// Vector wants a typed column rather than a jsonb expression. Refused
+		// loudly rather than half-built: a silently skipped index is a query
+		// plan that quietly falls back to a sequential scan over someone's
+		// whole memory, discovered months later as "search got slow".
+		//
+		// The index method is Megan's call when she builds search, and her
+		// provisional answer is hnsw, on the access pattern rather than a
+		// benchmark: ivfflat needs training data to build a useful index and
+		// degrades as the corpus outgrows what it was trained on, which is
+		// exactly the shape of a journal that starts empty and grows forever.
+		// hnsw costs more to build and does not care. Recorded here so the
+		// reasoning survives to whoever fills this branch in.
 		return fmt.Errorf("%w: vector indexes need a typed column and an index method "+
 			"nobody has chosen yet (%s.%s: %s)",
 			errNotImplemented, schema, collection, idx)

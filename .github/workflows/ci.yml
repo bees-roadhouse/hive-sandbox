@@ -67,3 +67,45 @@ jobs:
 
       - name: test
         run: go test -race ./...
+
+  # Separate from `gate` on purpose: this job downloads a ~115 MB browser, and a
+  # lint failure should not wait behind it. It needs no database ... the e2e
+  # suite drives the daemon's HTTP and SSE surface, not Postgres.
+  e2e:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: test/e2e
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: test/e2e/package-lock.json
+
+      - name: install
+        run: npm ci
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: install chromium
+        run: npx playwright install --with-deps chromium
+
+      # globalSetup builds the daemon, so `go` has to be on PATH here.
+      - name: e2e
+        run: npx playwright test
+
+      - if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: test/e2e/playwright-report/
+          retention-days: 7

@@ -44,13 +44,27 @@ without a code change.
 ## Development
 
 ```powershell
+.\scripts\db-up.ps1    # Postgres on 127.0.0.1:55432, prints the connection string
 .\scripts\gate.ps1     # build, vet, lint, gofmt, test -race
+.\scripts\db-down.ps1  # -Purge also deletes the volume
 ```
 
 ```bash
+./scripts/db-up.sh
 ./scripts/gate.sh
+./scripts/db-down.sh
 ```
 
+End-to-end tests live in `test/e2e` and drive a real daemon over HTTP:
+
+```bash
+cd test/e2e && npm install && npm run browsers && npm test
+```
+
+Integration tests skip themselves when `HIVE_SANDBOX_TEST_DATABASE_URL` is
+unset, so the gate is green on a machine with no database.
+
 Nothing becomes a red PR. Run the gate locally first and read its output rather
-than a piped exit code. Conventions and the load-bearing invariants are in
-`CLAUDE.md`.
+than a piped exit code. Full setup is in
+[`docs/development.md`](docs/development.md); conventions and the load-bearing
+invariants are in `CLAUDE.md`.

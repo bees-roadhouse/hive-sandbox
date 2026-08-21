@@ -1,0 +1,58 @@
+# Local development Postgres for hive-sandbox.
+#
+# Deliberately NOT on 5432: this box already runs `hive-postgres` (the current
+# hive) on 5432 and `hive-latest-pg` on 55433. Colliding with either would be a
+# very confusing way to lose data.
+#
+# Brought up by scripts/db-up.ps1 / scripts/db-down.ps1 (and the .sh twins),
+# which also create the test database. Do not `compose up` this by hand unless
+# you want to create hive_sandbox_test yourself.
+name: hive-sandbox-dev
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: hive-sandbox-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hive_sandbox
+      POSTGRES_PASSWORD: hive_sandbox
+      POSTGRES_DB: hive_sandbox
+      # C collation keeps text ordering and index behaviour identical to the
+      # CI service container, so a sort that passes locally passes there.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      # Loopback only. Nothing off this machine should reach a dev database.
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    command:
+      - postgres
+      # Integration tests open a pool per test and run in parallel; the default
+      # 100 runs out well before the test suite does.
+      - -c
+      - max_connections=300
+      # Dev and test data is disposable. Durability costs more than it is worth.
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+    healthcheck:
+      # pg_isready alone reports ready during the initdb bootstrap, when the
+      # server is briefly up on a unix socket but not yet accepting real work.
+      # Running an actual query is the only honest readiness signal.
+      test:
+        [
+          "CMD-SHELL",
+          "psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -tAc 'select 1' >/dev/null 2>&1",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 40
+      start_period: 5s
+
+volumes:
+  pgdata:
+    name: hive-sandbox-pgdata

@@ -64,6 +64,26 @@ if [ -n "$skipped" ]; then
   echo "$skipped" | sed 's/^/  /'
   echo "Container-image tests need scripts/harness-build.sh and scripts/egress-build.sh."
 fi
+
+# A count of what was skipped CANNOT see what was never built.
+#
+# A test package that does not compile has zero tests rather than skipped ones,
+# so it contributes nothing to the number above and "0 skipped" reads identically
+# for "everything ran" and "this package was never built". That is not
+# hypothetical: internal/store's test package stopped compiling for an hour and
+# every Postgres-backed test in it ... the whole grant predicate suite ... was
+# absent from main while `go build ./...` stayed green, because test files are
+# not part of it.
+#
+# `go vet ./...` above already fails on it. This is the second reading, because
+# the failure mode of the first one being wrong is that the number people trust
+# is the number that lies.
+if grep -q '\[build failed\]' "$test_log"; then
+  echo
+  echo "A TEST PACKAGE FAILED TO BUILD ... it ran zero tests and skipped none."
+  grep '\[build failed\]' "$test_log" | sed 's/^/  /'
+  failed+=("test-build")
+fi
 rm -f "$test_log"
 
 if [ ${#failed[@]} -gt 0 ]; then

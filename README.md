@@ -16,18 +16,26 @@ Phase 0, and honest about the gap. What exists:
 |---|---|
 | `internal/store` | migrations, the grant predicate, install authority |
 | `internal/wasmhost` | guest apps on wazero behind the JSON ABI, with trust structural in the ABI |
-| `internal/blob` | the driver seam, the disk driver, and the reference layer |
+| `internal/blob` | the driver seam — disk and S3-compatible (Garage) drivers — and the reference layer |
+| `internal/bus` | the events table as transport, NOTIFY as wakeup, SSE fan-out |
+| `internal/mcp` | the tools tier: what `tools/list` shows is what `tools/call` accepts |
+| `internal/manifest` | the app declaration and everything derivable from it; pure, no I/O |
+| `internal/registry` | manifest + module + Postgres = an installed app |
 | `internal/harness` | hosted agent runs under Podman |
 | `internal/egress` | the allowlisting proxy a run reaches the internet through |
 
-**The daemon wires almost none of it yet.** It boots and serves `/healthz`;
-composing the pieces is [issue #9](https://github.com/bees-roadhouse/hive-sandbox/issues/9),
-and the event bus, workflow engine, dynamic surfaces, tools tier and journal app
-are all still ahead. [Issue #29](https://github.com/bees-roadhouse/hive-sandbox/issues/29)
+**The daemon has a spine but little built on top of it yet.** It opens the
+store, migrates, keeps the event partitions ahead of the clock, runs the
+LISTEN/NOTIFY bus, and serves `/healthz` plus an authenticated SSE stream of
+committed events at `/events`. Mounting the REST surface, the MCP tools tier,
+app installs and the workflow runner onto that spine is
+[issue #9](https://github.com/bees-roadhouse/hive-sandbox/issues/9); the
+journal app is still ahead.
+[Issue #29](https://github.com/bees-roadhouse/hive-sandbox/issues/29)
 tracks the lot.
 
 The design is complete through decision D23. `CLAUDE.md` says where it lives and
-carries the thirteen invariants that are load-bearing ... **each one came out of
+carries the fourteen invariants that are load-bearing ... **each one came out of
 a defect a review reproduced**, so breaking one is a bug even when the tests
 pass.
 
@@ -49,14 +57,15 @@ pass.
 ## Running it
 
 ```bash
-go run ./cmd/hive-sandbox            # both roles, listens on :7979
+go run ./cmd/hive-sandbox            # api + workflows by default, listens on :7979
 go run ./cmd/hive-sandbox -version
 curl localhost:7979/healthz
 ```
 
-One process serves every role (D7). `-serve-api` and `-run-workflows` exist from
-day one so a heavy agent run can be split off from interactive traffic later
-without a code change.
+One process serves every role (D7). `-serve-api`, `-run-workflows` and
+`-run-egress-proxy` (an allowlisting forward proxy, HTTP and CONNECT, on
+:3128) can each be
+turned off or split across processes without a code change.
 
 ## Guest apps
 
@@ -99,6 +108,10 @@ rejects wasip2 imports at link time.
 
 ./scripts/garage-up.sh
 ./scripts/garage-down.sh
+
+# No Go toolchain on the machine? The same gate runs in a container;
+# Podman is all the host needs.
+./scripts/gate-container.sh
 ```
 
 End-to-end tests live in `test/e2e` and drive a real daemon over HTTP:
@@ -108,8 +121,9 @@ cd test/e2e && npm install && npm run browsers && npm test
 ```
 
 Integration tests skip themselves when `HIVE_SANDBOX_TEST_DATABASE_URL` is
-unset, so the gate is green on a machine with no database. The S3 driver tests
-do the same for the four `HIVE_SANDBOX_TEST_S3_*` variables `garage-up` prints.
+unset, and the S3 driver tests do the same for the four `HIVE_SANDBOX_TEST_S3_*`
+variables `garage-up` prints. **The gate refuses to run without the database
+variable** rather than reporting green over a suite that never executed.
 In CI those skips are failures — the jobs that promise a backend set
 `HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS=1`, because a test that never executes
 proves nothing.

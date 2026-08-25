@@ -26,7 +26,10 @@ if (Get-Command golangci-lint -ErrorAction SilentlyContinue) {
 }
 
 Write-Host "==> gofmt -l ." -ForegroundColor Cyan
-$unformatted = gofmt -l . | Where-Object { $_ -notmatch "node_modules" }
+# .gocache is gate-container.sh's own build and module cache, mounted inside
+# the tree it formats; without this exclusion the gate flags the toolchain's
+# vendored sources as unformatted and reds itself.
+$unformatted = gofmt -l . | Where-Object { $_ -notmatch "node_modules" -and $_ -notmatch "^\.gocache/" }
 if ($unformatted) {
     Write-Host "unformatted files:" -ForegroundColor Red
     $unformatted | ForEach-Object { Write-Host "  $_" }

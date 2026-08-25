@@ -22,7 +22,7 @@ import (
 // time; the fourth was spotted by an agent who thought the repo was wrong.
 //
 // A human remembering to check a file after every merge is not a control.
-const minInvariants = 13
+const minInvariants = 14
 
 // Anchored at column zero on purpose. The invariants are a top-level numbered
 // list; nested numbered lists elsewhere in the file are indented, and matching

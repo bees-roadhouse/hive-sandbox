@@ -1,3 +1,7 @@
+# Go toolchain telemetry dropped at the repo root when a container runs go
+# with the checkout as its working directory. Never source code.
+.config/
+.cache/
 /bin/
 /dist/
 *.exe
@@ -14,6 +18,14 @@
 .env.local
 /tmp/
 /testdata/local/
+
+# gate-container.sh's build and module caches, mounted into the container from
+# here so they survive between runs. Never source code.
+.gocache/
+
+# Build outputs of scripts/build-desktop.sh.
+/desktop/bin/
+/desktop/dist/
 
 # node, for the Playwright-driven integration tests only
 node_modules/

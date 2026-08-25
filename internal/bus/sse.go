@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bees-roadhouse/hive-sandbox/internal/httpauth"
 	"github.com/bees-roadhouse/hive-sandbox/internal/store"
 )
 
@@ -55,48 +56,19 @@ func (o SSEOptions) withDefaults() SSEOptions {
 }
 
 // Authenticator turns a request into the credential pair every read is filtered
-// by. It is a function rather than a dependency so the real auth middleware can
-// replace it without the bus knowing.
-type Authenticator func(ctx context.Context, r *http.Request) (store.Credential, error)
+// by. The definition lives in httpauth so REST and SSE share one type; this
+// alias keeps every existing bus signature and test unchanged.
+type Authenticator = httpauth.Authenticator
 
-// SessionCookie is where a browser carries its credential.
-//
-// EventSource cannot set an Authorization header, so a browser needs somewhere
-// else to put the token. A cookie is that place and a query parameter is not:
-// a bearer token in a URL lands in the reverse proxy's access log, in browser
-// history, and in a Referer header on the next navigation, and no doc comment
-// on this handler prevents any of those.
-const SessionCookie = "hive_session"
+// SessionCookie is where a browser carries its credential. Defined once in
+// httpauth; aliased here for the bus callers and tests that name it through
+// this package.
+const SessionCookie = httpauth.SessionCookie
 
-// BearerAuth resolves a credential from, in order: the Authorization header,
-// the session cookie, then an `access_token` query parameter.
-//
-// The query parameter is last and it is kept only for non-browser callers that
-// cannot set a header ... curl against a stream, mostly. It is deliberately NOT
-// what the end-to-end tests exercise, because whatever the tests exercise
-// becomes the path the first real client copies.
-//
-// If this outlives the phase it should become a short-lived single-use ticket
-// minted from an authenticated request rather than the session token itself, so
-// that a leaked URL is worthless by the time anyone reads the log.
-func BearerAuth(db store.DB) Authenticator {
-	return func(ctx context.Context, r *http.Request) (store.Credential, error) {
-		if h := r.Header.Get("Authorization"); h != "" {
-			if after, ok := strings.CutPrefix(h, "Bearer "); ok {
-				if token := strings.TrimSpace(after); token != "" {
-					return store.ResolveCredential(ctx, db, token)
-				}
-			}
-		}
-		if c, err := r.Cookie(SessionCookie); err == nil && c.Value != "" {
-			return store.ResolveCredential(ctx, db, c.Value)
-		}
-		if token := r.URL.Query().Get("access_token"); token != "" {
-			return store.ResolveCredential(ctx, db, token)
-		}
-		return store.Credential{}, store.ErrNoCredential
-	}
-}
+// BearerAuth resolves a credential from the Authorization header, the session
+// cookie, then an access_token query parameter ... the shared implementation,
+// now owned by httpauth.
+func BearerAuth(db store.DB) Authenticator { return httpauth.Bearer(db) }
 
 // SSEHandler serves /events.
 func (b *Bus) SSEHandler(guard *store.Guard, auth Authenticator, opts SSEOptions) http.Handler {
@@ -105,8 +77,8 @@ func (b *Bus) SSEHandler(guard *store.Guard, auth Authenticator, opts SSEOptions
 		cred, err := auth(r.Context(), r)
 		if err != nil {
 			// Absence of scope is deny, and the response says nothing about
-			// whether the token existed.
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			// whether the token existed. Same bytes as every other surface.
+			httpauth.Unauthorized(w)
 			return
 		}
 		if err := b.stream(w, r, guard, auth, cred, opts); err != nil && !isClientGone(err) {

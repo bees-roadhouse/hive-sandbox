@@ -23,6 +23,7 @@ import (
 
 	"github.com/bees-roadhouse/hive-sandbox/internal/bus"
 	"github.com/bees-roadhouse/hive-sandbox/internal/egress"
+	"github.com/bees-roadhouse/hive-sandbox/internal/httpapi"
 	"github.com/bees-roadhouse/hive-sandbox/internal/store"
 )
 
@@ -168,7 +169,7 @@ func run() error {
 	if cfg.serveAPI {
 		apiSrv := &http.Server{
 			Addr:              cfg.addr,
-			Handler:           newMux(st, eventer),
+			Handler:           httpapi.New(st, eventer, httpapi.Options{Version: version}),
 			ReadHeaderTimeout: 10 * time.Second,
 			// Deliberately no WriteTimeout: an SSE response is meant to stay
 			// open. The stream sets its own per-write deadline instead.
@@ -302,22 +303,4 @@ func bootstrapFromEnv(ctx context.Context, st *store.Store) error {
 	}
 	slog.Info("bootstrap credential present", "actor", res.RootActorID)
 	return nil
-}
-
-func newMux(st *store.Store, eventer *bus.Bus) *http.ServeMux {
-	mux := http.NewServeMux()
-
-	// Liveness only. Readiness needs Postgres and the bus, so it lands with them.
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		// A failed write here means the client went away mid-response. Nothing
-		// to do about it and nothing worth logging on a liveness probe.
-		_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`+"\n", version)
-	})
-
-	if st != nil && eventer != nil {
-		mux.Handle("GET /events", eventer.SSEHandler(st.Guard(), bus.BearerAuth(st.Pool()), bus.SSEOptions{}))
-	}
-
-	return mux
 }

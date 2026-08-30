@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -251,5 +252,36 @@ func TestAgentRunStoreRefusesAnIncompleteCredential(t *testing.T) {
 	}
 	if _, err := store.NewAgentRunStore(nil, store.RunWriter{}); err == nil {
 		t.Error("accepted a nil store")
+	}
+}
+
+// Every NetworkMode the harness can produce must be storable.
+//
+// This is a reproduction, not a regression test: 0002 shipped with
+// CHECK (network IN ('none','daemon','egress')) while harness.NetworkProxied is
+// "proxied", so every run that reaches the internet failed its INSERT before
+// the container started. The original tests only ever passed NetworkDaemon, so
+// they never asked the question -- one value out of three is not coverage.
+func TestAgentRunStoreAcceptsEveryNetworkMode(t *testing.T) {
+	t.Parallel()
+
+	st, cred := agentRunFixture(t)
+	ctx := t.Context()
+
+	rs, err := store.NewAgentRunStore(st, store.RunWriter{Cred: cred, Trust: trust.Trusted})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	for i, mode := range []harness.NetworkMode{
+		harness.NetworkNone, harness.NetworkDaemon, harness.NetworkProxied,
+	} {
+		t.Run(string(mode), func(t *testing.T) {
+			rec := newRecord(fmt.Sprintf("run-net-%d", i))
+			rec.Network = mode
+			if createErr := rs.CreateRun(ctx, rec); createErr != nil {
+				t.Fatalf("CreateRun with network %q: %v", mode, createErr)
+			}
+		})
 	}
 }

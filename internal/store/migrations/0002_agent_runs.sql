@@ -58,7 +58,13 @@ CREATE TABLE agent_runs (
     -- permission, which is invariant 14's shape.
     session_id      text NOT NULL DEFAULT '',
 
-    network         text NOT NULL CHECK (network IN ('none', 'daemon', 'egress')),
+    -- These are harness.NetworkMode's values VERBATIM: none, daemon, proxied.
+    -- Shipped once as ('none','daemon','egress'), which rejected every run that
+    -- reaches the internet -- the constraint fired before the container started
+    -- and surfaced as a create failure rather than as a network problem. The
+    -- names here are not descriptions; they are the Go constants, and drifting
+    -- from them is silent until the one mode nobody tested is used.
+    network         text NOT NULL CHECK (network IN ('none', 'daemon', 'proxied')),
     memory_bytes    bigint NOT NULL DEFAULT 0 CHECK (memory_bytes >= 0),
     cpus            numeric NOT NULL DEFAULT 0 CHECK (cpus >= 0),
     pids_limit      int NOT NULL DEFAULT 0 CHECK (pids_limit >= 0),

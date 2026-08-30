@@ -12,24 +12,24 @@ import (
 )
 
 // Compile-time proof that this satisfies the ABI's expectations.
-var _ wasmhost.Events = (*AppEvents)(nil)
+var _ wasmhost.Events = (*GuestEvents)(nil)
 
-// AppEvents is the events capability for guest apps: hive_events.emit.
+// GuestEvents is the events capability for guest apps: hive_events.emit.
 //
 // It lives here rather than in a package of its own because appending an event
 // is a write, and invariant 1 puts every write behind ONE enforcement point in
 // this layer. An adapter elsewhere would be a second place that decides who may
 // write, which is the thing that invariant exists to prevent.
-type AppEvents struct {
+type GuestEvents struct {
 	store *Store
 }
 
-// NewAppEvents wires the events capability over a store.
-func NewAppEvents(s *Store) (*AppEvents, error) {
+// NewGuestEvents wires the events capability over a store.
+func NewGuestEvents(s *Store) (*GuestEvents, error) {
 	if s == nil {
-		return nil, errors.New("appevents needs a store")
+		return nil, errors.New("guestevents needs a store")
 	}
-	return &AppEvents{store: s}, nil
+	return &GuestEvents{store: s}, nil
 }
 
 // kindPrefix is what every guest-emitted kind is filed under.
@@ -84,7 +84,7 @@ type emitBody struct {
 // treated as data. The kind it asks for is filed under its own namespace, so a
 // guest can raise events about itself and cannot raise one that another app or
 // the platform would be believed to have raised.
-func (a *AppEvents) Emit(ctx context.Context, req wasmhost.Request) (wasmhost.Response, error) {
+func (a *GuestEvents) Emit(ctx context.Context, req wasmhost.Request) (wasmhost.Response, error) {
 	// Invariant 7: a guest parked inside a host call is unkillable, because
 	// wazero's termination checks live in guest code. Check before starting.
 	if err := ctx.Err(); err != nil {

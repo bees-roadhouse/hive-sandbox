@@ -32,6 +32,20 @@ CREATE TABLE agent_runs (
     -- Nullable on purpose. A run started from a chat has no step.
     workflow_step_id uuid REFERENCES workflow_steps (id) ON DELETE SET NULL,
 
+    -- The harness's OWN run identifier, and it is not a uuid: it names a podman
+    -- container and a network, so it is constrained to what podman will accept
+    -- as a name. RunSpec.validate enforces the same pattern before a container
+    -- is created; this repeats it because a writer is not the only way a row
+    -- arrives, and the two fail for different callers.
+    --
+    -- UNIQUE fleet-wide, which is STRICTER than strictly necessary: the derived
+    -- names are unique per podman daemon and daemons are per host, so two hosts
+    -- could reuse one without colliding in reality. Fleet-wide is kept anyway
+    -- because it costs nothing and makes a run id mean one run everywhere,
+    -- which is what anyone reading a log will assume it means.
+    run_key         text NOT NULL UNIQUE
+        CHECK (run_key ~ '^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$'),
+
     -- What actually ran, from RunRecord.
     runtime         text NOT NULL,
     image_digest    text NOT NULL,

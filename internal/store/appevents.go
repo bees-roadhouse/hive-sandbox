@@ -85,13 +85,22 @@ type emitBody struct {
 // guest can raise events about itself and cannot raise one that another app or
 // the platform would be believed to have raised.
 func (a *AppEvents) Emit(ctx context.Context, req wasmhost.Request) (wasmhost.Response, error) {
+	// Invariant 7: a guest parked inside a host call is unkillable, because
+	// wazero's termination checks live in guest code. Check before starting.
+	if err := ctx.Err(); err != nil {
+		return wasmhost.Response{}, err
+	}
 	if err := req.Caller.Validate(); err != nil {
 		return wasmhost.Response{}, wasmhost.Errorf(wasmhost.StatusDenied, "events.emit: %v", err)
 	}
 
 	var in emitBody
 	if err := json.Unmarshal(req.Body, &in); err != nil {
-		return wasmhost.Response{}, wasmhost.Errorf(wasmhost.StatusInvalid, "events.emit: %v", err)
+		// Deliberately does NOT wrap err. Every error string is copied into the
+		// guest's result slot, so echoing a decoder message hands back a
+		// fragment of whatever was being decoded -- and the guest is not always
+		// the party that supplied it.
+		return wasmhost.Response{}, wasmhost.Errorf(wasmhost.StatusInvalid, "events.emit: body is not an object")
 	}
 	if err := guestKind(in.Kind); err != nil {
 		return wasmhost.Response{}, err

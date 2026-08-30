@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/bees-roadhouse/hive-sandbox/internal/blob"
 	"github.com/bees-roadhouse/hive-sandbox/internal/bus"
 	"github.com/bees-roadhouse/hive-sandbox/internal/httpauth"
 	"github.com/bees-roadhouse/hive-sandbox/internal/store"
@@ -23,12 +24,17 @@ import (
 // -version and reported by /healthz and /whoami.
 type Options struct {
 	Version string
+
+	// Blobs enables the blob read route. Optional: a daemon without a catalog
+	// simply does not serve blobs, rather than serving them unauthorized.
+	Blobs *blob.Catalog
 }
 
 // API holds the handlers. Constructed once per process by New.
 type API struct {
 	st      *store.Store
 	eventer *bus.Bus
+	blobs   *blob.Catalog
 	version string
 }
 
@@ -36,7 +42,7 @@ type API struct {
 // shape is the workflow-only process, which today has no listener at all, but
 // New keeps it expressible so the day it grows one nothing here has to move.
 func New(st *store.Store, eventer *bus.Bus, opts Options) *http.ServeMux {
-	a := &API{st: st, eventer: eventer, version: opts.Version}
+	a := &API{st: st, eventer: eventer, blobs: opts.Blobs, version: opts.Version}
 
 	mux := http.NewServeMux()
 
@@ -61,6 +67,13 @@ func New(st *store.Store, eventer *bus.Bus, opts Options) *http.ServeMux {
 	if st != nil {
 		auth := bus.BearerAuth(st.Pool())
 		mux.Handle("GET /whoami", httpauth.Require(auth, a.whoami))
+		if a.blobs != nil {
+			// Reads resolve through the caller's refs, exactly as the guest
+			// capability does. HEAD shares the handler so a client can size an
+			// object before pulling it.
+			mux.Handle("GET /blobs/{hash}", httpauth.Require(auth, a.blobRead))
+			mux.Handle("HEAD /blobs/{hash}", httpauth.Require(auth, a.blobRead))
+		}
 		mux.Handle("POST /credentials", httpauth.Require(auth, a.enroll))
 	}
 

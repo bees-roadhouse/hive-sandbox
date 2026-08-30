@@ -140,6 +140,7 @@ func run() error {
 	var (
 		st      *store.Store
 		eventer *bus.Bus
+		catalog *blob.Catalog
 		wg      sync.WaitGroup
 	)
 	defer wg.Wait()
@@ -164,7 +165,8 @@ func run() error {
 		if dErr != nil {
 			return dErr
 		}
-		catalog, cErr := blob.NewCatalog(st.Pool(), driver)
+		var cErr error
+		catalog, cErr = blob.NewCatalog(st.Pool(), driver)
 		if cErr != nil {
 			return cErr
 		}
@@ -232,7 +234,7 @@ func run() error {
 	if cfg.serveAPI {
 		apiSrv := &http.Server{
 			Addr:              cfg.addr,
-			Handler:           httpapi.New(st, eventer, httpapi.Options{Version: version}),
+			Handler:           httpapi.New(st, eventer, httpapi.Options{Version: version, Blobs: catalog}),
 			ReadHeaderTimeout: 10 * time.Second,
 			// Deliberately no WriteTimeout: an SSE response is meant to stay
 			// open. The stream sets its own per-write deadline instead.

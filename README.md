@@ -21,16 +21,31 @@ Phase 0, and honest about the gap. What exists:
 | `internal/mcp` | the tools tier: what `tools/list` shows is what `tools/call` accepts |
 | `internal/manifest` | the app declaration and everything derivable from it; pure, no I/O |
 | `internal/registry` | manifest + module + Postgres = an installed app |
-| `internal/harness` | hosted agent runs under Podman |
+| `internal/harness` | hosted agent runs under Podman, persisted in Postgres |
 | `internal/egress` | the allowlisting proxy a run reaches the internet through |
+| `internal/httpapi` | liveness, readiness, events, enrollment, and blob reads |
 
-**The daemon has a spine but little built on top of it yet.** It opens the
-store, migrates, keeps the event partitions ahead of the clock, runs the
-LISTEN/NOTIFY bus, and serves `/healthz` plus an authenticated SSE stream of
-committed events at `/events`. Mounting the REST surface, the MCP tools tier,
-app installs and the workflow runner onto that spine is
-[issue #9](https://github.com/bees-roadhouse/hive-sandbox/issues/9); the
-journal app is still ahead.
+**The daemon now composes.** It opens the store, migrates, bootstraps an empty
+database, keeps the event partitions ahead of the clock, runs the LISTEN/NOTIFY
+bus, instantiates the wasm host with real Storage, Blob and Events, and serves
+its API on a port **and a unix socket** — the socket because a harness container
+runs `--network=none` with it bind-mounted, and on rootless Podman an
+`--internal` network has no gateway to the host at all.
+
+`docker/docker-compose.stack.yml` brings the whole thing up: Postgres, a
+pre-migration database dump, then the daemon.
+
+```bash
+podman compose -f docker/docker-compose.stack.yml up -d
+curl localhost:7979/readyz
+```
+
+`/healthz` is liveness and stays dumb on purpose; `/readyz` reports Postgres and
+the bus, and refuses until the bus has tailed once — serving before that
+publishes a replica whose stream resumes from a watermark it never established.
+
+What is still ahead: the workflow runner, app installs, the MCP tools tier over
+HTTP, chat over the harness, and the journal app.
 [Issue #29](https://github.com/bees-roadhouse/hive-sandbox/issues/29)
 tracks the lot.
 

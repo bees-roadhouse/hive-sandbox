@@ -2,6 +2,7 @@ package harness
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -187,6 +188,18 @@ func (s *Supervisor) Run(ctx context.Context, spec RunSpec, onEvent EventFunc) (
 	if cmd.Stdout != nil || cmd.Stderr != nil {
 		result.EndedAt = time.Now()
 		return s.finish(ctx, result, errors.New("harness: Launcher set Stdout or Stderr; the supervisor owns the pipes"))
+	}
+	// Same rule for stdin, and for the same reason: the supervisor owns the
+	// pipes. A Launcher that set this would race the prompt write below.
+	if cmd.Stdin != nil {
+		result.EndedAt = time.Now()
+		return s.finish(ctx, result, errors.New("harness: Launcher set Stdin; the supervisor owns the pipes"))
+	}
+	if len(spec.PromptStdin) > 0 {
+		// bytes.Reader rather than a pipe we manage: exec closes it when the
+		// content is exhausted, so the child sees EOF without the supervisor
+		// having to sequence a close against Start and Wait.
+		cmd.Stdin = bytes.NewReader(spec.PromptStdin)
 	}
 	// Escalate from the context's kill if the process ignores it.
 	cmd.WaitDelay = s.terminateGrace()

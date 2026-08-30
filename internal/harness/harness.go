@@ -146,8 +146,21 @@ type RunSpec struct {
 	// CLIVersion is recorded on the run alongside the digest. Informational.
 	CLIVersion string
 
-	// Args are passed to the CLI entrypoint. The prompt goes here.
+	// Args are passed to the CLI entrypoint.
+	//
+	// A PROMPT DOES NOT GO HERE. Use PromptStdin: argv is world-readable
+	// through /proc on the host, so a message put here is visible to every
+	// process on the box, and it is bounded by ARG_MAX besides. Flags belong
+	// in Args; content does not.
 	Args []string
+
+	// PromptStdin is written to the child's stdin and the pipe is then closed.
+	//
+	// This is where untrusted content goes. A chat message is written by a
+	// person and read by an agent, and neither argv nor the environment is an
+	// acceptable channel for it: both are readable by anything that can see
+	// the process, and both have length limits a message does not respect.
+	PromptStdin []byte
 
 	// Env is injected at spawn. Credentials arrive this way, from the vault,
 	// per run (D12.7). Nothing is baked into the image.

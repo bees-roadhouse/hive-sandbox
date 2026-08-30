@@ -333,3 +333,45 @@ func TestAgentRunStoreAcceptsEveryTerminalState(t *testing.T) {
 		})
 	}
 }
+
+// D17.3: an untrusted run must not reach the internet.
+//
+// Untrusted means content the platform pulled in from outside -- what a browse
+// or fetch returned -- not a message an authenticated principal typed. So a
+// normal chat turn is trusted and may use egress; a run carrying fetched
+// content may not.
+func TestUntrustedRunCannotHaveEgress(t *testing.T) {
+	t.Parallel()
+
+	st, cred := agentRunFixture(t)
+	ctx := t.Context()
+
+	tainted, err := store.NewAgentRunStore(st, store.RunWriter{Cred: cred, Trust: trust.Untrusted})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	rec := newRecord("run-tainted-egress")
+	rec.Network = harness.NetworkProxied
+	if createErr := tainted.CreateRun(ctx, rec); createErr == nil {
+		t.Fatal("an untrusted run was given egress")
+	}
+
+	// The same run without egress is fine: taint restricts the network, it does
+	// not stop the run.
+	rec2 := newRecord("run-tainted-noegress")
+	rec2.Network = harness.NetworkDaemon
+	if createErr := tainted.CreateRun(ctx, rec2); createErr != nil {
+		t.Errorf("an untrusted run without egress should be allowed: %v", createErr)
+	}
+
+	// And a trusted run may use egress, or the proxy would be unreachable.
+	clean, err := store.NewAgentRunStore(st, store.RunWriter{Cred: cred, Trust: trust.Trusted})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	rec3 := newRecord("run-trusted-egress")
+	rec3.Network = harness.NetworkProxied
+	if createErr := clean.CreateRun(ctx, rec3); createErr != nil {
+		t.Errorf("a trusted run must be able to use egress: %v", createErr)
+	}
+}

@@ -86,6 +86,11 @@ CREATE TABLE agent_runs (
     -- must land 'indeterminate' rather than re-firing. 'indeterminate' is
     -- therefore a first-class terminal state, not an error: it means the run
     -- may or may not have completed and NOTHING may retry it automatically.
+    -- A run caused by another run, so a loop guard has something to count
+    -- (D17.12). An agent that spawns an agent that spawns an agent is the
+    -- shape that spends money without a human ever seeing it.
+    cause_depth     int NOT NULL DEFAULT 0 CHECK (cause_depth >= 0),
+
     exit_code       int,
     event_count     int NOT NULL DEFAULT 0 CHECK (event_count >= 0),
     stderr_tail     text NOT NULL DEFAULT '',
@@ -95,6 +100,26 @@ CREATE TABLE agent_runs (
     heartbeat_at    timestamptz,
     deadline_at     timestamptz,
     ended_at        timestamptz,
+
+    -- D17.3 with teeth, on the column that actually grants egress.
+    --
+    -- An untrusted run must not reach the internet. workflow_runs already
+    -- carries the equivalent; agent_runs recorded trust and network and
+    -- structurally forbade nothing, so the one path that matters -- content a
+    -- browse or fetch returned, reaching a network it could send it to -- was
+    -- prevented by discipline alone.
+    --
+    -- This does NOT block chat. Untrusted means content the platform pulled in
+    -- from outside; a message typed by an authenticated principal spending
+    -- their own authority is first-party input and stays trusted. The reading
+    -- checks out by reductio: if user input were untrusted then every run would
+    -- be, this CHECK would forbid egress universally, and the egress proxy with
+    -- its per-run allowlist would be unreachable code.
+    --
+    -- It fires before a container exists: CreateRun runs ahead of the launcher,
+    -- so this is enforcement rather than decoration.
+    CONSTRAINT agent_runs_untrusted_has_no_egress
+        CHECK (trust = 'trusted' OR network <> 'proxied'),
 
     CONSTRAINT agent_runs_terminal_has_end
         CHECK (state = 'running' OR ended_at IS NOT NULL),

@@ -44,10 +44,22 @@ services:
       # the database. A dependent that starts then fails on a database that
       # does not exist yet.
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -q && psql -U $${POSTGRES_USER} -d $${POSTGRES_DB} -tAc 'select 1' >/dev/null"]
-      interval: 3s
+      #
+      # Interval and start_period are deliberately unhurried. Every probe is a
+      # transient systemd unit under rootless Podman, and a failing one exits
+      # non-zero -- so a tight interval during initdb produces a burst of failed
+      # units. A 3s interval here generated 171 failures in 19 seconds on a
+      # first boot (mostly exit 1 "not ready yet" and exit 125 "container
+      # already gone"), which is enough to set off a desktop's failed-unit
+      # notifier. Nothing was wrong; the probe was just asking too often while
+      # the answer could not yet be yes.
+      #
+      # 10s x 18 still gives three minutes of grace, which is more than initdb
+      # needs and far fewer units.
+      interval: 10s
       timeout: 5s
-      retries: 20
-      start_period: 10s
+      retries: 18
+      start_period: 40s
 
   # Runs to completion BEFORE the daemon starts, every start.
   #

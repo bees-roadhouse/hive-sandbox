@@ -73,8 +73,14 @@ CREATE TABLE agent_runs (
     -- claimed by the run.
     trust           text NOT NULL DEFAULT 'trusted' CHECK (trust IN ('trusted', 'untrusted')),
 
+    -- harness.TerminalState's values VERBATIM, plus 'running'. Shipped once
+    -- without 'deadline_exceeded', which terminalState() returns on the
+    -- ORDINARY long-answer path rather than on a crash path -- so FinishRun
+    -- raised, the row stayed 'running' forever, and the reclaimer kept finding
+    -- a run that had already ended.
     state           text NOT NULL DEFAULT 'running'
-        CHECK (state IN ('running', 'succeeded', 'failed', 'cancelled', 'indeterminate')),
+        CHECK (state IN ('running', 'succeeded', 'failed', 'deadline_exceeded',
+                         'cancelled', 'indeterminate')),
 
     -- INVARIANT 10 lives here. A harness run spends money, so a lease reclaim
     -- must land 'indeterminate' rather than re-firing. 'indeterminate' is

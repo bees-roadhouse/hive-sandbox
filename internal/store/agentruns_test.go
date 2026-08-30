@@ -285,3 +285,51 @@ func TestAgentRunStoreAcceptsEveryNetworkMode(t *testing.T) {
 		})
 	}
 }
+
+// Every TerminalState the harness can return must be recordable.
+//
+// Reproduction: 0002's state CHECK omitted 'deadline_exceeded', which
+// terminalState() returns on the ORDINARY long-answer path -- not a crash
+// path. FinishRun raised, the row stayed 'running' forever, and the reclaimer
+// kept finding a run that had already ended.
+//
+// Same root cause as the network CHECK: the states were enumerated instead of
+// read off harness.TerminalState, and the tests only ever used the two happy
+// ones.
+func TestAgentRunStoreAcceptsEveryTerminalState(t *testing.T) {
+	t.Parallel()
+
+	st, cred := agentRunFixture(t)
+	ctx := t.Context()
+
+	rs, err := store.NewAgentRunStore(st, store.RunWriter{Cred: cred, Trust: trust.Trusted})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	for i, state := range []harness.TerminalState{
+		harness.StateSucceeded, harness.StateFailed, harness.StateDeadlineExceeded,
+		harness.StateCancelled, harness.StateIndeterminate,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			rec := newRecord(fmt.Sprintf("run-state-%d", i))
+			if createErr := rs.CreateRun(ctx, rec); createErr != nil {
+				t.Fatalf("create: %v", createErr)
+			}
+			if finErr := rs.FinishRun(ctx, rec.RunID, harness.Result{
+				State: state, ExitCode: -1,
+				StartedAt: rec.StartedAt, EndedAt: time.Now().UTC(),
+			}); finErr != nil {
+				t.Fatalf("FinishRun with state %q: %v", state, finErr)
+			}
+			var got string
+			if qErr := st.Pool().QueryRow(ctx,
+				`SELECT state FROM agent_runs WHERE run_key = $1`, rec.RunID).Scan(&got); qErr != nil {
+				t.Fatalf("read back: %v", qErr)
+			}
+			if got != string(state) {
+				t.Errorf("state = %q, want %q", got, state)
+			}
+		})
+	}
+}

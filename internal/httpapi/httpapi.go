@@ -40,13 +40,19 @@ func New(st *store.Store, eventer *bus.Bus, opts Options) *http.ServeMux {
 
 	mux := http.NewServeMux()
 
-	// Liveness only. Readiness needs Postgres and the bus, so it lands with them.
+	// Liveness only, and deliberately so: see readyz.go for why this one must
+	// not learn to check dependencies.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// A failed write here means the client went away mid-response. Nothing
 		// to do about it and nothing worth logging on a liveness probe.
 		_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`+"\n", a.version)
 	})
+
+	// Unauthenticated on purpose. A readiness probe runs before any credential
+	// exists -- an orchestrator has none -- and it reports only whether this
+	// process can serve, never anything about the data it would serve.
+	mux.HandleFunc("GET /readyz", a.readyz)
 
 	if st != nil && eventer != nil {
 		mux.Handle("GET /events", eventer.SSEHandler(st.Guard(), bus.BearerAuth(st.Pool()), bus.SSEOptions{}))

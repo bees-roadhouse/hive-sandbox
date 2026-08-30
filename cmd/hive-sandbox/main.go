@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -32,6 +33,7 @@ var version = "dev"
 
 type config struct {
 	addr         string
+	unixSocket   string
 	serveAPI     bool
 	runWorkflows bool
 
@@ -81,6 +83,8 @@ func run() error {
 	var cfg config
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.StringVar(&cfg.addr, "addr", ":7979", "listen address for the HTTP surface")
+	flag.StringVar(&cfg.unixSocket, "unix-socket", os.Getenv("HIVE_SANDBOX_UNIX_SOCKET"),
+		"also serve the API on this unix socket path (env HIVE_SANDBOX_UNIX_SOCKET)")
 	flag.BoolVar(&cfg.serveAPI, "serve-api", true, "serve REST, MCP and SSE")
 	flag.BoolVar(&cfg.runWorkflows, "run-workflows", true, "claim and execute workflow steps")
 	flag.StringVar(&cfg.databaseURL, "database-url", os.Getenv("HIVE_SANDBOX_DATABASE_URL"),
@@ -155,7 +159,10 @@ func run() error {
 	}
 
 	var servers []*http.Server
-	errCh := make(chan error, 2)
+	// Buffered for every listener that can report: egress, api, api-unix. An
+	// unbuffered send from a listener nobody is reading would leak its
+	// goroutine on the shutdown path.
+	errCh := make(chan error, 3)
 
 	if cfg.runEgressProxy {
 		proxySrv, err := egressServer(cfg)
@@ -176,6 +183,21 @@ func run() error {
 		}
 		servers = append(servers, apiSrv)
 		go listen(apiSrv, "api", cfg.addr, errCh)
+
+		// The SAME server on a second listener, so one Shutdown drains both and
+		// the socket cannot outlive the port it is meant to mirror.
+		//
+		// Invariant 13: a harness container runs --network=none with this file
+		// bind-mounted, because on rootless Podman an --internal network has no
+		// gateway and cannot reach the host at all. Without this the harness has
+		// no route to the API and the failure looks like a bug inside the run.
+		if cfg.unixSocket != "" {
+			ln, err := unixListener(ctx, cfg.unixSocket)
+			if err != nil {
+				return err
+			}
+			go serve(apiSrv, "api-unix", ln, errCh)
+		}
 	}
 
 	if len(servers) == 0 {
@@ -233,6 +255,16 @@ func prepare(ctx context.Context, st *store.Store, cfg config) error {
 func listen(srv *http.Server, role, addr string, errCh chan<- error) {
 	slog.Info("listening", "role", role, "addr", addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		errCh <- fmt.Errorf("%s: %w", role, err)
+	}
+}
+
+// serve is listen for a listener we already hold. ListenAndServe cannot express
+// a unix socket, and the socket has to be bound and chmod'ed before anything is
+// served over it.
+func serve(srv *http.Server, role string, ln net.Listener, errCh chan<- error) {
+	slog.Info("listening", "role", role, "addr", ln.Addr().String())
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		errCh <- fmt.Errorf("%s: %w", role, err)
 	}
 }

@@ -22,10 +22,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bees-roadhouse/hive-sandbox/internal/blob"
 	"github.com/bees-roadhouse/hive-sandbox/internal/bus"
 	"github.com/bees-roadhouse/hive-sandbox/internal/egress"
 	"github.com/bees-roadhouse/hive-sandbox/internal/httpapi"
 	"github.com/bees-roadhouse/hive-sandbox/internal/store"
+	"github.com/bees-roadhouse/hive-sandbox/internal/wasmhost"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
@@ -39,6 +41,8 @@ type config struct {
 
 	databaseURL string
 	migrate     bool
+
+	blob blobConfig
 
 	runEgressProxy     bool
 	egressAddr         string
@@ -90,6 +94,10 @@ func run() error {
 	flag.StringVar(&cfg.databaseURL, "database-url", os.Getenv("HIVE_SANDBOX_DATABASE_URL"),
 		"Postgres connection string (or HIVE_SANDBOX_DATABASE_URL)")
 	flag.BoolVar(&cfg.migrate, "migrate", true, "apply pending migrations at boot")
+	flag.StringVar(&cfg.blob.driver, "blob-driver", envOr("HIVE_SANDBOX_BLOB_DRIVER", "disk"),
+		"blob backend: disk or s3 (env HIVE_SANDBOX_BLOB_DRIVER)")
+	flag.StringVar(&cfg.blob.root, "blob-root", envOr("HIVE_SANDBOX_BLOB_ROOT", "/var/lib/hive/blobs"),
+		"blob root for the disk driver (env HIVE_SANDBOX_BLOB_ROOT)")
 	flag.BoolVar(&cfg.runEgressProxy, "run-egress-proxy", false,
 		"run the allowlisting egress proxy for a harness run (D12.6)")
 	flag.StringVar(&cfg.egressAddr, "egress-addr", ":3128", "listen address for the egress proxy")
@@ -147,6 +155,54 @@ func run() error {
 		if err := prepare(ctx, st, cfg); err != nil {
 			return err
 		}
+
+		// The guest data layer and the runtime that calls it. Built here
+		// rather than lazily because a daemon that comes up and only discovers
+		// at first guest call that it has no blob backend has already told an
+		// orchestrator it was ready.
+		driver, dErr := blobDriver(cfg.blob)
+		if dErr != nil {
+			return dErr
+		}
+		catalog, cErr := blob.NewCatalog(st.Pool(), driver)
+		if cErr != nil {
+			return cErr
+		}
+		appData, aErr := store.NewAppData(st, catalog, slog.Default())
+		if aErr != nil {
+			return aErr
+		}
+		guestEvents, eErr := store.NewGuestEvents(st)
+		if eErr != nil {
+			return eErr
+		}
+		guestBlobs, bErr := store.NewGuestBlobs(st, catalog, slog.Default())
+		if bErr != nil {
+			return bErr
+		}
+
+		// KV and Sanitizer stay stubbed: both are unbuilt, and a nil field
+		// resolves to a stub that answers StatusUnimplemented rather than
+		// crashing. Storage, Blob and Events are real.
+		host, hErr := wasmhost.New(ctx, wasmhost.Config{}, wasmhost.Deps{
+			Storage: appData,
+			Blob:    guestBlobs,
+			Events:  guestEvents,
+		})
+		if hErr != nil {
+			return hErr
+		}
+		defer func() {
+			// Its own context: ctx is already cancelled by the time this runs,
+			// and a Close that inherits a dead context tears down without
+			// draining.
+			closeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := host.Close(closeCtx); err != nil {
+				slog.Error("wasm host close", "err", err)
+			}
+		}()
+		slog.Info("wasm host ready", "blob_driver", driver.Name())
 
 		eventer = bus.New(st.Pool(), bus.Config{Logger: slog.Default()})
 		wg.Add(1)
@@ -335,4 +391,13 @@ func bootstrapFromEnv(ctx context.Context, st *store.Store) error {
 	}
 	slog.Info("bootstrap credential present", "actor", res.RootActorID)
 	return nil
+}
+
+// envOr is a flag default that an environment variable can override, so the
+// same binary configures the same way from a shell and from a compose file.
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

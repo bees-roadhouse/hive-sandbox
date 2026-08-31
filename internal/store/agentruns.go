@@ -43,6 +43,16 @@ type RunWriter struct {
 	// run started from a chat -- which is why agent_runs is not parented to
 	// workflow_steps.
 	StepID *uuid.UUID
+
+	// ConversationID and TurnID link the run to a chat turn, when one caused
+	// it. Both nil for a workflow run.
+	//
+	// Here rather than on RunRecord for the same reason as everything else in
+	// this struct: a caller that could supply them could attribute its run to
+	// someone else's conversation, and agent_runs_turn_uq would then be
+	// enforcing at-most-once over a number the caller chose.
+	ConversationID *uuid.UUID
+	TurnID         *uuid.UUID
 }
 
 func (w RunWriter) validate() error {
@@ -94,8 +104,8 @@ func (a *AgentRunStore) CreateRun(ctx context.Context, rec harness.RunRecord) er
 		     author_actor, owner_kind, owner_id, agent_actor, workflow_step_id,
 		     run_key, runtime, image_digest, cli_version, model, session_id,
 		     network, memory_bytes, cpus, pids_limit, trust,
-		     started_at, deadline_at
-		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+		     started_at, deadline_at, conversation_id, turn_id
+		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
 		 RETURNING id`,
 		// Pinned from the credential, never from rec.
 		a.writer.Cred.ActorID, owner.Kind, owner.ID,
@@ -105,7 +115,7 @@ func (a *AgentRunStore) CreateRun(ctx context.Context, rec harness.RunRecord) er
 		rec.Model, rec.SessionID, string(rec.Network),
 		rec.Limits.MemoryBytes, rec.Limits.CPUs, rec.Limits.PidsLimit,
 		string(a.writer.Trust.Normalize()),
-		started, deadline,
+		started, deadline, a.writer.ConversationID, a.writer.TurnID,
 	).Scan(&id)
 	if err != nil {
 		return fmt.Errorf("agent run: create %s: %w", rec.RunID, err)

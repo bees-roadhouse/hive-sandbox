@@ -1,0 +1,66 @@
+# The hive-sandbox daemon: the image the platform actually ships as.
+#
+# Same binary as docker/egress/Containerfile builds, different entrypoint. The
+# egress image hard-disables every role but the proxy because an egress proxy
+# that also served the API would be a way around the isolation it exists to
+# enforce; this one enables the platform roles and leaves the proxy off, for the
+# mirror-image reason. One codebase, two deliberately narrow entrypoints.
+#
+# Built by scripts/image-build.ps1 (or .sh) from the repo root, because the build
+# stage needs the whole module.
+
+FROM docker.io/library/golang:1.26-bookworm AS build
+
+WORKDIR /src
+
+# Module files first so a source-only change does not redownload the module
+# cache.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ARG VERSION=dev
+# CGO_ENABLED=0 for a static binary that runs on a distroless base, and because
+# the host is CGo-free on purpose (wazero is pure Go and that is the point).
+# Set explicitly rather than relying on the absence of a C toolchain, which is
+# the kind of thing that changes when a base image does.
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags "-s -w -X main.version=${VERSION}" \
+    -o /out/hive-sandbox ./cmd/hive-sandbox
+
+# --- runtime -----------------------------------------------------------------
+# Distroless static: no shell, no package manager, nothing to pivot to. That is
+# worth more here than in the egress image, because this process holds the
+# database credential.
+#
+# It also means there is no `curl` and no `wget` for a HEALTHCHECK to call. The
+# healthcheck is deliberately left to whatever schedules this ... compose, or a
+# k8s httpGet probe against /healthz ... rather than faked with a shell that is
+# not in the image.
+FROM gcr.io/distroless/static-debian12:nonroot AS daemon
+
+COPY --from=build /out/hive-sandbox /usr/local/bin/hive-sandbox
+
+# nonroot in the distroless base. The daemon needs no root: it binds 7979, which
+# is unprivileged, and writes blobs to a mounted path it is given.
+USER 65532:65532
+
+EXPOSE 7979
+
+LABEL org.beesroadhouse.hive-sandbox.component=daemon
+
+# The platform roles, and NOT the egress proxy. -run-egress-proxy stays off so
+# this image cannot become the thing that fences harness runs; that is the
+# egress image's whole job, and it runs on the per-run internal network where
+# this one has no business being.
+#
+# The database URL arrives at run time as HIVE_SANDBOX_DATABASE_URL. There is no
+# default: a daemon that silently came up against the wrong database would be
+# worse than one that refuses to start, and main.go already refuses.
+ENTRYPOINT ["/usr/local/bin/hive-sandbox", \
+            "-serve-api", \
+            "-run-workflows", \
+            "-run-egress-proxy=false", \
+            "-addr=:7979"]

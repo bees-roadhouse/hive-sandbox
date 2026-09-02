@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,9 +22,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bees-roadhouse/hive-sandbox/internal/blob"
 	"github.com/bees-roadhouse/hive-sandbox/internal/bus"
 	"github.com/bees-roadhouse/hive-sandbox/internal/egress"
+	"github.com/bees-roadhouse/hive-sandbox/internal/httpapi"
 	"github.com/bees-roadhouse/hive-sandbox/internal/store"
+	"github.com/bees-roadhouse/hive-sandbox/internal/wasmhost"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
@@ -31,11 +35,14 @@ var version = "dev"
 
 type config struct {
 	addr         string
+	unixSocket   string
 	serveAPI     bool
 	runWorkflows bool
 
 	databaseURL string
 	migrate     bool
+
+	blob blobConfig
 
 	runEgressProxy     bool
 	egressAddr         string
@@ -80,11 +87,17 @@ func run() error {
 	var cfg config
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.StringVar(&cfg.addr, "addr", ":7979", "listen address for the HTTP surface")
+	flag.StringVar(&cfg.unixSocket, "unix-socket", os.Getenv("HIVE_SANDBOX_UNIX_SOCKET"),
+		"also serve the API on this unix socket path (env HIVE_SANDBOX_UNIX_SOCKET)")
 	flag.BoolVar(&cfg.serveAPI, "serve-api", true, "serve REST, MCP and SSE")
 	flag.BoolVar(&cfg.runWorkflows, "run-workflows", true, "claim and execute workflow steps")
 	flag.StringVar(&cfg.databaseURL, "database-url", os.Getenv("HIVE_SANDBOX_DATABASE_URL"),
 		"Postgres connection string (or HIVE_SANDBOX_DATABASE_URL)")
 	flag.BoolVar(&cfg.migrate, "migrate", true, "apply pending migrations at boot")
+	flag.StringVar(&cfg.blob.driver, "blob-driver", envOr("HIVE_SANDBOX_BLOB_DRIVER", "disk"),
+		"blob backend: disk or s3 (env HIVE_SANDBOX_BLOB_DRIVER)")
+	flag.StringVar(&cfg.blob.root, "blob-root", envOr("HIVE_SANDBOX_BLOB_ROOT", "/var/lib/hive/blobs"),
+		"blob root for the disk driver (env HIVE_SANDBOX_BLOB_ROOT)")
 	flag.BoolVar(&cfg.runEgressProxy, "run-egress-proxy", false,
 		"run the allowlisting egress proxy for a harness run (D12.6)")
 	flag.StringVar(&cfg.egressAddr, "egress-addr", ":3128", "listen address for the egress proxy")
@@ -127,6 +140,7 @@ func run() error {
 	var (
 		st      *store.Store
 		eventer *bus.Bus
+		catalog *blob.Catalog
 		wg      sync.WaitGroup
 	)
 	defer wg.Wait()
@@ -143,6 +157,55 @@ func run() error {
 			return err
 		}
 
+		// The guest data layer and the runtime that calls it. Built here
+		// rather than lazily because a daemon that comes up and only discovers
+		// at first guest call that it has no blob backend has already told an
+		// orchestrator it was ready.
+		driver, dErr := blobDriver(cfg.blob)
+		if dErr != nil {
+			return dErr
+		}
+		var cErr error
+		catalog, cErr = blob.NewCatalog(st.Pool(), driver)
+		if cErr != nil {
+			return cErr
+		}
+		appData, aErr := store.NewAppData(st, catalog, slog.Default())
+		if aErr != nil {
+			return aErr
+		}
+		guestEvents, eErr := store.NewGuestEvents(st)
+		if eErr != nil {
+			return eErr
+		}
+		guestBlobs, bErr := store.NewGuestBlobs(st, catalog, slog.Default())
+		if bErr != nil {
+			return bErr
+		}
+
+		// KV and Sanitizer stay stubbed: both are unbuilt, and a nil field
+		// resolves to a stub that answers StatusUnimplemented rather than
+		// crashing. Storage, Blob and Events are real.
+		host, hErr := wasmhost.New(ctx, wasmhost.Config{}, wasmhost.Deps{
+			Storage: appData,
+			Blob:    guestBlobs,
+			Events:  guestEvents,
+		})
+		if hErr != nil {
+			return hErr
+		}
+		defer func() {
+			// Its own context: ctx is already cancelled by the time this runs,
+			// and a Close that inherits a dead context tears down without
+			// draining.
+			closeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := host.Close(closeCtx); err != nil {
+				slog.Error("wasm host close", "err", err)
+			}
+		}()
+		slog.Info("wasm host ready", "blob_driver", driver.Name())
+
 		eventer = bus.New(st.Pool(), bus.Config{Logger: slog.Default()})
 		wg.Add(1)
 		go func() {
@@ -154,7 +217,10 @@ func run() error {
 	}
 
 	var servers []*http.Server
-	errCh := make(chan error, 2)
+	// Buffered for every listener that can report: egress, api, api-unix. An
+	// unbuffered send from a listener nobody is reading would leak its
+	// goroutine on the shutdown path.
+	errCh := make(chan error, 3)
 
 	if cfg.runEgressProxy {
 		proxySrv, err := egressServer(cfg)
@@ -168,13 +234,28 @@ func run() error {
 	if cfg.serveAPI {
 		apiSrv := &http.Server{
 			Addr:              cfg.addr,
-			Handler:           newMux(st, eventer),
+			Handler:           httpapi.New(st, eventer, httpapi.Options{Version: version, Blobs: catalog}),
 			ReadHeaderTimeout: 10 * time.Second,
 			// Deliberately no WriteTimeout: an SSE response is meant to stay
 			// open. The stream sets its own per-write deadline instead.
 		}
 		servers = append(servers, apiSrv)
 		go listen(apiSrv, "api", cfg.addr, errCh)
+
+		// The SAME server on a second listener, so one Shutdown drains both and
+		// the socket cannot outlive the port it is meant to mirror.
+		//
+		// Invariant 13: a harness container runs --network=none with this file
+		// bind-mounted, because on rootless Podman an --internal network has no
+		// gateway and cannot reach the host at all. Without this the harness has
+		// no route to the API and the failure looks like a bug inside the run.
+		if cfg.unixSocket != "" {
+			ln, err := unixListener(ctx, cfg.unixSocket)
+			if err != nil {
+				return err
+			}
+			go serve(apiSrv, "api-unix", ln, errCh)
+		}
 	}
 
 	if len(servers) == 0 {
@@ -232,6 +313,16 @@ func prepare(ctx context.Context, st *store.Store, cfg config) error {
 func listen(srv *http.Server, role, addr string, errCh chan<- error) {
 	slog.Info("listening", "role", role, "addr", addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		errCh <- fmt.Errorf("%s: %w", role, err)
+	}
+}
+
+// serve is listen for a listener we already hold. ListenAndServe cannot express
+// a unix socket, and the socket has to be bound and chmod'ed before anything is
+// served over it.
+func serve(srv *http.Server, role string, ln net.Listener, errCh chan<- error) {
+	slog.Info("listening", "role", role, "addr", ln.Addr().String())
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		errCh <- fmt.Errorf("%s: %w", role, err)
 	}
 }
@@ -304,20 +395,11 @@ func bootstrapFromEnv(ctx context.Context, st *store.Store) error {
 	return nil
 }
 
-func newMux(st *store.Store, eventer *bus.Bus) *http.ServeMux {
-	mux := http.NewServeMux()
-
-	// Liveness only. Readiness needs Postgres and the bus, so it lands with them.
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		// A failed write here means the client went away mid-response. Nothing
-		// to do about it and nothing worth logging on a liveness probe.
-		_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`+"\n", version)
-	})
-
-	if st != nil && eventer != nil {
-		mux.Handle("GET /events", eventer.SSEHandler(st.Guard(), bus.BearerAuth(st.Pool()), bus.SSEOptions{}))
+// envOr is a flag default that an environment variable can override, so the
+// same binary configures the same way from a shell and from a compose file.
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-
-	return mux
+	return fallback
 }

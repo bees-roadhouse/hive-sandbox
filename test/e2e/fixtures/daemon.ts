@@ -1,6 +1,8 @@
 import { type ChildProcess, spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import net from 'node:net';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 import { buildInfoPath, type BuildInfo } from './paths';
 
@@ -64,12 +66,16 @@ export async function startDaemon(options: DaemonOptions): Promise<RunningDaemon
   const info = JSON.parse(readFileSync(buildInfoPath, 'utf8')) as BuildInfo;
   const port = await freePort();
   const url = `http://127.0.0.1:${port}`;
+  // The daemon's defaults live under /var/lib, which a test runner cannot
+  // write; every daemon gets its own scratch roots, removed when it stops.
+  const scratch = mkdtempSync(path.join(tmpdir(), 'hive-e2e-'));
 
   const child: ChildProcess = spawn(info.binaryPath, ['-addr', `127.0.0.1:${port}`], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
       HIVE_SANDBOX_DATABASE_URL: options.databaseURL,
+      HIVE_SANDBOX_BLOB_ROOT: path.join(scratch, 'blobs'),
       // D19.1: the root actor and its first credential arrive out of band.
       // There is no API path that could create either.
       HIVE_SANDBOX_BOOTSTRAP_HANDLE: 'e2e-root',
@@ -107,6 +113,7 @@ export async function startDaemon(options: DaemonOptions): Promise<RunningDaemon
       child.kill('SIGKILL');
       await exited;
     }
+    rmSync(scratch, { recursive: true, force: true });
   };
 
   const deadline = Date.now() + 20_000;

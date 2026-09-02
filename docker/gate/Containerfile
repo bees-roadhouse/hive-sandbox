@@ -1,0 +1,32 @@
+# The toolchain the born-green gate runs in.
+#
+# This exists so the gate does not require a Go toolchain, a golangci-lint and a
+# C compiler installed on the machine ... only Podman, which the harness and
+# egress tiers already require. `scripts/gate-container.sh` mounts the checkout
+# into this and runs the ordinary `scripts/gate.sh` inside it, so there is one
+# gate rather than a containerized variant that can drift from the real one.
+#
+# Built by scripts/gate-container.ps1 (or .sh) on first use.
+
+FROM docker.io/library/golang:1.26-bookworm AS gate
+
+# Built from source with THIS image's Go rather than downloading a release
+# binary, for the reason the first CI run here found: a golangci-lint compiled
+# against an older Go refuses to load a config targeting a newer one. Pinning
+# the tool to the toolchain that will lint with it is the whole point, and it is
+# why the version tracks the base image rather than a version ARG.
+RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+
+# `go test -race` needs cgo and a C compiler. The bookworm base carries gcc, and
+# CGO_ENABLED defaults to 1 here ... unlike the daemon image, which sets it to 0
+# on purpose. A gate image that quietly disabled cgo would turn every -race run
+# into a normal run and report green over a detector that never ran.
+RUN gcc --version >/dev/null && echo "cgo toolchain present"
+
+# The gate shells out to these. Failing here beats failing three minutes into a
+# run with a confusing message from a script that assumed a coreutil.
+RUN command -v git >/dev/null && command -v gofmt >/dev/null
+
+ENV GOFLAGS=-buildvcs=false
+
+WORKDIR /src

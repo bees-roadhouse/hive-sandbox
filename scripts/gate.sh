@@ -22,7 +22,10 @@ else
 fi
 
 echo "==> gofmt -l ."
-unformatted=$(gofmt -l . | grep -v node_modules || true)
+# .gocache is gate-container.sh's own build and module cache, mounted inside
+# the tree it formats; without this exclusion the gate flags the toolchain's
+# vendored sources as unformatted and reds itself.
+unformatted=$(gofmt -l . | grep -v node_modules | grep -v '^\.gocache/' || true)
 if [ -n "$unformatted" ]; then
   echo "unformatted files:"
   echo "$unformatted"

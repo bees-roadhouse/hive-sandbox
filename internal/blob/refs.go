@@ -147,6 +147,20 @@ func (c *Catalog) Publish(
 // Honest dedup has the caller holding the bytes. A Sealed is evidence of that
 // and a Hash is not, so the signature can now tell the two apart. To reference
 // bytes already held without re-sealing them, use [Catalog.LinkRef].
+// BeginUpload opens a driver write through the catalog.
+//
+// It exists so a producer above the seam never has to hold the Driver itself,
+// and so the bytes are sealed by the SAME driver whose Name() and Key()
+// Publish will record. Handing a caller the Driver lets those two diverge, and
+// the row then names a backend the bytes are not in.
+//
+// An Upload confers nothing on its own. Only a Sealed reaches Publish, and
+// Publish refuses one that did not come from a driver -- a hash alone is not
+// evidence of possession.
+func (c *Catalog) BeginUpload(ctx context.Context, spec CreateUpload) (Upload, error) {
+	return c.driver.CreateUpload(ctx, spec)
+}
+
 func (c *Catalog) AddRef(ctx context.Context, tx pgx.Tx, sealed Sealed, spec RefSpec) (Ref, error) {
 	if err := spec.validate(); err != nil {
 		return Ref{}, err

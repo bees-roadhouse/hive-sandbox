@@ -82,15 +82,25 @@ func TestTailPrunesPartitions(t *testing.T) {
 		if name == nil {
 			t.Fatalf("partition -%d months could not be created", months-1-i)
 		}
-		// Mid-month and mid-day, so nothing sits near a boundary.
+		// Mid-month for every month but the current one. The current month is
+		// clamped to an hour ago: the trigger rejects a created_at more than an
+		// hour ahead of the server clock, and the 16th is in the future for the
+		// first half of every month ... this fixture passed all of late August
+		// and failed on the 2nd of September. GREATEST keeps the first hour of
+		// a month inside that month rather than sliding into the previous one.
+		// Everything stays a UTC-naive timestamp until the final AT TIME ZONE,
+		// so no comparison is coerced through the session zone.
 		if _, err := s.Pool().Exec(ctx, `
 			INSERT INTO events (created_at, kind, owner_kind, owner_id, author_actor,
 			                    principal_kind, principal_id)
-			SELECT (date_trunc('month', now() AT TIME ZONE 'UTC')
-			        - make_interval(months => $1)
-			        + interval '15 days' + make_interval(mins => g)) AT TIME ZONE 'UTC',
+			SELECT (GREATEST(m.month_start,
+			                 LEAST(m.month_start + interval '15 days',
+			                       (now() AT TIME ZONE 'UTC') - interval '1 hour'))
+			        + make_interval(mins => g)) AT TIME ZONE 'UTC',
 			       'test.event', 'user', $2, $2, 'user', $2
-			  FROM generate_series(0, 4) AS g`, months-1-i, alice); err != nil {
+			  FROM (SELECT date_trunc('month', now() AT TIME ZONE 'UTC')
+			               - make_interval(months => $1) AS month_start) AS m,
+			       generate_series(0, 4) AS g`, months-1-i, alice); err != nil {
 			t.Fatalf("insert events -%d months: %v", months-1-i, err)
 		}
 	}

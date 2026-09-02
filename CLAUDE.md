@@ -110,6 +110,11 @@ export HIVE_SANDBOX_TEST_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
 ./scripts/gate.sh
 ```
 
+No local toolchain needed: `./scripts/gate-container.sh` runs this same gate
+inside a Podman-built toolchain image ... Go, golangci-lint and the C compiler
+for `-race` live in the image, Podman is the only thing the host needs, and
+anything after `--` runs there in place of the gate.
+
 **The database line is not optional and the gate now refuses without it.** It
 used to be a suggestion, and the result was shape 2 from the list below at full
 scale: without that variable **125 tests skip themselves** ... every
@@ -126,25 +131,112 @@ hears it.
 Order matters: `gofmt` AFTER any lint autofix. The toolchain is pinned in
 `go.mod`; CI runs the same version.
 
+## Running things
+
+```bash
+go run ./cmd/hive-sandbox                                  # every role, :7979
+curl localhost:7979/healthz
+
+go test ./internal/store -run TestAbsenceIsDeny -race -v    # one test
+go test ./internal/wasmhost -race                           # one package
+```
+
+A single test needs `HIVE_SANDBOX_TEST_DATABASE_URL` exactly as much as the gate
+does, and skips itself without it ... `-run` narrows what executes, it does not
+change what a skip means. `testdb.Pool` hands every test a private schema and
+drops it on the way out, so there is no shared mutable fixture and no ordering
+between tests: run one, run them in parallel, run them in any order.
+
+There are four test tiers and three of them are invisible to `go test ./...` on
+a bare machine:
+
+| tier | needs | brought up by |
+|---|---|---|
+| unit + integration | Postgres | `./scripts/db-up.sh` |
+| container (harness, egress) | Podman, both images | `./scripts/harness-build.sh`, `./scripts/egress-build.sh` |
+| blob store (S3 driver) | Garage, four `HIVE_SANDBOX_TEST_S3_*` | `./scripts/garage-up.sh` |
+| end-to-end | a daemon and chromium | `cd test/e2e && npm install && npm run browsers && npm test` |
+
+**`HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS=1` turns a skip into a failure.** It is
+the enforcement half of "Check the skip" below, and CI sets it on every job that
+promised a backend ... a job that provisions Podman and then skips the Podman
+tests reports success for doing nothing.
+
+Guests are a separate build: `./scripts/build-guests.sh` needs tinygo 0.41.1 and
+binaryen's `wasm-opt`. The built `.wasm` is checked in under
+`internal/wasmhost/testdata/` so the host suite runs without a wasm toolchain,
+and CI rebuilds it from source to prove the checked-in bytes still match.
+
+## This file is under test
+
+`internal/repodocs` asserts against `../../CLAUDE.md`. It exists because this
+file was silently reverted four times by merges from branches cut before an
+invariant was written, and nobody caught one of them at merge time.
+
+- The numbered invariants must stay contiguous from 1, and there must be at
+  least `minInvariants` of them. Adding one means raising that constant in the
+  same commit. The regex is anchored at column zero, so nested numbered lists
+  elsewhere in this file are invisible to it ... keep them indented.
+- Ten load-bearing phrases must survive verbatim. Rewording one means updating
+  `requiredPhrases` in the same commit.
+- A phrase must not span a line break. This file is hard-wrapped and the check
+  reads raw bytes, so a sentence that renders as one line can be two in source.
+
+When the gate fails on either check, the question is which side is stale. A
+branch that predates an invariant rebases and keeps the version with more
+guidance, never fewer.
+
 ## Layout
 
 ```
-cmd/hive-sandbox/      the daemon entrypoint (role flags: --serve-api, --run-workflows)
-internal/store/        Postgres: migrations, the data layer, the grant predicate
+cmd/hive-sandbox/      the daemon entrypoint. Roles are flags, one process serves all
+                       of them (D7): -serve-api, -run-workflows, -run-egress-proxy.
+                       -addr defaults to :7979
+internal/manifest/     the app declaration and everything derived from it. Deliberately
+                       pure ... it parses, validates and derives, opens no connections
+                       and runs no guests, so everything with I/O consumes its output
+internal/registry/     manifest + module + Postgres = an installed app. Where a claim
+                       meets its evidence. Everything decidable at install is
+                       decided at install, so nothing re-litigates it per call
+internal/store/        Postgres: migrations, the data layer, the grant predicate. The
+                       single enforcement point; nothing outside it touches grants
 internal/bus/          events table + LISTEN/NOTIFY + SSE fan-out
-internal/wasmhost/     wazero runtime, compiled-module cache, instance LRU, the ABI
+internal/wasmhost/     wazero runtime, compiled-module cache, instance LRU, the ABI.
+                       The guest contract is written up in its doc.go, not here
+internal/blob/         the driver seam: disk and S3-compatible (Garage) drivers,
+                       chosen at config time (D11)
+internal/harness/      hosted agent runs (claude / codex / opencode), rootless Podman
+internal/egress/       the allowlisting proxy a harness run reaches the internet through
+internal/mcp/          the tool surface. Everything tools/list shows, tools/call accepts
+internal/httpauth/     request-to-credential resolution and THE one 401 shape,
+                       shared by SSE and REST
+internal/httpapi/      the daemon's HTTP surface: healthz, events, whoami,
+                       device enrollment for desktop clients
+internal/identity/     the credential every layer passes around. Types and validation only
+internal/trust/        provenance carried across every layer (invariants 3 and 12)
+internal/testdb/       schema-per-test Postgres for integration tests
+internal/repodocs/     no code. The gate's assertions about this repo's own documentation
 guest/                 the SDK a WASM guest links against (own module, wasip1 only)
-internal/blob/         the driver seam: disk now, S3-compatible later
-internal/workflow/     defs, runs, steps, claim/lease/timer/wait
-internal/harness/      hosted agent runs (claude / codex / opencode)
-apps/                  pre-built first-party guest apps (journal first)
-docs/                  repo-local docs; the design lives in the epic
-test/                  integration tests, including Playwright-driven HTTP/SSE
+apps/                  first-party guest apps. apps/hello is the reference one
+desktop/               the Linux desktop client: a Wails v3 shell over a
+                       webview-free core. Own module, own gate script; see docs/desktop.md
+docs/                  per-topic docs (development.md installs the toolchain from
+                       nothing); the design lives in the epic
+test/e2e/              Playwright end-to-end tests that drive a real daemon over HTTP
 ```
+
+`internal/workflow/` does not exist yet, and neither does the journal app.
+Invariants 6 and 10 are therefore written against a design rather than against
+code: they bind the moment it lands (issue #29). Everything else above is real
+and has tests.
 
 ## Conventions
 
 - Go 1.26, no CGo anywhere in the host. wazero is pure Go and that is the point.
+  **`desktop/` is the deliberate carve-out**: its Wails shell links GTK/WebKit
+  through cgo, lives in its own nested module so the host gate never builds it,
+  and `scripts/build-desktop.sh` plus the CI `desktop` job are where it is
+  checked instead.
 - Guests target **WASI preview1 only**. Never import wasip2 or component-model.
   The host enforces this at link time in `checkModule`, so it is not a
   convention you can drift away from. Guests build with `-scheduler=none`;
@@ -170,7 +262,11 @@ test/                  integration tests, including Playwright-driven HTTP/SSE
   except `Sealed` was a plain struct, so `Sealed{Hash: stolenHash}` satisfied the
   new signature and changed nothing. It carries an unexported marker now. If a
   type stands in for a capability, make sure a caller cannot simply write one
-  down. The same goes for helpers: `FullPath` was concatenation that turned
+  down. The signature has since split (#76): `AddRef` writes a first reference
+  to bytes a driver just sealed; `LinkRef` references bytes the caller already
+  holds, authorised by a live reference and never raising trust ... so host
+  code facing a hash out of guest JSON links rather than adds. The same goes
+  for helpers: `FullPath` was concatenation that turned
   `/../other` into `/apps/other`, and the fix was making its doc say it is not a
   boundary rather than making it silently rewrite routes. **A helper that looks
   protective and is not is worse than an obviously blunt one, because the next

@@ -1,0 +1,25 @@
+# Build context for the image builds (daemon, egress). Podman reads this the way
+# Docker reads .dockerignore.
+#
+# Deliberately does NOT exclude *.md: internal/repodocs reads ../../CLAUDE.md,
+# so a context that dropped markdown would make the containerized gate fail on a
+# file it cannot see, which is a confusing way to learn about a build context.
+.git/
+node_modules/
+test/e2e/node_modules/
+test/e2e/test-results/
+test/e2e/playwright-report/
+test/e2e/.playwright/
+/bin/
+/dist/
+/tmp/
+/testdata/local/
+.env
+.env.local
+docker/garage/garage.env
+
+# Build outputs of scripts/build-desktop.sh, and the toolchain caches that
+# gate-container.sh / build-desktop.sh mount from here into their containers.
+.gocache/
+/desktop/bin/
+/desktop/dist/

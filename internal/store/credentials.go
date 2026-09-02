@@ -135,3 +135,51 @@ func ResolveCredential(ctx context.Context, db DB, token string) (Credential, er
 
 	return c, nil
 }
+
+// CredentialDetail is a live credential plus the metadata an authenticated
+// caller may learn about the token it presented.
+type CredentialDetail struct {
+	Credential
+	ID         uuid.UUID
+	Label      string
+	CreatedAt  time.Time
+	LastUsedAt time.Time // zero until the first use
+}
+
+// CredentialDetailByToken re-reads the row behind a live token, under the same
+// conditions ResolveCredential applies: revoked, expired, or belonging to a
+// disabled actor all read back as ErrNoCredential.
+//
+// It exists beside ResolveCredential rather than instead of it because the two
+// callers need different widths. The SSE auth gate re-resolves through
+// ResolveCredential every interval and compares results with ==; widening what
+// IT returns would make stream teardown depend on bookkeeping fields that
+// move underneath a healthy session. Only /whoami pays for the wider query.
+func CredentialDetailByToken(ctx context.Context, db DB, token string) (CredentialDetail, error) {
+	if token == "" {
+		return CredentialDetail{}, ErrNoCredential
+	}
+
+	var (
+		d         CredentialDetail
+		principal string
+	)
+	err := db.QueryRow(ctx, `
+		SELECT c.id, c.actor_id, c.principal_kind, c.principal_id,
+		       c.label, c.created_at, c.last_used_at
+		  FROM credentials c
+		  JOIN actors a ON a.id = c.actor_id AND a.disabled_at IS NULL
+		 WHERE c.token_sha256 = $1
+		   AND c.revoked_at IS NULL
+		   AND (c.expires_at IS NULL OR c.expires_at > now())`,
+		HashToken(token)).Scan(&d.ID, &d.ActorID, &principal, &d.PrincipalID,
+		&d.Label, &d.CreatedAt, &d.LastUsedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CredentialDetail{}, ErrNoCredential
+	}
+	if err != nil {
+		return CredentialDetail{}, fmt.Errorf("read credential detail: %w", err)
+	}
+	d.PrincipalKind = PrincipalKind(principal)
+	return d, nil
+}

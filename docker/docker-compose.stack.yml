@@ -1,0 +1,155 @@
+# The whole thing, running.
+#
+#   podman compose -f docker/docker-compose.stack.yml up -d
+#   curl localhost:7979/readyz
+#
+# Postgres, a pre-migration backup, and the daemon. One command from a bare
+# machine to something answering on 7979.
+#
+# This is deliberately NOT docker-compose.dev.yml with a daemon bolted on. That
+# file is the database a test suite talks to; it publishes 55432 and exists so
+# `go test` works. Sharing one file would mean a test run and a live stack
+# fighting over the same container name, which is how you get "the tests
+# passed" against a database the daemon had migrated out from under them.
+name: hive-sandbox
+
+services:
+  postgres:
+    image: docker.io/pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${HIVE_DB_USER:-hive_sandbox}
+      POSTGRES_PASSWORD: ${HIVE_DB_PASSWORD:?set HIVE_DB_PASSWORD}
+      POSTGRES_DB: ${HIVE_DB_NAME:-hive_sandbox}
+      # C collation keeps text ordering and index behaviour identical to CI, so
+      # a sort that passes there passes here.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # :z relabels for SELinux. Without it, rootless Podman on an
+      # SELinux host gives the container "Permission denied" on every file in
+      # this directory and Postgres exits during initdb -- which reads as a
+      # broken image rather than a mount label.
+      - ./initdb:/docker-entrypoint-initdb.d:ro,z
+    # No published port. The daemon reaches it over the compose network; a
+    # published database is the kind of thing that is temporary for a year.
+    healthcheck:
+      # healthcheck-verified 2026-08-30: pg_isready ships in the postgres image
+      # (/usr/bin/pg_isready) and this image is pinned, so the binary cannot go
+      # missing without the tag changing. Verified with
+      #   podman run --rm docker.io/pgvector/pgvector:pg17 which pg_isready
+      #
+      # The extra SELECT matters: pg_isready alone reports ready DURING initdb,
+      # when the server accepts local connections and has not finished creating
+      # the database. A dependent that starts then fails on a database that
+      # does not exist yet.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -q && psql -U $${POSTGRES_USER} -d $${POSTGRES_DB} -tAc 'select 1' >/dev/null"]
+      #
+      # Interval and start_period are deliberately unhurried. Every probe is a
+      # transient systemd unit under rootless Podman, and a failing one exits
+      # non-zero -- so a tight interval during initdb produces a burst of failed
+      # units. A 3s interval here generated 171 failures in 19 seconds on a
+      # first boot (mostly exit 1 "not ready yet" and exit 125 "container
+      # already gone"), which is enough to set off a desktop's failed-unit
+      # notifier. Nothing was wrong; the probe was just asking too often while
+      # the answer could not yet be yes.
+      #
+      # 10s x 18 still gives three minutes of grace, which is more than initdb
+      # needs and far fewer units.
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 40s
+
+  # Runs to completion BEFORE the daemon starts, every start.
+  #
+  # The daemon migrates on boot and migrations are one-way -- there is no down
+  # migration and Migrate refuses one whose checksum changed after it was
+  # applied. So the only route back from a bad migration is a dump taken before
+  # it ran, and the only moment that is reliably true is here.
+  db-backup:
+    image: docker.io/pgvector/pgvector:pg17
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${HIVE_DB_PASSWORD:?set HIVE_DB_PASSWORD}
+      KEEP: ${HIVE_BACKUP_KEEP:-7}
+    volumes:
+      - backups:/backups
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        U="${HIVE_DB_USER:-hive_sandbox}"; D="${HIVE_DB_NAME:-hive_sandbox}"
+        # The version we are about to move off. A database with no
+        # schema_migrations has never been migrated, which is worth capturing
+        # as 0000 rather than refusing -- an empty database is a legitimate
+        # thing to hold a dump of.
+        V=$$(psql -h postgres -U "$$U" -d "$$D" -tAc \
+          "SELECT lpad(max(version)::text,4,'0') FROM schema_migrations" 2>/dev/null | tr -d '[:space:]')
+        [ -n "$$V" ] || V=0000
+        OUT="/backups/$${V}_$$(date -u +%Y%m%dT%H%M%SZ).dump"
+        echo "==> dumping schema $$V to $$OUT"
+        pg_dump -h postgres -U "$$U" -Fc "$$D" > "$$OUT"
+        # A truncated dump is worse than none: it restores far enough to look
+        # like it worked. Leave nothing that could be mistaken for a backup.
+        if [ ! -s "$$OUT" ]; then rm -f "$$OUT"; echo "dump was empty"; exit 1; fi
+        ls -1t /backups/*.dump | tail -n +$$((KEEP + 1)) | while read -r f; do
+          echo "    pruning $$(basename "$$f")"; rm -f "$$f"
+        done
+        echo "==> backup complete"
+    restart: "no"
+
+  hive-sandbox:
+    image: localhost/hive-sandbox:latest
+    build:
+      context: ..
+      dockerfile: docker/hive-sandbox/Containerfile
+      target: daemon
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-backup:
+        # Not service_started: the point is that the dump EXISTS before the
+        # daemon migrates. Starting alongside it would race the thing this
+        # service is here to prevent.
+        condition: service_completed_successfully
+    environment:
+      HIVE_SANDBOX_DATABASE_URL: postgres://${HIVE_DB_USER:-hive_sandbox}:${HIVE_DB_PASSWORD:?set HIVE_DB_PASSWORD}@postgres:5432/${HIVE_DB_NAME:-hive_sandbox}?sslmode=disable
+      # Invariant 13. A harness container runs --network=none with this socket
+      # bind-mounted, because on rootless Podman an --internal network has no
+      # gateway and cannot reach the host at all. The daemon serves the same
+      # handler here and on the port.
+      HIVE_SANDBOX_UNIX_SOCKET: /run/hive/api.sock
+      HIVE_SANDBOX_BOOTSTRAP_HANDLE: ${HIVE_BOOTSTRAP_HANDLE:-}
+      HIVE_SANDBOX_BOOTSTRAP_ORG: ${HIVE_BOOTSTRAP_ORG:-}
+      HIVE_SANDBOX_BOOTSTRAP_TOKEN: ${HIVE_BOOTSTRAP_TOKEN:-}
+    ports:
+      - "${HIVE_ADDR:-127.0.0.1:7979}:7979"
+    volumes:
+      # Shared with harness containers, which get it bind-mounted and reach the
+      # API through it with no network at all.
+      - runsock:/run/hive
+      - blobs:/var/lib/hive/blobs
+    # NO healthcheck, deliberately. The image is distroless/static: no shell,
+    # no curl, no wget. A CMD-SHELL probe here would exit 127 every interval
+    # and gate nothing while looking like it gated something -- the exact
+    # failure this repo has hit before. /readyz is the probe; run it from
+    # outside, or from an orchestrator that speaks httpGet natively.
+    security_opt:
+      - "no-new-privileges:true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pgdata:
+  backups:
+  blobs:
+  # The socket lives in a volume rather than a host path so a harness container
+  # can be handed it by name without the daemon knowing where the host keeps it.
+  runsock:

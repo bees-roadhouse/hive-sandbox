@@ -81,10 +81,10 @@ go run ./cmd/hive-sandbox -version
 curl localhost:7979/healthz
 ```
 
-One process serves every role (D7). `-serve-api`, `-run-workflows` and
-`-run-egress-proxy` (an allowlisting forward proxy, HTTP and CONNECT, on
-:3128) can each be
-turned off or split across processes without a code change.
+One process serves every role (D7). `-serve-api`, `-run-workflows`,
+`-run-chat` and `-run-egress-proxy` (an allowlisting forward proxy, HTTP and
+CONNECT, on :3128) can each be turned off or split across processes without a
+code change.
 
 ## Guest apps
 

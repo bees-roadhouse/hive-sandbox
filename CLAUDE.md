@@ -190,7 +190,9 @@ guidance, never fewer.
 
 ```
 cmd/hive-sandbox/      the daemon entrypoint. Roles are flags, one process serves all
-                       of them (D7): -serve-api, -run-workflows, -run-egress-proxy.
+                       of them (D7): -serve-api, -run-workflows, -run-chat,
+                       -run-egress-proxy. Every role defaults on except the proxy,
+                       so a single-role image turns the others off by name.
                        -addr defaults to :7979
 internal/manifest/     the app declaration and everything derived from it. Deliberately
                        pure ... it parses, validates and derives, opens no connections

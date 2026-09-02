@@ -208,6 +208,12 @@ internal/blob/         the driver seam: disk and S3-compatible (Garage) drivers,
 internal/harness/      hosted agent runs (claude / codex / opencode), rootless Podman
 internal/egress/       the allowlisting proxy a harness run reaches the internet through
 internal/mcp/          the tool surface. Everything tools/list shows, tools/call accepts
+internal/chat/         a message becomes one hosted agent run. The turn worker, its
+                       heartbeat, the reclaimers, and the in-process hub a stream
+                       subscribes to. docs/chat.md has the design
+internal/sse/          the SSE frame writer, shared by /events and the chat stream
+internal/webui/        the browser client: three embedded files served at /, no
+                       build step, rendered with textContent under a strict CSP
 internal/httpauth/     request-to-credential resolution and THE one 401 shape,
                        shared by SSE and REST
 internal/httpapi/      the daemon's HTTP surface: healthz, events, whoami,

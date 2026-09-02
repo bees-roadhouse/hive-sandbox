@@ -23,7 +23,9 @@ Phase 0, and honest about the gap. What exists:
 | `internal/registry` | manifest + module + Postgres = an installed app |
 | `internal/harness` | hosted agent runs under Podman, persisted in Postgres |
 | `internal/egress` | the allowlisting proxy a run reaches the internet through |
-| `internal/httpapi` | liveness, readiness, events, enrollment, and blob reads |
+| `internal/httpapi` | liveness, readiness, events, enrollment, blob reads, and chat |
+| `internal/chat` | a message becomes one hosted agent run; the worker, its heartbeat and the reclaimers |
+| `internal/webui` | the browser client, embedded and served at `/` |
 
 **The daemon now composes.** It opens the store, migrates, bootstraps an empty
 database, keeps the event partitions ahead of the clock, runs the LISTEN/NOTIFY
@@ -44,8 +46,10 @@ curl localhost:7979/readyz
 the bus, and refuses until the bus has tailed once — serving before that
 publishes a replica whose stream resumes from a watermark it never established.
 
-What is still ahead: the workflow runner, app installs, the MCP tools tier over
-HTTP, chat over the harness, and the journal app.
+Chat is built end to end: `docs/chat.md` covers the turn worker, the stream,
+and the browser client at `/`. What is still ahead: the workflow runner, app
+installs, the MCP tools tier over HTTP, a container test that a real `claude`
+run resumes its session, and the journal app.
 [Issue #29](https://github.com/bees-roadhouse/hive-sandbox/issues/29)
 tracks the lot.
 

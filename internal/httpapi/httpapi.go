@@ -40,17 +40,23 @@ type Options struct {
 	// Wake is called after a message is accepted, so an in-process worker
 	// does not wait out its poll interval. Optional.
 	Wake func()
+
+	// PlainHTTP says the deployment serves plain HTTP and the session cookie
+	// must not be Secure, or no browser would ever send it. Off by default;
+	// the operator says so once, deliberately (D26).
+	PlainHTTP bool
 }
 
 // API holds the handlers. Constructed once per process by New.
 type API struct {
-	st      *store.Store
-	eventer *bus.Bus
-	blobs   *blob.Catalog
-	chat    *store.Chat
-	hub     *chat.Hub
-	wake    func()
-	version string
+	st        *store.Store
+	eventer   *bus.Bus
+	blobs     *blob.Catalog
+	chat      *store.Chat
+	hub       *chat.Hub
+	wake      func()
+	plainHTTP bool
+	version   string
 }
 
 // New builds the whole mux. st may be nil only when eventer is nil too: that
@@ -58,7 +64,7 @@ type API struct {
 // New keeps it expressible so the day it grows one nothing here has to move.
 func New(st *store.Store, eventer *bus.Bus, opts Options) *http.ServeMux {
 	a := &API{st: st, eventer: eventer, blobs: opts.Blobs, version: opts.Version,
-		chat: opts.Chat, hub: opts.Hub, wake: opts.Wake}
+		chat: opts.Chat, hub: opts.Hub, wake: opts.Wake, plainHTTP: opts.PlainHTTP}
 	if a.hub == nil {
 		a.hub = chat.NewHub()
 	}

@@ -49,6 +49,8 @@ type config struct {
 
 	blob blobConfig
 
+	plainHTTP bool
+
 	runChat         bool
 	harnessPins     string
 	podman          string
@@ -110,6 +112,8 @@ func run() error {
 		"blob backend: disk or s3 (env HIVE_SANDBOX_BLOB_DRIVER)")
 	flag.StringVar(&cfg.blob.root, "blob-root", envOr("HIVE_SANDBOX_BLOB_ROOT", "/var/lib/hive/blobs"),
 		"blob root for the disk driver (env HIVE_SANDBOX_BLOB_ROOT)")
+	flag.BoolVar(&cfg.plainHTTP, "plain-http", envOr("HIVE_SANDBOX_PLAIN_HTTP", "") != "",
+		"this deployment serves plain HTTP: session cookies are sent without Secure (env HIVE_SANDBOX_PLAIN_HTTP). Off by default, on purpose.")
 	flag.BoolVar(&cfg.runChat, "run-chat", true, "answer chat turns with hosted agent runs")
 	flag.StringVar(&cfg.harnessPins, "harness-pins", envOr("HIVE_SANDBOX_HARNESS_PINS", harness.DefaultPinsPath),
 		"the image lockfile scripts/harness-build.sh writes (env HIVE_SANDBOX_HARNESS_PINS)")
@@ -159,6 +163,11 @@ func run() error {
 		"run_workflows", cfg.runWorkflows,
 		"run_chat", cfg.runChat,
 		"run_egress_proxy", cfg.runEgressProxy)
+	if cfg.plainHTTP && cfg.serveAPI {
+		// At every boot, not once: the flag outlives the person who set it.
+		slog.Warn("plain HTTP: session cookies are not Secure and cross the network in the clear; " +
+			"anything on the path can read a credential. Put TLS in front and drop -plain-http.")
+	}
 
 	var (
 		st        *store.Store
@@ -281,6 +290,7 @@ func run() error {
 	if cfg.serveAPI {
 		mux := httpapi.New(st, eventer, httpapi.Options{
 			Version: version, Blobs: catalog, Chat: chatLayer, Hub: hub, Wake: wake,
+			PlainHTTP: cfg.plainHTTP,
 		})
 		// The browser client, at the root. Two patterns that no API route
 		// shares, so a file can never shadow an endpoint.

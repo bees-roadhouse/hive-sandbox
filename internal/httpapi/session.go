@@ -14,8 +14,8 @@ import (
 // in script-readable storage where any injected script can read it. So the
 // web app presents the token once, over the Authorization header, and from
 // then on the cookie carries it: HttpOnly so script never sees it again,
-// SameSite=Strict so no other site can ride it, Secure whenever the request
-// arrived over TLS.
+// SameSite=Strict so no other site can ride it, and Secure unless the
+// deployment said, once and deliberately, that it serves plain HTTP (D26).
 //
 // The header, not the cookie: a request that already carries the cookie has
 // nothing to exchange, and accepting the query parameter here would make the
@@ -32,31 +32,33 @@ func (a *API) startSession(w http.ResponseWriter, r *http.Request) {
 		httpauth.Unauthorized(w)
 		return
 	}
-	http.SetCookie(w, sessionCookie(r, token, 0))
+	http.SetCookie(w, a.sessionCookie(token, 0))
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // endSession clears the cookie. It needs no credential: clearing a cookie
 // you do not hold changes nothing, and a logout that could fail for lack of
 // authorization is a logout that leaves a revoked session in the browser.
-func (a *API) endSession(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, sessionCookie(r, "", -1))
+func (a *API) endSession(w http.ResponseWriter, _ *http.Request) {
+	http.SetCookie(w, a.sessionCookie("", -1))
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func sessionCookie(r *http.Request, value string, maxAge int) *http.Cookie {
-	// G124 wants Secure spelled true. It follows the request's scheme instead:
-	// the deployment this serves is a family LAN over plain HTTP with no
-	// public ingress (docs/desktop.md), and a cookie the browser refuses to
-	// send is not a session, it is a login page that never goes away. Over
-	// TLS, or behind a proxy that says so, it IS Secure.
-	return &http.Cookie{ //nolint:gosec // G124: Secure follows the scheme; see above
+// sessionCookie is Secure by default. The one exception is a deployment that
+// declared itself plain HTTP: the flag, not the request, decides, because a
+// security property read off the request's scheme or a forwarded header is a
+// property the network gets to choose, and it is silent. Over plain HTTP
+// without the flag the browser drops the cookie and the operator sees a
+// sign-in page that never goes away, which is exactly the moment the choice
+// belongs to them (D26, item 5).
+func (a *API) sessionCookie(value string, maxAge int) *http.Cookie {
+	return &http.Cookie{ //nolint:gosec // G124: Secure is a deployment decision, not a literal; see above
 		Name:     httpauth.SessionCookie,
 		Value:    value,
 		Path:     "/",
 		MaxAge:   maxAge,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"),
+		Secure:   !a.plainHTTP,
 	}
 }

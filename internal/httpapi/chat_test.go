@@ -40,6 +40,11 @@ type chatAPI struct {
 
 func testChatAPI(t *testing.T) *chatAPI {
 	t.Helper()
+	return newChatAPI(t, false)
+}
+
+func newChatAPI(t *testing.T, plainHTTP bool) *chatAPI {
+	t.Helper()
 
 	pool := testdb.Pool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -66,7 +71,7 @@ func testChatAPI(t *testing.T) *chatAPI {
 	}
 	a := &chatAPI{st: s, chat: c, hub: chat.NewHub(), ctx: ctx, root: rootToken}
 	mux := httpapi.New(s, bus.New(s.Pool(), bus.Config{}), httpapi.Options{
-		Version: "test-v1", Chat: c, Hub: a.hub, Wake: func() { a.woken++ },
+		Version: "test-v1", Chat: c, Hub: a.hub, Wake: func() { a.woken++ }, PlainHTTP: plainHTTP,
 	})
 	a.srv = httptest.NewServer(mux)
 	t.Cleanup(a.srv.Close)
@@ -273,6 +278,11 @@ func TestSessionCookieCarriesTheCredential(t *testing.T) {
 	}
 	if cookie.Value != a.root || !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode || cookie.Path != "/" {
 		t.Errorf("cookie = %+v; want the token, HttpOnly, SameSite=Strict, Path=/", cookie)
+	}
+	// Secure by default, over a plain httptest server, on purpose: the flag
+	// decides, never the request's scheme (D26).
+	if !cookie.Secure {
+		t.Error("the session cookie was not Secure; the deployment never said it serves plain HTTP")
 	}
 
 	// The cookie alone authenticates.
@@ -553,3 +563,32 @@ func TestStreamOnAQuietConversationIsQuiet(t *testing.T) {
 }
 
 var _ = errors.Is
+
+// A deployment that declared plain HTTP gets a cookie the browser will send
+// over it. Everything else about the cookie is unchanged: the exception is
+// one flag, not a looser cookie.
+func TestPlainHTTPDeploymentDropsSecureAndNothingElse(t *testing.T) {
+	a := newChatAPI(t, true)
+	req, _ := http.NewRequest("POST", a.srv.URL+"/session", nil)
+	req.Header.Set("Authorization", "Bearer "+a.root)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	var cookie *http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == "hive_session" {
+			cookie = c
+		}
+	}
+	if cookie == nil {
+		t.Fatal("no cookie")
+	}
+	if cookie.Secure {
+		t.Error("a plain-HTTP deployment set Secure; no browser would send this cookie")
+	}
+	if !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode {
+		t.Errorf("plain HTTP loosened more than Secure: %+v", cookie)
+	}
+}

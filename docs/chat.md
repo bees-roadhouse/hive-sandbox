@@ -98,10 +98,12 @@ put the distinction back.
 Every write requires `Content-Type: application/json`, and that is the CSRF
 control for the cookie: a cross-site form cannot send that content type, a
 cross-site `fetch()` that does is preflighted, and there is no CORS to approve
-it. `SameSite=Strict` on the cookie is the second layer. `Secure` follows the
-request's scheme rather than being forced, because the deployment this serves
-is a LAN over plain HTTP and a cookie the browser refuses to send is a login
-page that never goes away.
+it. `SameSite=Strict` on the cookie is the second layer. `Secure` is on by
+default and comes off only when the deployment says, once, that it serves
+plain HTTP (`-plain-http`, env `HIVE_SANDBOX_PLAIN_HTTP`), which the daemon
+warns about at every boot. Never from the request's scheme or a forwarded
+header: a security property the network can shape is not a property
+(`docs/design/D26-five-open-items.md`, item 5).
 
 ## The page
 

@@ -75,7 +75,9 @@ export async function startDaemon(options: DaemonOptions): Promise<RunningDaemon
   // Without this, a machine that has built the harness images would boot a
   // daemon that refuses for lack of a socket, and one that has not would boot
   // one that warns, and the two would look different for no reason.
-  const child: ChildProcess = spawn(info.binaryPath, ['-addr', `127.0.0.1:${port}`, '-run-chat=false'], {
+  // -plain-http because this daemon IS a plain-HTTP deployment: without it the
+  // session cookie is Secure and the browser would never send it back.
+  const child: ChildProcess = spawn(info.binaryPath, ['-addr', `127.0.0.1:${port}`, '-run-chat=false', '-plain-http'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,

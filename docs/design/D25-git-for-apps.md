@@ -74,13 +74,10 @@ default, PR-gated is what a multi-user instance wants. In both, the commit that
 lands is a person's or an AI's with the credential that made it, and invariant
 2 holds through git exactly as it does through the API.
 
-## Left open, deliberately
+## Left open, then settled
 
-- Where the default instance's own repository lives when the instance is the
-  thing being deployed from it (the repo contains the daemon that reads the
-  repo). Likely a subpath convention plus a bootstrap source.
-- Whether the host builds modules itself, and with which toolchain, or only
-  verifies a CI-built artifact. The halfway house is the phase-one answer.
-- How a source's checkout is stored and fenced: a bare clone per source under
-  the daemon's data directory is the obvious shape; it must not be a guest-
-  reachable path.
+All three were settled the same day in [D26](D26-five-open-items.md), items
+1 to 3: the instance repository is separate from the platform's and defaults
+to a local bare repository; the host builds; a bare clone per source under
+the data directory, keyed by uuid, with only a per-build worktree ever
+mounted.

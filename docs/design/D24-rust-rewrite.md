@@ -87,7 +87,5 @@ forgotten.
 - Where the Solid.js client lives (`web/` in this repo, or its own) and how it
   reaches the desktop later.
 - Whether `hive-sandbox` stays the crate and binary name.
-- The two decisions made on 2026-09-02 that need Nate: an AI actor per
-  runtime (agent messages are attributed to the conversation's author until
-  one exists, bending invariant 2), and whether the session cookie forces
-  `Secure` once there is TLS in front of the daemon.
+- ~~The AI actor per runtime and the cookie's `Secure` flag~~ settled in
+  [D26](D26-five-open-items.md), items 4 and 5.

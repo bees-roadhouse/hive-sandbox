@@ -119,7 +119,7 @@ func (s *Stream) backoffFor(attempt int) time.Duration {
 	if hint := s.retryHint(); hint > 0 && d > hint {
 		d = hint
 	}
-	return d/2 + time.Duration(rand.Int64N(int64(d/2))) // jitter ±50%
+	return d/2 + time.Duration(rand.Int64N(int64(d/2))) //nolint:gosec // G404: reconnect jitter, not a secret
 }
 
 func (s *Stream) retryHint() time.Duration {
@@ -145,7 +145,7 @@ func (s *Stream) connectOnce(ctx context.Context, token string, out chan<- Event
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	switch resp.StatusCode {
 	case http.StatusUnauthorized:

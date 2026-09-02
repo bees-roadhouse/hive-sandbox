@@ -50,7 +50,7 @@ func (OS) Load(_ context.Context, ref Ref) (string, error) {
 	case errors.Is(err, keyring.ErrNotFound):
 		return "", ErrNotFound
 	case err != nil:
-		return "", fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return "", fmt.Errorf("%w: %w", ErrUnavailable, err)
 	case v == "":
 		return "", ErrNotFound
 	}
@@ -60,7 +60,7 @@ func (OS) Load(_ context.Context, ref Ref) (string, error) {
 // Save writes the token for ref.
 func (OS) Save(_ context.Context, ref Ref, token string) error {
 	if err := keyring.Set(service, ref.ServerURL, token); err != nil {
-		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
 	return nil
 }
@@ -69,7 +69,7 @@ func (OS) Save(_ context.Context, ref Ref, token string) error {
 func (OS) Delete(_ context.Context, ref Ref) error {
 	err := keyring.Delete(service, ref.ServerURL)
 	if err != nil && !errors.Is(err, keyring.ErrNotFound) {
-		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
 	return nil
 }

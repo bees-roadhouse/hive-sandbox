@@ -137,10 +137,10 @@ func (s *Session) Enroll(ctx context.Context, serverURL, issuerToken string) err
 		return fmt.Errorf("enroll: %w", err)
 	}
 	ref := keyring.Ref{ServerURL: config.NormalizeServerURL(serverURL)}
-	if err := s.tokens.Save(ctx, ref, resp.Token); err != nil {
+	if err = s.tokens.Save(ctx, ref, resp.Token); err != nil {
 		return fmt.Errorf("store device token: %w", err)
 	}
-	if err := config.Save(config.Config{ServerURL: ref.ServerURL}); err != nil {
+	if err = config.Save(config.Config{ServerURL: ref.ServerURL}); err != nil {
 		return fmt.Errorf("save server url: %w", err)
 	}
 	// issuerToken falls out of scope here; nothing kept a reference.
@@ -155,7 +155,7 @@ func (s *Session) Enroll(ctx context.Context, serverURL, issuerToken string) err
 	s.whoami, s.hasID = id, id.Version != ""
 	s.mu.Unlock()
 
-	s.spawn(ref.ServerURL, resp.Token)
+	s.spawn(ref.ServerURL, resp.Token) //nolint:contextcheck // detached on purpose; see spawn
 	return nil
 }
 
@@ -203,7 +203,7 @@ func (s *Session) Resume(ctx context.Context) error {
 		s.mu.Unlock()
 	}
 
-	s.spawn(cfg.ServerURL, token)
+	s.spawn(cfg.ServerURL, token) //nolint:contextcheck // detached on purpose; see spawn
 	return nil
 }
 
@@ -270,7 +270,7 @@ func (s *Session) loop(ctx context.Context, serverURL, token string, events chan
 // Forget tears down the connection and removes every local trace of the
 // server: keyring entry first, then config. Used when enrollment is revoked
 // or the user switches servers.
-func (s *Session) Forget() error {
+func (s *Session) Forget(ctx context.Context) error {
 	s.mu.Lock()
 	serverURL := s.serverURL
 	if s.cancel != nil {
@@ -285,7 +285,7 @@ func (s *Session) Forget() error {
 	if serverURL == "" {
 		return nil
 	}
-	if err := s.tokens.Delete(context.Background(), keyring.Ref{ServerURL: config.NormalizeServerURL(serverURL)}); err != nil {
+	if err := s.tokens.Delete(ctx, keyring.Ref{ServerURL: config.NormalizeServerURL(serverURL)}); err != nil {
 		return fmt.Errorf("delete token: %w", err)
 	}
 	path, err := config.Path()

@@ -46,7 +46,7 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: Path() derives it from XDG_CONFIG_HOME; no input reaches it
 	if errors.Is(err, os.ErrNotExist) {
 		return Config{}, ErrNoConfig
 	}
@@ -76,7 +76,7 @@ func Save(c Config) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create config dir: %w", err)
 	}
 	raw, err := json.MarshalIndent(c, "", "  ")

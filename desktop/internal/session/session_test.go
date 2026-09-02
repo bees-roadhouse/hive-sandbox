@@ -167,10 +167,10 @@ func TestRevokedTokenNeedsEnrollment(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case r.URL.Path == "/healthz":
+		switch r.URL.Path {
+		case "/healthz":
 			_, _ = w.Write([]byte(`{"status":"ok","version":"v"}`))
-		case r.URL.Path == "/whoami":
+		case "/whoami":
 			_, _ = w.Write([]byte(`{"version":"v","actor":{"id":"a","kind":"human","handle":"x","display_name":""},"principal":{"kind":"user","id":"a"},"credential":{"id":"c","label":"","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-01T00:00:00Z"}}`))
 		default:
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
@@ -201,7 +201,7 @@ func TestForgetClearsEverything(t *testing.T) {
 	if err := s.Enroll(ctx, daemon.URL, "issuer-token"); err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
-	if err := s.Forget(); err != nil {
+	if err := s.Forget(context.Background()); err != nil {
 		t.Fatalf("forget: %v", err)
 	}
 	if _, err := tokens.Load(ctx, keyring.Ref{ServerURL: daemon.URL}); !errors.Is(err, keyring.ErrNotFound) {

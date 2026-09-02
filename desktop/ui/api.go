@@ -213,8 +213,8 @@ func (a *API) handleResume(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (a *API) handleForget(w http.ResponseWriter, _ *http.Request) {
-	if err := a.sess.Forget(); err != nil {
+func (a *API) handleForget(w http.ResponseWriter, r *http.Request) {
+	if err := a.sess.Forget(r.Context()); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "forget_failed"})
 		return
 	}

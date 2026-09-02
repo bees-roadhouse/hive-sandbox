@@ -32,6 +32,14 @@ failed=()
 run_host() {
   echo "==> desktop: go vet (webview-free packages)"
   ( cd desktop && go vet ./internal/... ./ui ) || failed+=("vet")
+  # CI lints these packages and this script did not, so fourteen findings
+  # reached a pull request with a green local gate. One gate, same steps.
+  if command -v golangci-lint >/dev/null 2>&1; then
+    echo "==> desktop: golangci-lint (webview-free packages)"
+    ( cd desktop && golangci-lint run ./internal/... ./ui ) || failed+=("lint")
+  else
+    echo "golangci-lint not on the host; the desktop lint step is SKIPPED here and CI will run it" >&2
+  fi
 
   echo "==> desktop: go test -race (webview-free packages)"
   ( cd desktop && go test -race -count=1 -timeout 120s ./internal/... ) || failed+=("test")
@@ -80,6 +88,7 @@ else
       -w /src/desktop "$IMAGE" bash -c '
         set -e
         go vet ./internal/... ./ui
+        golangci-lint run ./internal/... ./ui
         go test -race -count=1 -timeout 120s ./internal/...
         mkdir -p bin
         CGO_ENABLED=1 go build -tags gtk3 -ldflags "-s -w -X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" -o bin/hive-desktop ./cmd/hive-desktop

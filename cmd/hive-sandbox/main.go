@@ -12,11 +12,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,10 +26,13 @@ import (
 
 	"github.com/bees-roadhouse/hive-sandbox/internal/blob"
 	"github.com/bees-roadhouse/hive-sandbox/internal/bus"
+	"github.com/bees-roadhouse/hive-sandbox/internal/chat"
 	"github.com/bees-roadhouse/hive-sandbox/internal/egress"
+	"github.com/bees-roadhouse/hive-sandbox/internal/harness"
 	"github.com/bees-roadhouse/hive-sandbox/internal/httpapi"
 	"github.com/bees-roadhouse/hive-sandbox/internal/store"
 	"github.com/bees-roadhouse/hive-sandbox/internal/wasmhost"
+	"github.com/bees-roadhouse/hive-sandbox/internal/webui"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
@@ -44,6 +49,13 @@ type config struct {
 
 	blob blobConfig
 
+	runChat         bool
+	harnessPins     string
+	podman          string
+	chatWorkspaces  string
+	chatConcurrency int
+	chatDeadline    time.Duration
+
 	runEgressProxy     bool
 	egressAddr         string
 	egressAllow        stringList
@@ -58,7 +70,7 @@ type config struct {
 // credentials to reach it with. Requiring a connection string there would make
 // every run depend on the database being up in order to be *denied* network
 // access, which is backwards.
-func (c config) needsDatabase() bool { return c.serveAPI || c.runWorkflows }
+func (c config) needsDatabase() bool { return c.serveAPI || c.runWorkflows || c.runChat }
 
 // stringList collects a repeatable flag.
 type stringList []string
@@ -98,6 +110,16 @@ func run() error {
 		"blob backend: disk or s3 (env HIVE_SANDBOX_BLOB_DRIVER)")
 	flag.StringVar(&cfg.blob.root, "blob-root", envOr("HIVE_SANDBOX_BLOB_ROOT", "/var/lib/hive/blobs"),
 		"blob root for the disk driver (env HIVE_SANDBOX_BLOB_ROOT)")
+	flag.BoolVar(&cfg.runChat, "run-chat", true, "answer chat turns with hosted agent runs")
+	flag.StringVar(&cfg.harnessPins, "harness-pins", envOr("HIVE_SANDBOX_HARNESS_PINS", harness.DefaultPinsPath),
+		"the image lockfile scripts/harness-build.sh writes (env HIVE_SANDBOX_HARNESS_PINS)")
+	flag.StringVar(&cfg.podman, "podman", envOr("HIVE_SANDBOX_PODMAN", "podman"),
+		"podman binary a harness run is launched with (env HIVE_SANDBOX_PODMAN)")
+	flag.StringVar(&cfg.chatWorkspaces, "chat-workspaces",
+		envOr("HIVE_SANDBOX_CHAT_WORKSPACES", "/var/lib/hive/workspaces"),
+		"directory holding one workspace per conversation (env HIVE_SANDBOX_CHAT_WORKSPACES)")
+	flag.IntVar(&cfg.chatConcurrency, "chat-concurrency", 2, "how many chat turns run at once")
+	flag.DurationVar(&cfg.chatDeadline, "chat-deadline", 10*time.Minute, "wall clock one chat turn gets")
 	flag.BoolVar(&cfg.runEgressProxy, "run-egress-proxy", false,
 		"run the allowlisting egress proxy for a harness run (D12.6)")
 	flag.StringVar(&cfg.egressAddr, "egress-addr", ":3128", "listen address for the egress proxy")
@@ -122,8 +144,8 @@ func run() error {
 		}
 	}
 
-	if !cfg.serveAPI && !cfg.runWorkflows && !cfg.runEgressProxy {
-		return errors.New("no role enabled: pass -serve-api, -run-workflows, -run-egress-proxy, or a combination")
+	if !cfg.serveAPI && !cfg.runWorkflows && !cfg.runChat && !cfg.runEgressProxy {
+		return errors.New("no role enabled: pass -serve-api, -run-workflows, -run-chat, -run-egress-proxy, or a combination")
 	}
 	if cfg.needsDatabase() && cfg.databaseURL == "" {
 		return errors.New("no database: pass -database-url or set HIVE_SANDBOX_DATABASE_URL")
@@ -135,13 +157,17 @@ func run() error {
 	slog.Info("starting", "version", version,
 		"serve_api", cfg.serveAPI,
 		"run_workflows", cfg.runWorkflows,
+		"run_chat", cfg.runChat,
 		"run_egress_proxy", cfg.runEgressProxy)
 
 	var (
-		st      *store.Store
-		eventer *bus.Bus
-		catalog *blob.Catalog
-		wg      sync.WaitGroup
+		st        *store.Store
+		eventer   *bus.Bus
+		catalog   *blob.Catalog
+		chatLayer *store.Chat
+		hub       = chat.NewHub()
+		wake      func()
+		wg        sync.WaitGroup
 	)
 	defer wg.Wait()
 
@@ -214,6 +240,27 @@ func run() error {
 				slog.Error("bus stopped", "err", err)
 			}
 		}()
+
+		var chatErr error
+		if chatLayer, chatErr = store.NewChat(st); chatErr != nil {
+			return chatErr
+		}
+		if cfg.runChat {
+			worker, wErr := chatWorker(cfg, st, chatLayer, hub)
+			if wErr != nil {
+				return wErr
+			}
+			if worker != nil {
+				wake = worker.Kick
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if err := worker.Run(ctx); err != nil {
+						slog.Error("chat worker stopped", "err", err)
+					}
+				}()
+			}
+		}
 	}
 
 	var servers []*http.Server
@@ -232,9 +279,15 @@ func run() error {
 	}
 
 	if cfg.serveAPI {
+		mux := httpapi.New(st, eventer, httpapi.Options{
+			Version: version, Blobs: catalog, Chat: chatLayer, Hub: hub, Wake: wake,
+		})
+		// The browser client, at the root. Two patterns that no API route
+		// shares, so a file can never shadow an endpoint.
+		webui.Mount(mux)
 		apiSrv := &http.Server{
 			Addr:              cfg.addr,
-			Handler:           httpapi.New(st, eventer, httpapi.Options{Version: version, Blobs: catalog}),
+			Handler:           mux,
 			ReadHeaderTimeout: 10 * time.Second,
 			// Deliberately no WriteTimeout: an SSE response is meant to stay
 			// open. The stream sets its own per-write deadline instead.
@@ -282,6 +335,52 @@ func run() error {
 		}
 	}
 	return shutdownErr
+}
+
+// chatWorker builds the turn worker, or returns nil when there is nothing to
+// run turns on.
+//
+// No pins file is a warning rather than a boot failure: a development daemon,
+// the end-to-end suite and a fresh install all come up before anyone has built
+// a harness image, and a chat that queues turns nothing answers is visible in
+// the thread ("waiting for an agent") while a daemon that refuses to start is
+// visible nowhere. A pins file that exists and cannot be read IS a failure.
+func chatWorker(cfg config, st *store.Store, chatLayer *store.Chat, hub *chat.Hub) (*chat.Worker, error) {
+	pins, err := harness.LoadPins(cfg.harnessPins)
+	if errors.Is(err, fs.ErrNotExist) {
+		slog.Warn("chat worker disabled: no harness image pins; run scripts/harness-build.sh",
+			"path", cfg.harnessPins)
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	// A turn reaches the daemon over the socket and nothing else (invariant
+	// 13), so a daemon that answers turns has to have one.
+	if cfg.unixSocket == "" {
+		return nil, errors.New("-run-chat needs -unix-socket: a harness run reaches the API only through it")
+	}
+
+	host, _ := os.Hostname()
+	if host == "" {
+		host = "daemon"
+	}
+	sup := &harness.Supervisor{Launcher: &harness.PodmanLauncher{Binary: cfg.podman}}
+	worker, err := chat.NewWorker(st, chatLayer, sup, hub, chat.Config{
+		Name:          host + "/" + strconv.Itoa(os.Getpid()),
+		Pins:          pins,
+		DaemonSocket:  cfg.unixSocket,
+		WorkspaceRoot: cfg.chatWorkspaces,
+		Deadline:      cfg.chatDeadline,
+		Concurrency:   cfg.chatConcurrency,
+		Logger:        slog.Default(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	slog.Info("chat worker ready", "pins", cfg.harnessPins, "workspaces", cfg.chatWorkspaces,
+		"concurrency", cfg.chatConcurrency)
+	return worker, nil
 }
 
 // prepare brings the schema up to date and seeds root, in that order.

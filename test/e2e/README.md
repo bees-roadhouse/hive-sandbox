@@ -10,6 +10,14 @@ npm test
 
 `docs/development.md` has the from-nothing version.
 
+No Go on the machine? Build the daemon in the gate container and hand it to
+the suite; nothing else changes.
+
+```bash
+./scripts/gate-container.sh -- go build -o test/e2e/.playwright/hive-sandbox ./cmd/hive-sandbox
+HIVE_SANDBOX_E2E_BINARY="$PWD/test/e2e/.playwright/hive-sandbox" npm test
+```
+
 ## What the harness gives you
 
 `globalSetup` builds the daemon once into `.playwright/` and records the output

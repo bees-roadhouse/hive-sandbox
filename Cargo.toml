@@ -1,0 +1,37 @@
+# The Rust daemon, beside the Go tree it replaces (docs/design/D24-rust-rewrite.md).
+#
+# At the repo root because that is where the workspace ends up; the Go module
+# ignores it and the Cargo workspace ignores the Go module. The two are compared
+# against the same database and the same guests, never merged.
+[workspace]
+members = ["crates/hive-store", "crates/hive-testdb"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+rust-version = "1.98"
+publish = false
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# Runtime queries, never the compile-time macros: the gate builds on machines
+# with no database in reach. rustls for the reason the Go host had no CGo.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+sha2 = "0.10"
+hex = "0.4"
+
+[workspace.lints.rust]
+# The Go host had no CGo anywhere. This is that rule in the new language.
+unsafe_code = "forbid"
+
+[profile.release]
+lto = true
+strip = true
+opt-level = 3

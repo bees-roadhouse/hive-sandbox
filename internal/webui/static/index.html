@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hive</title>
+<link rel="stylesheet" href="/ui/styles.css">
+</head>
+<body>
+<header>
+  <span class="brand">hive</span>
+  <span id="identity" class="identity"></span>
+  <button id="logout" class="ghost" hidden>sign out</button>
+</header>
+
+<main id="login" class="card" hidden>
+  <h1>Sign in to your hive</h1>
+  <p class="hint">Paste a credential. It is exchanged once for a session cookie and never kept by this page.</p>
+  <label>Credential
+    <input id="token" type="password" autocomplete="off" placeholder="token">
+  </label>
+  <button id="signin" class="primary">Sign in</button>
+  <p id="login-error" class="error" hidden></p>
+</main>
+
+<main id="app" class="app" hidden>
+  <aside class="sidebar">
+    <form id="new-conversation" class="new">
+      <select id="runtime" aria-label="Runtime">
+        <option value="claude">claude</option>
+        <option value="codex">codex</option>
+        <option value="opencode">opencode</option>
+      </select>
+      <input id="model" placeholder="model (optional)" maxlength="100">
+      <input id="title" placeholder="title (optional)" maxlength="200">
+      <button class="primary" type="submit">New conversation</button>
+    </form>
+    <ul id="conversations" class="list"></ul>
+  </aside>
+
+  <section class="thread">
+    <div id="empty" class="hint center">Pick a conversation, or start one.</div>
+    <div id="messages" class="messages" hidden></div>
+    <form id="composer" class="composer" hidden>
+      <textarea id="body" rows="3" placeholder="Message" required></textarea>
+      <button class="primary" type="submit">Send</button>
+    </form>
+  </section>
+</main>
+
+<p id="notice" class="notice" hidden></p>
+<script src="/ui/app.js"></script>
+</body>
+</html>

@@ -272,7 +272,7 @@ func (g *Guard) ToolReason(ctx context.Context, cred Credential, installID uuid.
 // That made it optional for anyone who reached for this method, which is every
 // list, search and graph query there will ever be.
 func (g *Guard) VisibleEntityIDs(ctx context.Context, cred Credential, access Access, kind string, limit int) ([]uuid.UUID, error) {
-	rows, err := g.db.Query(ctx, `
+	return g.visibleIDs(ctx, cred, access, SubjectEntity, "visible entities", `
 		SELECT e.id, d.reason
 		  FROM entities e
 		 CROSS JOIN LATERAL access_decision('entity', e.id, NULL, $2, $3, $4, $5, now()) d
@@ -282,8 +282,35 @@ func (g *Guard) VisibleEntityIDs(ctx context.Context, cred Credential, access Ac
 		 ORDER BY e.created_at DESC
 		 LIMIT $6`,
 		kind, string(cred.PrincipalKind), cred.PrincipalID, cred.ActorID, string(access), limit)
+}
+
+// VisibleConversationIDs is the same question for chat threads, most recently
+// active first. Archived threads are not listed, and archiving is not a grant
+// question: it is the owner putting a thread away, and a stranger's grant does
+// not unpack it.
+func (g *Guard) VisibleConversationIDs(ctx context.Context, cred Credential, access Access, limit int) ([]uuid.UUID, error) {
+	return g.visibleIDs(ctx, cred, access, SubjectConversation, "visible conversations", `
+		SELECT c.id, d.reason
+		  FROM conversations c
+		 CROSS JOIN LATERAL access_decision('conversation', c.id, NULL, $1, $2, $3, $4, now()) d
+		 WHERE c.archived_at IS NULL
+		   AND d.reason IS NOT NULL
+		 ORDER BY c.updated_at DESC
+		 LIMIT $5`,
+		string(cred.PrincipalKind), cred.PrincipalID, cred.ActorID, string(access), limit)
+}
+
+// visibleIDs runs a list query whose rows are (id, reason) pairs the predicate
+// already filtered, and audits every override before any id leaves.
+//
+// One implementation for every list, because the audit obligation is the part
+// a second copy forgets: the query is easy to get right and the audit is the
+// thing that was missing the first time.
+func (g *Guard) visibleIDs(ctx context.Context, cred Credential, access Access, kind SubjectKind,
+	what, query string, args ...any) ([]uuid.UUID, error) {
+	rows, err := g.db.Query(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("visible entities: %w", err)
+		return nil, fmt.Errorf("%s: %w", what, err)
 	}
 
 	var (
@@ -297,7 +324,7 @@ func (g *Guard) VisibleEntityIDs(ctx context.Context, cred Credential, access Ac
 		)
 		if err := rows.Scan(&id, &reason); err != nil {
 			rows.Close()
-			return nil, fmt.Errorf("scan entity id: %w", err)
+			return nil, fmt.Errorf("%s: scan: %w", what, err)
 		}
 		ids = append(ids, id)
 		if Reason(reason) == ReasonOverride {
@@ -306,13 +333,13 @@ func (g *Guard) VisibleEntityIDs(ctx context.Context, cred Credential, access Ac
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("visible entities: %w", err)
+		return nil, fmt.Errorf("%s: %w", what, err)
 	}
 
 	// Audit before returning. If the evidence cannot be written, the rows do
 	// not leave this function.
 	for _, id := range overrides {
-		subj := Subject{Kind: SubjectEntity, ID: id}
+		subj := Subject{Kind: kind, ID: id}
 		_, grantID, err := g.decision(ctx, cred, subj, access)
 		if err != nil {
 			return nil, err

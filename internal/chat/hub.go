@@ -8,43 +8,95 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/bees-roadhouse/hive-sandbox/internal/harness"
+	"github.com/bees-roadhouse/hive-sandbox/internal/store"
 )
 
-// Hub fans events out to live subscribers, in process.
+// Frame is what a subscriber sees of one run event: enough to render a reply
+// as it streams, and nothing a tool fetched.
 //
-// It is NOT the transport. agent_run_events is: every event is in the table
-// before it reaches here, so a subscriber that misses one reconnects and reads
-// it, and a subscriber that never connects loses nothing. This exists only to
-// make a live stream feel live, which is why every send is non-blocking and a
-// full subscriber is dropped rather than waited for.
+// Text is assistant text only. Tool calls, tool results and stderr arrive as a
+// Frame with a Type and no Text, so a client can show "the agent is doing
+// something" without ever holding content the agent pulled off the open web.
+// That keeps the wire consistent with the answer projection below: what a
+// person can copy out of a live stream is exactly what ends up in the message,
+// and a client cannot accidentally paste fetched content back into a turn
+// (invariant 9, one hop removed).
+type Frame struct {
+	RequestSeq int    `json:"request_seq"`
+	Seq        int    `json:"seq"`
+	Stream     string `json:"stream"`
+	Type       string `json:"type"`
+	Text       string `json:"text,omitempty"`
+}
+
+// FrameOf projects one event for the wire.
+func FrameOf(requestSeq int, ev harness.Event) Frame {
+	return Frame{
+		RequestSeq: requestSeq,
+		Seq:        ev.Seq,
+		Stream:     string(ev.Stream),
+		Type:       ev.Type,
+		Text:       assistantText(ev),
+	}
+}
+
+// FrameOfRecord is FrameOf for an event read back from the store.
+func FrameOfRecord(ev store.RunEvent) Frame {
+	return FrameOf(ev.RequestSeq, harness.Event{
+		Seq: ev.Seq, At: ev.At, Stream: harness.EventStream(ev.Stream),
+		Type: ev.Type, JSON: ev.Body, Text: ev.Text,
+	})
+}
+
+// TurnUpdate says a turn changed state: claimed when a worker took it, then
+// done or failed. A client uses it to show "thinking" for the right message
+// and to know when to read the answer out of the messages.
+type TurnUpdate struct {
+	RequestSeq int    `json:"request_seq"`
+	State      string `json:"state"`
+}
+
+// Update is one thing a subscriber is told. Exactly one field is set.
+type Update struct {
+	Run  *Frame
+	Turn *TurnUpdate
+}
+
+// Hub fans updates out to live subscribers, in process.
+//
+// It is NOT the transport. agent_run_events is: every run event is in the
+// table before it reaches here, so a subscriber that misses one reconnects and
+// reads it, and a subscriber that never connects loses nothing. This exists
+// only to make a live stream feel live, which is why every send is
+// non-blocking and a full subscriber is dropped rather than waited for.
 //
 // That distinction is what keeps a slow browser from slowing an agent. The
 // alternative -- blocking the drain path on a subscriber -- puts a person's
 // network on the critical path of a child process's pipe.
 type Hub struct {
 	mu   sync.RWMutex
-	subs map[uuid.UUID]map[int]chan harness.Event
+	subs map[uuid.UUID]map[int]chan Update
 	next int
 }
 
 // NewHub returns an empty hub.
 func NewHub() *Hub {
-	return &Hub{subs: make(map[uuid.UUID]map[int]chan harness.Event)}
+	return &Hub{subs: make(map[uuid.UUID]map[int]chan Update)}
 }
 
-// Subscribe returns a channel of events for one conversation, and a function
+// Subscribe returns a channel of updates for one conversation, and a function
 // that stops the subscription. The caller must call it.
-func (h *Hub) Subscribe(conversationID uuid.UUID, buffer int) (<-chan harness.Event, func()) {
+func (h *Hub) Subscribe(conversationID uuid.UUID, buffer int) (<-chan Update, func()) {
 	if buffer <= 0 {
 		buffer = 64
 	}
-	ch := make(chan harness.Event, buffer)
+	ch := make(chan Update, buffer)
 
 	h.mu.Lock()
 	id := h.next
 	h.next++
 	if h.subs[conversationID] == nil {
-		h.subs[conversationID] = make(map[int]chan harness.Event)
+		h.subs[conversationID] = make(map[int]chan Update)
 	}
 	h.subs[conversationID][id] = ch
 	h.mu.Unlock()
@@ -64,17 +116,17 @@ func (h *Hub) Subscribe(conversationID uuid.UUID, buffer int) (<-chan harness.Ev
 	}
 }
 
-// Publish delivers an event to every live subscriber of a conversation.
+// Publish delivers an update to every live subscriber of a conversation.
 //
-// Non-blocking. A subscriber whose buffer is full misses this event and will
+// Non-blocking. A subscriber whose buffer is full misses this update and will
 // see it on reconnect, because the table is the transport. Blocking here would
 // let one stalled browser hold up the pipe drain of a running agent.
-func (h *Hub) Publish(conversationID uuid.UUID, ev harness.Event) {
+func (h *Hub) Publish(conversationID uuid.UUID, u Update) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for _, ch := range h.subs[conversationID] {
 		select {
-		case ch <- ev:
+		case ch <- u:
 		default:
 		}
 	}
@@ -110,16 +162,23 @@ var assistantTypes = map[string]bool{
 // than guessed at: a type this does not know about might be a tool result, and
 // the failure mode of guessing is the one described above.
 func (a *answer) observe(ev harness.Event) {
-	if ev.Stream != harness.StreamStdout || !assistantTypes[ev.Type] {
-		return
-	}
-	if text := extractText(ev); text != "" {
+	if text := assistantText(ev); text != "" {
 		a.parts = append(a.parts, text)
 	}
 }
 
 func (a *answer) String() string {
 	return strings.TrimSpace(strings.Join(a.parts, ""))
+}
+
+// assistantText is the text a person should read out of one event, or empty.
+// One function for the answer and for the wire, so the two cannot disagree
+// about what counts.
+func assistantText(ev harness.Event) string {
+	if ev.Stream != harness.StreamStdout || !assistantTypes[ev.Type] {
+		return ""
+	}
+	return extractText(ev)
 }
 
 // extractText pulls the human-readable text out of an assistant event.

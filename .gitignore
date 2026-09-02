@@ -19,6 +19,9 @@
 /tmp/
 /testdata/local/
 
+# Cargo's build output for the Rust tree.
+/target/
+
 # gate-container.sh's build and module caches, mounted into the container from
 # here so they survive between runs. Never source code.
 .gocache/

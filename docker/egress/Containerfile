@@ -54,5 +54,6 @@ LABEL org.beesroadhouse.hive-sandbox.component=egress-proxy
 ENTRYPOINT ["/usr/local/bin/hive-sandbox", \
             "-serve-api=false", \
             "-run-workflows=false", \
+            "-run-chat=false", \
             "-run-egress-proxy", \
             "-egress-addr=:3128"]

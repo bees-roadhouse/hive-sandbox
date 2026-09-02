@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -224,4 +225,31 @@ func (a *AgentRunStore) rowID(ctx context.Context, runID string) (uuid.UUID, err
 	a.ids[runID] = id
 	a.mu.Unlock()
 	return id, nil
+}
+
+// ReclaimAbandonedRuns marks every run still 'running' past its deadline plus
+// grace as indeterminate, and reports how many.
+//
+// This is the reader agent_runs_reclaim_idx was created for. The supervisor
+// enforces the deadline itself and records deadline_exceeded on the ordinary
+// long-answer path, so a row that is still running well after its deadline
+// belongs to a supervisor that died before it could write. Indeterminate, not
+// failed: the container may have finished, or may still be running with
+// nothing watching it, and either way nothing retries it (invariant 10).
+//
+// A run with no deadline is not touched. The supervisor refuses to start one,
+// so such a row is a writer bypassing the harness, and guessing at its fate is
+// worse than leaving it visible.
+func ReclaimAbandonedRuns(ctx context.Context, db DB, grace time.Duration) (int64, error) {
+	if grace < 0 {
+		grace = 0
+	}
+	tag, err := db.Exec(ctx,
+		`UPDATE agent_runs SET state = 'indeterminate', ended_at = now()
+		  WHERE state = 'running' AND deadline_at IS NOT NULL
+		    AND deadline_at < now() - $1::interval`, grace.String())
+	if err != nil {
+		return 0, fmt.Errorf("agent runs: reclaim abandoned: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }

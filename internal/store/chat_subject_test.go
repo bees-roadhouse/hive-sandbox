@@ -96,10 +96,16 @@ func TestConversationSubjectHasNoName(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 
+	// conrelid, not conname alone. pg_constraint spans every schema in the
+	// shared test database and ignores search_path, and each schema carries a
+	// constraint by this name ... including one an older daemon image migrated
+	// before 0003 existed, which is the row this read the first time it failed.
+	// 'grants'::regclass resolves through search_path to this test's own table.
 	var ok bool
 	if err := pool.QueryRow(ctx,
 		`SELECT pg_get_constraintdef(oid) LIKE '%conversation%'
-		   FROM pg_constraint WHERE conname = 'grants_named_subjects'`).Scan(&ok); err != nil {
+		   FROM pg_constraint
+		  WHERE conrelid = 'grants'::regclass AND conname = 'grants_named_subjects'`).Scan(&ok); err != nil {
 		t.Fatalf("read constraint: %v", err)
 	}
 	if !ok {

@@ -20,3 +20,4 @@ does not.
 | [D24](D24-rust-rewrite.md) | the daemon is rewritten in Rust, beside the Go tree, tests first |
 | [D25](D25-git-for-apps.md) | git is the change management for apps: sources, not modes |
 | [D26](D26-five-open-items.md) | the instance repo, host builds, checkout storage, the AI actor, the cookie rule |
+| [D27](D27-agents-relate.md) | one agent graph over AI actors, edges as grants, profiles as runtimes, definitions never credentials |

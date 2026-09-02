@@ -16,6 +16,7 @@ import (
 
 	"github.com/bees-roadhouse/hive-sandbox/internal/blob"
 	"github.com/bees-roadhouse/hive-sandbox/internal/bus"
+	"github.com/bees-roadhouse/hive-sandbox/internal/chat"
 	"github.com/bees-roadhouse/hive-sandbox/internal/httpauth"
 	"github.com/bees-roadhouse/hive-sandbox/internal/store"
 )
@@ -28,6 +29,17 @@ type Options struct {
 	// Blobs enables the blob read route. Optional: a daemon without a catalog
 	// simply does not serve blobs, rather than serving them unauthorized.
 	Blobs *blob.Catalog
+
+	// Chat enables the conversation routes. Optional in the same way. Hub is
+	// where the turn worker publishes; the stream subscribes to it, so the
+	// two must share one, and a nil Hub gets a private one that nothing
+	// publishes to ... a stream that is correct and never live.
+	Chat *store.Chat
+	Hub  *chat.Hub
+
+	// Wake is called after a message is accepted, so an in-process worker
+	// does not wait out its poll interval. Optional.
+	Wake func()
 }
 
 // API holds the handlers. Constructed once per process by New.
@@ -35,6 +47,9 @@ type API struct {
 	st      *store.Store
 	eventer *bus.Bus
 	blobs   *blob.Catalog
+	chat    *store.Chat
+	hub     *chat.Hub
+	wake    func()
 	version string
 }
 
@@ -42,7 +57,11 @@ type API struct {
 // shape is the workflow-only process, which today has no listener at all, but
 // New keeps it expressible so the day it grows one nothing here has to move.
 func New(st *store.Store, eventer *bus.Bus, opts Options) *http.ServeMux {
-	a := &API{st: st, eventer: eventer, blobs: opts.Blobs, version: opts.Version}
+	a := &API{st: st, eventer: eventer, blobs: opts.Blobs, version: opts.Version,
+		chat: opts.Chat, hub: opts.Hub, wake: opts.Wake}
+	if a.hub == nil {
+		a.hub = chat.NewHub()
+	}
 
 	mux := http.NewServeMux()
 
@@ -75,6 +94,20 @@ func New(st *store.Store, eventer *bus.Bus, opts Options) *http.ServeMux {
 			mux.Handle("HEAD /blobs/{hash}", httpauth.Require(auth, a.blobRead))
 		}
 		mux.Handle("POST /credentials", httpauth.Require(auth, a.enroll))
+
+		// The browser's login. Unauthenticated in the middleware sense because
+		// the token it exchanges arrives in the header it validates itself.
+		mux.HandleFunc("POST /session", a.startSession)
+		mux.HandleFunc("DELETE /session", a.endSession)
+
+		if a.chat != nil {
+			mux.Handle("POST /conversations", httpauth.Require(auth, a.createConversation))
+			mux.Handle("GET /conversations", httpauth.Require(auth, a.listConversations))
+			mux.Handle("GET /conversations/{id}", httpauth.Require(auth, a.getConversation))
+			mux.Handle("GET /conversations/{id}/messages", httpauth.Require(auth, a.listMessages))
+			mux.Handle("POST /conversations/{id}/messages", httpauth.Require(auth, a.postMessage))
+			mux.Handle("GET /conversations/{id}/stream", httpauth.Require(auth, a.chatStream))
+		}
 	}
 
 	return mux

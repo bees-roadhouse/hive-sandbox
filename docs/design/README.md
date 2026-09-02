@@ -21,3 +21,4 @@ does not.
 | [D25](D25-git-for-apps.md) | git is the change management for apps: sources, not modes |
 | [D26](D26-five-open-items.md) | the instance repo, host builds, checkout storage, the AI actor, the cookie rule |
 | [D27](D27-agents-relate.md) | one agent graph over AI actors, edges as grants, profiles as runtimes, definitions never credentials |
+| [D28](D28-profile-context.md) | a profile's CLAUDE.md is a generated view, the briefing is live, trust decides what is inline |

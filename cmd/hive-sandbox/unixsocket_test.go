@@ -63,18 +63,9 @@ func TestUnixListenerReplacesAStaleSocket(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "api.sock")
 
-	var lc net.ListenConfig
-	dead, err := lc.Listen(t.Context(), "unix", path)
-	if err != nil {
-		t.Fatalf("seed socket: %v", err)
-	}
-	// Close without unlinking, which is what a SIGKILL leaves behind.
-	if ul, ok := dead.(*net.UnixListener); ok {
-		ul.SetUnlinkOnClose(false)
-	}
-	if closeErr := dead.Close(); closeErr != nil {
-		t.Fatalf("close seed: %v", closeErr)
-	}
+	// A socket file with nothing behind it; see seedStaleSocket for why it is
+	// arranged the way it is.
+	seedStaleSocket(t, path)
 	if _, statErr := os.Stat(path); statErr != nil {
 		t.Fatalf("stale socket should still exist: %v", statErr)
 	}

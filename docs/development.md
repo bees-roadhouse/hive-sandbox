@@ -96,7 +96,7 @@ The Rust tree has the same gate in the same shape:
 `cargo fmt --check`, `cargo clippy -D warnings`, `cargo build`, `cargo test`,
 then a named list of every test that printed `SKIPPED:`. It refuses to run
 without `HIVE_SANDBOX_TEST_DATABASE_URL` for the same reason the Go gate does.
-CI does not run it yet; say in the PR that you did.
+CI runs it as the `rust` job.
 
 Read the output, not an exit code. A piped `| tail` or a chained `&&` reports
 the status of the last thing in the pipe, which is how a red gate gets pushed.

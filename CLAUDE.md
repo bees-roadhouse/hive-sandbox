@@ -153,8 +153,8 @@ export HIVE_SANDBOX_TEST_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
 ./scripts/gate-rust.sh    # cargo fmt --check, clippy -D warnings, build, test; names every skip
 ```
 
-**CI does not run it yet.** Until a `rust` job exists in `ci.yml`, a Rust
-change is gated on the machine that made it or not at all; say which in the PR.
+CI runs the same script as the `rust` job, against the same Postgres service
+container as the Go gate, so a Rust change is gated in both places.
 
 ## Running things
 

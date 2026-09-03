@@ -22,3 +22,5 @@ does not.
 | [D26](D26-five-open-items.md) | the instance repo, host builds, checkout storage, the AI actor, the cookie rule |
 | [D27](D27-agents-relate.md) | one agent graph over AI actors, edges as grants, profiles as runtimes, definitions never credentials |
 | [D28](D28-profile-context.md) | a profile's CLAUDE.md is a generated view, the briefing is live, trust decides what is inline |
+| [D29](D29-accounts-to-profiles.md) | accounts are records with a trust domain, profiles bind to one, domains must match, the four layers named |
+| [D30](D30-voice-on-the-client.md) | voice is an interface; Kokoro renders on the client, the daemon never makes audio, the server stack is the fallback |

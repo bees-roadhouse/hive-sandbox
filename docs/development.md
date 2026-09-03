@@ -6,7 +6,8 @@ From nothing to a passing test suite. Assumes you have none of this installed.
 
 | What                | Why                                          | Windows                                    | Linux / macOS                          |
 | ------------------- | -------------------------------------------- | ------------------------------------------ | -------------------------------------- |
-| **Go 1.26.7**       | the daemon                                   | `winget install GoLang.Go`                 | https://go.dev/dl/                     |
+| **Go 1.26.7**       | the Go daemon, the one that runs today       | `winget install GoLang.Go`                 | https://go.dev/dl/                     |
+| **Rust** via rustup | the daemon's rewrite (D24); `rust-toolchain.toml` pins 1.98 with clippy and rustfmt, rustup installs it on first `cargo` | `winget install Rustlang.Rustup` | https://rustup.rs |
 | **Podman 5+**       | local Postgres (Docker works too)            | `winget install RedHat.Podman-Desktop`     | `brew install podman` / your package manager |
 | **Node 20+**        | the Playwright suite                         | `winget install OpenJS.NodeJS.LTS`         | `brew install node` / nvm              |
 | **golangci-lint**   | the gate's lint step                         | `go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest` | same |
@@ -86,6 +87,17 @@ Build, vet, `golangci-lint`, `gofmt -l`, `go test -race`. `gofmt` runs after
 lint because lint autofix can reformat. It prints `GATE GREEN` or
 `GATE RED: <steps>`.
 
+The Rust tree has the same gate in the same shape:
+
+```bash
+./scripts/gate-rust.sh
+```
+
+`cargo fmt --check`, `cargo clippy -D warnings`, `cargo build`, `cargo test`,
+then a named list of every test that printed `SKIPPED:`. It refuses to run
+without `HIVE_SANDBOX_TEST_DATABASE_URL` for the same reason the Go gate does.
+CI does not run it yet; say in the PR that you did.
+
 Read the output, not an exit code. A piped `| tail` or a chained `&&` reports
 the status of the last thing in the pipe, which is how a red gate gets pushed.
 
@@ -118,6 +130,17 @@ A corollary worth knowing before you write a store test: **the database is
 shared across tests, only the schema is private.** Anything database-scoped ...
 `DROP SCHEMA public`, `CREATE EXTENSION`, a role change ... is not isolated and
 will follow every test that runs after it, in any package.
+
+## Write a Rust integration test
+
+`crates/hive-testdb` is `internal/testdb` in Rust: a private schema per test on
+the shared database, dropped when the test ends, `extensions` on the search path
+and `public` kept empty. Without `HIVE_SANDBOX_TEST_DATABASE_URL` a test prints
+`SKIPPED: <name>` and returns, because Rust has no native skip and a silent
+early return is the "test that never executes" shape the conventions warn about.
+`crates/hive-store/tests/invariants.rs` is the reference: the invariant tests
+were ported before the behaviour they test, against the same migration files the
+Go tree runs, which is the tests-first rule of D24 in practice.
 
 ## Run the e2e tests
 
@@ -206,6 +229,7 @@ compiled against an older Go refuses to load a config targeting a newer one.
 
 ## Where the design lives
 
-Not in this repo. Decision log and plans are in the Traycer epic; `CLAUDE.md`
-has the path and the invariants that are load-bearing. Read those before writing
+D0 to D23 are in the Traycer epic, not in this repo; `CLAUDE.md` has the path
+and the invariants that are load-bearing. D24 onward, starting with the Rust
+rewrite, are in [`design/`](design/README.md). Read those before writing
 anything past the harness.

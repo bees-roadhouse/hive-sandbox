@@ -1,8 +1,11 @@
 # hive-sandbox
 
-An app-of-apps platform for a family. A Go daemon hosts WASM guest apps on
-wazero behind a JSON ABI; apps store and relate data through host-mediated
-surfaces; workflows and AI agent runs compose them. Claude Code appears twice:
+An app-of-apps platform for a family. A daemon hosts WASM guest apps behind a
+JSON ABI; apps store and relate data through host-mediated surfaces; workflows
+and AI agent runs compose them. The daemon is Go on wazero today and is being
+rewritten in Rust on wasmtime ([D24](docs/design/D24-rust-rewrite.md), 2026-09-02):
+the Rust workspace under `crates/` grows beside the Go tree, tests first, until
+it reaches parity, and new server code is Rust. Claude Code appears twice:
 as a **builder** that writes new apps into the running system, and as a **brain**
 apps and workflows can call.
 
@@ -26,6 +29,8 @@ Phase 0, and honest about the gap. What exists:
 | `internal/httpapi` | liveness, readiness, events, enrollment, blob reads, and chat |
 | `internal/chat` | a message becomes one hosted agent run; the worker, its heartbeat and the reclaimers |
 | `internal/webui` | the browser client, embedded and served at `/` |
+| `crates/hive-store` | the Rust store: shared migrations, the grant predicate's invariant tests ported first, a table of where every invariant lives in the Rust tree |
+| `crates/hive-testdb` | schema-per-test Postgres for the Rust tests, twin of `internal/testdb` |
 
 **The daemon now composes.** It opens the store, migrates, bootstraps an empty
 database, keeps the event partitions ahead of the clock, runs the LISTEN/NOTIFY
@@ -53,8 +58,9 @@ run resumes its session, and the journal app.
 [Issue #29](https://github.com/bees-roadhouse/hive-sandbox/issues/29)
 tracks the lot.
 
-The design is complete through decision D23. `CLAUDE.md` says where it lives and
-carries the fourteen invariants that are load-bearing ... **each one came out of
+The design is complete through decision D23 in the epic; D24 onward are
+snapshotted in [`docs/design/`](docs/design/README.md). `CLAUDE.md` says where
+the rest lives and carries the fourteen invariants that are load-bearing ... **each one came out of
 a defect a review reproduced**, so breaking one is a bug even when the tests
 pass.
 
@@ -80,6 +86,9 @@ go run ./cmd/hive-sandbox            # api + workflows by default, listens on :7
 go run ./cmd/hive-sandbox -version
 curl localhost:7979/healthz
 ```
+
+That is the Go daemon. The Rust one has no binary yet; `./scripts/gate-rust.sh`
+runs what exists of it (see [Development](#development)).
 
 One process serves every role (D7). `-serve-api`, `-run-workflows`,
 `-run-chat` and `-run-egress-proxy` (an allowlisting forward proxy, HTTP and
@@ -122,7 +131,8 @@ rejects wasip2 imports at link time.
 
 ```bash
 ./scripts/db-up.sh
-./scripts/gate.sh
+./scripts/gate.sh          # the Go tree
+./scripts/gate-rust.sh     # the Rust tree: fmt, clippy, build, test, named skips
 ./scripts/db-down.sh
 
 ./scripts/garage-up.sh

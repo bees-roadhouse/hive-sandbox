@@ -1,8 +1,18 @@
 # hive-sandbox
 
-An app-of-apps platform. A Go daemon hosts WASM guest apps on wazero behind a
-JSON ABI; apps store and relate data through host-mediated surfaces; workflows
-and AI runs compose them. It replaces `bees-roadhouse/hive`.
+An app-of-apps platform. A daemon hosts WASM guest apps behind a JSON ABI; apps
+store and relate data through host-mediated surfaces; workflows and AI runs
+compose them. It replaces `bees-roadhouse/hive`.
+
+**The daemon is being rewritten in Rust** (D24, decided 2026-09-02). The Go
+daemon on wazero is the one that runs today and keeps its gate; a Cargo
+workspace at `crates/*` grows beside it, **tests first**, until it reaches
+parity, and the two are compared against the same database and the same
+guests, never merged. Port order: store, bus, wasmhost, httpapi, chat. New
+server code is Rust; the Go tree takes fixes only. The browser client becomes
+a Solid.js shell and apps may contribute UI as htmx fragments; the desktop
+client is parked until the shell exists to share. The reasons, the picks and
+what the rewrite costs are in `docs/design/D24-rust-rewrite.md`.
 
 **The design is settled and currently lives outside this repo**, in a Traycer
 epic on the maintainer's machine: a decision log running D0 to D23, plus a plan
@@ -13,7 +23,8 @@ transforms, the tools tier, hosted harnesses, the real-time journal, and grants.
 that is a real gap rather than a formality ... several of those decisions are
 corrections that building or reviewing forced, and they explain why the code
 looks the way it does. Snapshotting them into `docs/design/` is tracked as
-issue #28.
+issue #28; that directory carries every decision from D24 onward and back-fills
+earlier ones as a change needs them.
 
 Until then, the invariants below and the issue tracker carry the load-bearing
 parts. If something here and something in the decision log disagree, **the
@@ -50,7 +61,10 @@ even if the tests pass.
    definition.
 7. **Every blocking host function takes a `context.Context` and returns on
    cancellation.** wazero inserts termination checks into *guest* code, so a
-   guest blocked inside a host call is otherwise unkillable.
+   guest blocked inside a host call is otherwise unkillable. The Rust tree
+   keeps the rule with the words changed: every blocking host function is a
+   future that completes on cancellation, and wasmtime's epoch interruption is
+   what makes a guest parked in a host call killable.
 8. **No blob exists without a ref**, and whatever produced it writes one ...
    host-internal producers included.
 9. **Untrusted content never reaches instruction position.** Anything a browser,
@@ -64,8 +78,9 @@ even if the tests pass.
     the enforcement point and there are as many enforcement points as call sites.
     Corollaries: an obligation like auditing belongs to the predicate rather than
     to one call site, and **a trigger cannot enforce what the writer supplies**
-    ... rules about "who did this" need a Go writer that pins the value from the
-    credential, because a trigger has no credential in scope.
+    ... rules about "who did this" need a host writer (Go today, Rust in the
+    port) that pins the value from the credential, because a trigger has no
+    credential in scope.
 12. **Trust is structural in the ABI, not a field a guest can forget.** Every
     capability response is `{trust, data}`; taint is tracked host-side per
     invocation and is monotonic, so a write made after an untrusted read inherits
@@ -131,6 +146,16 @@ hears it.
 Order matters: `gofmt` AFTER any lint autofix. The toolchain is pinned in
 `go.mod`; CI runs the same version.
 
+The Rust tree has a gate of the same shape with the same database rule:
+
+```bash
+export HIVE_SANDBOX_TEST_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
+./scripts/gate-rust.sh    # cargo fmt --check, clippy -D warnings, build, test; names every skip
+```
+
+**CI does not run it yet.** Until a `rust` job exists in `ci.yml`, a Rust
+change is gated on the machine that made it or not at all; say which in the PR.
+
 ## Running things
 
 ```bash
@@ -139,7 +164,13 @@ curl localhost:7979/healthz
 
 go test ./internal/store -run TestAbsenceIsDeny -race -v    # one test
 go test ./internal/wasmhost -race                           # one package
+
+cargo test -p hive-store --test invariants -- --nocapture   # the ported invariant tests
+cargo test --workspace -- --nocapture                       # everything Rust; skips print SKIPPED:
 ```
+
+There is no Rust binary to run yet: the Rust tree is tests and the store crate
+until the port order above reaches httpapi.
 
 A single test needs `HIVE_SANDBOX_TEST_DATABASE_URL` exactly as much as the gate
 does, and skips itself without it ... `-run` narrows what executes, it does not
@@ -189,6 +220,16 @@ guidance, never fewer.
 ## Layout
 
 ```
+Cargo.toml             the Rust workspace (D24), beside the Go tree it replaces: crates/*,
+                       unsafe forbidden at the workspace, toolchain pinned in
+                       rust-toolchain.toml. The Go module ignores it and it ignores the Go module
+crates/hive-store/     Postgres: migrations, the data layer, the grant predicate, in Rust.
+                       Embeds internal/store/migrations/*.sql by relative path and shares the
+                       schema_migrations table, so either daemon can migrate a database the
+                       other has touched. lib.rs carries the table of where each of the
+                       fourteen invariants lives in the Rust tree, "not yet" rows included
+crates/hive-testdb/    schema-per-test Postgres for the Rust integration tests; the twin of
+                       internal/testdb, and they share one database while both trees live
 cmd/hive-sandbox/      the daemon entrypoint. Roles are flags, one process serves all
                        of them (D7): -serve-api, -run-workflows, -run-chat,
                        -run-egress-proxy. Every role defaults on except the proxy,
@@ -229,7 +270,7 @@ apps/                  first-party guest apps. apps/hello is the reference one
 desktop/               the Linux desktop client: a Wails v3 shell over a
                        webview-free core. Own module, own gate script; see docs/desktop.md
 docs/                  per-topic docs (development.md installs the toolchain from
-                       nothing); the design lives in the epic
+                       nothing); docs/design/ holds the decision snapshots, D24 onward
 test/e2e/              Playwright end-to-end tests that drive a real daemon over HTTP
 ```
 
@@ -240,7 +281,14 @@ and has tests.
 
 ## Conventions
 
-- Go 1.26, no CGo anywhere in the host. wazero is pure Go and that is the point.
+- **Rust for the daemon, from D24 on.** 1.98, pinned in `rust-toolchain.toml`
+  with clippy and rustfmt; `unsafe_code = "forbid"` at the workspace, which is
+  the no-CGo rule in the new language; `sqlx` 0.8 with runtime queries and
+  rustls, because the gate builds on a machine with no database in reach and no
+  system TLS library; `axum` 0.8; `wasmtime`, WASI preview 1 only; `tokio`. The
+  reason behind each pick is in D24 and outlives the pick.
+- **The Go tree, while it lives:** Go 1.26, no CGo anywhere in the host. wazero
+  is pure Go and that is the point.
   **`desktop/` is the deliberate carve-out**: its Wails shell links GTK/WebKit
   through cgo, lives in its own nested module so the host gate never builds it,
   and `scripts/build-desktop.sh` plus the CI `desktop` job are where it is

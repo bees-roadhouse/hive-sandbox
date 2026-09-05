@@ -177,11 +177,10 @@ mod tests {
     #[test]
     fn the_refusal_is_the_same_on_every_attempt() {
         let doc = br#"{"zzz":{"blob":"bad-z"},"aaa":{"blob":"bad-a"},"mmm":{"blob":"bad-m"}}"#;
-        let first = descriptors_in(doc).err().expect("accepted").to_string();
+        let first = descriptors_in(doc).expect_err("accepted").to_string();
         for i in 0..20 {
             let again = descriptors_in(doc)
-                .err()
-                .expect("accepted on a later attempt")
+                .expect_err("accepted on a later attempt")
                 .to_string();
             assert_eq!(again, first, "attempt {i} named a different path");
         }
@@ -207,8 +206,7 @@ mod tests {
             "}".repeat(MAX_DESCRIPTOR_DEPTH + 5)
         );
         let err = descriptors_in(deep.as_bytes())
-            .err()
-            .expect("a document past the depth bound was accepted");
+            .expect_err("a document past the depth bound was accepted");
         assert!(
             err.to_string().contains("nests deeper"),
             "refused for a different reason than depth: {err}"
@@ -229,8 +227,7 @@ mod tests {
         );
         let doc = format!(r#"{{"files":[{}]}}"#, files.join(","));
         let err = descriptors_in(doc.as_bytes())
-            .err()
-            .expect("a document naming too many blobs was accepted");
+            .expect_err("a document naming too many blobs was accepted");
         assert!(
             err.to_string().contains("names more than"),
             "refused for a different reason than the count: {err}"

@@ -54,8 +54,7 @@ async fn ai_cannot_activate_its_own_build() {
 
     let err = activate_install(&mut conn, install_id, &ava_cred)
         .await
-        .err()
-        .expect("an AI activated its own build");
+        .expect_err("an AI activated its own build");
     assert!(
         matches!(err, StoreError::NotHuman(_)),
         "refused for the wrong reason: {err}"
@@ -364,8 +363,7 @@ async fn activating_checks_what_is_being_promoted_and_not_only_who() {
     let mut conn = w.conn().await;
     let err = activate_install(&mut conn, install_id, &alice_cred)
         .await
-        .err()
-        .expect("a withdrawn build was promoted into a live install");
+        .expect_err("a withdrawn build was promoted into a live install");
     assert!(
         matches!(err, StoreError::Denied),
         "refused for the wrong reason: {err}"
@@ -400,8 +398,7 @@ async fn activating_cannot_pull_a_teardown_back_to_live() {
     let mut conn = w.conn().await;
     let err = activate_install(&mut conn, install_id, &alice_cred)
         .await
-        .err()
-        .expect("an install being torn down was activated");
+        .expect_err("an install being torn down was activated");
     assert!(matches!(err, StoreError::Denied), "{err}");
     assert_eq!(w.install_state(install_id).await, "uninstalling");
 }
@@ -425,8 +422,7 @@ async fn activating_says_nothing_about_a_build_to_a_caller_with_no_standing() {
     let mut conn = w.conn().await;
     let err = activate_install(&mut conn, install_id, &bob_cred)
         .await
-        .err()
-        .expect("a stranger activated somebody else's install");
+        .expect_err("a stranger activated somebody else's install");
     assert!(
         !err.to_string().contains("withdrawn"),
         "the refusal disclosed the build's status: {err}"
@@ -638,6 +634,16 @@ fn short_slug() -> String {
     format!("t{}", &Uuid::new_v4().to_string()[..8])
 }
 
+/// An app schema lives outside the test's private schema, so each test drops
+/// the ones it provisioned.
+async fn drop_app_schema(w: &World, spec: &hive_registry::InstallSpec) {
+    let mut tx = w.store.begin().await.unwrap();
+    hive_store::drop_schema_plan(&mut tx, &spec.schema)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
 /// Ported from `TestBobCannotStageAnInstallOntoAlicesSchema`. There is no
 /// longer a field to name her schema WITH: the attack is unrepresentable
 /// rather than rejected. This still asserts the outcome, because "the type
@@ -651,10 +657,12 @@ async fn bob_cannot_stage_an_install_onto_alices_schema() {
     let bob = w.human("bob").await;
     let slug = short_slug();
 
+    let alice_spec = prepared_for(&slug, user(alice));
+    let bob_spec = prepared_for(&slug, user(bob));
     let alice_build = register_in(
         &w,
         BuildSpec {
-            spec: prepared_for(&slug, user(alice)),
+            spec: alice_spec.clone(),
             owner: Some(user(alice)),
             trust: String::new(),
         },
@@ -671,7 +679,7 @@ async fn bob_cannot_stage_an_install_onto_alices_schema() {
     let bob_build = register_in(
         &w,
         BuildSpec {
-            spec: prepared_for(&slug, user(bob)),
+            spec: bob_spec.clone(),
             owner: Some(user(bob)),
             trust: String::new(),
         },
@@ -692,6 +700,8 @@ async fn bob_cannot_stage_an_install_onto_alices_schema() {
     )
     .await
     else {
+        drop_app_schema(&w, &alice_spec).await;
+        drop_app_schema(&w, &bob_spec).await;
         return; // refused outright is a correct outcome too
     };
     let captured: String = sqlx::query_scalar("SELECT schema_name FROM installs WHERE id = $1")
@@ -699,6 +709,8 @@ async fn bob_cannot_stage_an_install_onto_alices_schema() {
         .fetch_one(w.pool())
         .await
         .unwrap();
+    drop_app_schema(&w, &alice_spec).await;
+    drop_app_schema(&w, &bob_spec).await;
     assert_ne!(captured, alices_schema, "bob's install owns alice's schema");
     assert_eq!(captured, bob_build.schema_name);
 }
@@ -713,10 +725,11 @@ async fn stage_install_refuses_a_slug_that_would_truncate() {
     let alice = w.human("alice").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let legal = short_slug();
+    let legal_spec = prepared_for(&legal, user(alice));
     let build = register_in(
         &w,
         BuildSpec {
-            spec: prepared_for(&legal, user(alice)),
+            spec: legal_spec.clone(),
             owner: Some(user(alice)),
             trust: String::new(),
         },
@@ -739,8 +752,7 @@ async fn stage_install_refuses_a_slug_that_would_truncate() {
         &alice_cred,
     )
     .await
-    .err()
-    .expect("a slug that pushes the owner digest past 63 characters was accepted");
+    .expect_err("a slug that pushes the owner digest past 63 characters was accepted");
     assert!(
         err.to_string().contains("slug"),
         "the error should say which input is too long: {err}"
@@ -764,10 +776,11 @@ async fn the_longest_legal_slug_still_works() {
         derived.len()
     );
 
+    let spec = prepared_for(&slug, user(alice));
     let build = register_in(
         &w,
         BuildSpec {
-            spec: prepared_for(&slug, user(alice)),
+            spec: spec.clone(),
             owner: Some(user(alice)),
             trust: String::new(),
         },
@@ -776,7 +789,7 @@ async fn the_longest_legal_slug_still_works() {
     .await
     .expect("the longest legal slug was refused at registration");
     let mut conn = w.conn().await;
-    stage_install(
+    let staged = stage_install(
         &mut conn,
         &InstallSpec {
             build_id: build.build_id,
@@ -785,8 +798,10 @@ async fn the_longest_legal_slug_still_works() {
         },
         &alice_cred,
     )
-    .await
-    .expect("the longest legal slug was refused at staging");
+    .await;
+    drop(conn);
+    drop_app_schema(&w, &spec).await;
+    staged.expect("the longest legal slug was refused at staging");
 }
 
 /// Ported from `TestTwoOwnersStayDistinctAfterPostgresTruncates`. No database:

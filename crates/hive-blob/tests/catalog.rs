@@ -237,8 +237,7 @@ async fn resolve_through_refs_not_the_global_hash_space() {
         .catalog
         .resolve(&carol, desc.hash)
         .await
-        .err()
-        .expect("expected an error");
+        .expect_err("expected an error");
     assert!(err.is_not_found(), "{err}");
 
     // And a hash nobody ever stored gives the identical shape.
@@ -247,8 +246,7 @@ async fn resolve_through_refs_not_the_global_hash_space() {
         .catalog
         .resolve(&carol, never)
         .await
-        .err()
-        .expect("expected an error");
+        .expect_err("expected an error");
     assert!(missing.is_not_found(), "{missing}");
     let mask = |e: &BlobError, h: Hash| e.to_string().replace(&h.to_string(), "<hash>");
     assert_eq!(
@@ -282,8 +280,8 @@ async fn open_requires_a_ref() {
         w.catalog
             .open(&carol, desc.hash, Range::FULL)
             .await
-            .err()
-            .expect("expected an error")
+            .map(|_| ())
+            .expect_err("expected an error")
             .is_not_found()
     );
 }
@@ -458,8 +456,7 @@ async fn sweep_collects_only_unreferenced_bytes() {
             .driver()
             .stat(desc.hash)
             .await
-            .err()
-            .expect("expected an error")
+            .expect_err("expected an error")
             .is_not_found(),
         "bytes survived collection"
     );
@@ -642,23 +639,22 @@ async fn a_hash_alone_is_not_a_reference() {
         w.catalog
             .resolve(&carol, desc.hash)
             .await
-            .err()
-            .expect("expected an error")
+            .expect_err("expected an error")
             .is_not_found()
     );
     assert!(
         w.catalog
             .open(&carol, desc.hash, Range::FULL)
             .await
-            .err()
-            .expect("expected an error")
+            .map(|_| ())
+            .expect_err("expected an error")
             .is_not_found()
     );
     let link = w
         .link_ref(&carol, desc.hash, &capture(carol, "stolen-1"))
         .await;
     assert!(
-        link.err().expect("expected an error").is_not_found(),
+        link.expect_err("expected an error").is_not_found(),
         "carol wrote herself a reference from a hash she only knew"
     );
 
@@ -668,13 +664,11 @@ async fn a_hash_alone_is_not_a_reference() {
     let missing = w
         .link_ref(&carol, absent, &capture(carol, "probe"))
         .await
-        .err()
-        .expect("expected an error");
+        .expect_err("expected an error");
     let unheld = w
         .link_ref(&carol, desc.hash, &capture(carol, "probe"))
         .await
-        .err()
-        .expect("expected an error");
+        .expect_err("expected an error");
     let mask = |e: &BlobError, h: Hash| e.to_string().replace(&h.to_string(), "<hash>");
     assert_eq!(
         mask(&unheld, desc.hash),
@@ -711,8 +705,7 @@ async fn link_ref_requires_an_existing_reference() {
     let err = w
         .link_ref(&carol, desc.hash, &capture(carol, "entry-9"))
         .await
-        .err()
-        .expect("expected an error");
+        .expect_err("expected an error");
     assert!(err.is_not_found(), "link_ref for a stranger = {err}");
 }
 

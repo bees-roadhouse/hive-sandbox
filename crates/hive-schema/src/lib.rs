@@ -1,12 +1,10 @@
-//! Forward-only migrations, shared with the Go tree.
+//! Forward-only migrations.
 //!
-//! The SQL files are the Go tree's own, embedded by relative path rather than
-//! copied: while both daemons live they must agree about one database, and two
-//! copies of a migration are two schemas claiming one version. The bookkeeping
-//! is identical for the same reason ... the same `schema_migrations` table,
-//! the same advisory lock key, the same checksum over the same bytes ... so
-//! either binary can migrate a database the other has touched, and either
-//! refuses a file the other applied differently.
+//! The SQL files under `migrations/` are the ones the Go daemon applied before
+//! the port (D31): the same `schema_migrations` table, the same advisory lock
+//! key, the same checksum over the same bytes, so a database the Go daemon
+//! migrated is a database this one continues, and a file that was applied
+//! differently is refused rather than reapplied.
 
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, PgPool};
@@ -33,25 +31,22 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: "0001",
         name: "init",
-        sql: include_str!("../../../internal/store/migrations/0001_init.sql"),
+        sql: include_str!("../migrations/0001_init.sql"),
     },
     Migration {
         version: "0002",
         name: "agent_runs",
-        sql: include_str!("../../../internal/store/migrations/0002_agent_runs.sql"),
+        sql: include_str!("../migrations/0002_agent_runs.sql"),
     },
     Migration {
         version: "0003",
         name: "chat",
-        sql: include_str!("../../../internal/store/migrations/0003_chat.sql"),
+        sql: include_str!("../migrations/0003_chat.sql"),
     },
 ];
 
 /// The shared directory, for the test that keeps `MIGRATIONS` honest.
-pub const SHARED_DIR: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../internal/store/migrations"
-);
+pub const SHARED_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
 
 /// An arbitrary but fixed key for `pg_advisory_lock`. Two daemons booting at
 /// once must not both run migration one; the loser waits and then finds
@@ -188,10 +183,10 @@ async fn apply(
 mod tests {
     use super::*;
 
-    /// The shared directory and the embedded list must agree. A file added to
-    /// the Go tree that this crate does not carry would let the Go daemon
-    /// migrate a database this one then refuses as unknown, which is correct
-    /// and also a surprise; this makes it a compile-adjacent failure instead.
+    /// The directory and the embedded list must agree. A file dropped into
+    /// `migrations/` that this list does not carry would never run, and a
+    /// listed file that is not on disk fails at compile time; this catches the
+    /// first shape.
     #[test]
     fn embedded_migrations_match_the_shared_directory() {
         let mut on_disk: Vec<String> = std::fs::read_dir(SHARED_DIR)
@@ -211,7 +206,7 @@ mod tests {
             .collect();
         assert_eq!(
             on_disk, embedded,
-            "internal/store/migrations and MIGRATIONS disagree"
+            "crates/hive-schema/migrations and MIGRATIONS disagree"
         );
     }
 

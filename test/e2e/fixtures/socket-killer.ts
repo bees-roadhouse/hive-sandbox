@@ -86,7 +86,7 @@ export async function startSocketKiller(): Promise<SocketKiller> {
 
   // CONNECT is not implemented on purpose: nothing in this suite speaks https,
   // and a tunnel nobody exercises is a tunnel nobody maintains. If that
-  // changes, internal/egress/proxy.go has a working one, including the detail
+  // changes, crates/hive-egress/src/proxy.rs has a working one, including the detail
   // that anything pipelined behind the CONNECT is already in the buffered
   // reader and is lost by reading the socket directly.
   server.on('connect', (_req, socket) => {

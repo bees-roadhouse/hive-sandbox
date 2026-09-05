@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# The born-green gate for the Rust tree. Mirrors scripts/gate.sh: fmt, lint,
-# build, test, and a NAMED list of every test that skipped, because a skip is
-# a test saying it is not answering the question and that only helps if
-# somebody hears it.
+# The born-green gate. Run before pushing; read the OUTPUT, never the exit code
+# of a piped command.
 #
 #   export HIVE_SANDBOX_TEST_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
 #   ./scripts/gate-rust.sh
 #
-# The database line is not optional and the gate refuses without it, for the
-# reason the Go gate gives: without it every integration test skips itself and
-# a green gate reports nothing.
+# fmt, clippy, build, test, and a NAMED list of every test that skipped, because
+# a skip is a test saying it is not answering the question and that only helps
+# if somebody hears it.
+#
+# The database line is not optional and the gate refuses without it. It used to
+# be a suggestion, and the result was every Postgres-backed test in the repo
+# skipping itself while the gate printed GATE GREEN in about the same wall time.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -34,6 +36,25 @@ step() {
   "$@" || failed+=("$name")
 }
 
+# The browser client is a committed build (web/dist) embedded into the daemon.
+# When node is present the gate rebuilds it and refuses a diff, so a change to
+# web/ that nobody rebuilt cannot ship stale bytes. Without node the committed
+# build is what gets embedded, and CI has node.
+if command -v npm >/dev/null 2>&1; then
+  echo "==> web"
+  if (cd web && npm ci --no-fund --no-audit --silent && npm run --silent typecheck && npm run --silent build); then
+    if ! git diff --quiet -- web/dist; then
+      echo "web/dist is out of date with web/src; commit the rebuilt files:" >&2
+      git --no-pager diff --stat -- web/dist >&2
+      failed+=("web-dist")
+    fi
+  else
+    failed+=("web")
+  fi
+else
+  echo "==> web (npm not found; embedding the committed web/dist as is)"
+fi
+
 step fmt cargo fmt --all -- --check
 step clippy cargo clippy --workspace --all-targets -- -D warnings
 step build cargo build --workspace --all-targets
@@ -42,7 +63,9 @@ echo "==> test"
 log=$(mktemp)
 # --nocapture so a SKIPPED: line reaches this script; the test harness would
 # otherwise swallow it along with everything else a passing test printed.
-cargo test --workspace -- --nocapture 2>&1 | tee "$log"
+# --no-fail-fast so one red crate does not hide the others' results: the point
+# of a gate is the whole picture, not the first thing that broke.
+cargo test --workspace --no-fail-fast -- --nocapture 2>&1 | tee "$log"
 test_status=${PIPESTATUS[0]}
 [ "$test_status" -eq 0 ] || failed+=("test")
 

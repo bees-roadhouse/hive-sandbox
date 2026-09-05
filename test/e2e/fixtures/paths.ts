@@ -1,14 +1,16 @@
-import { existsSync } from 'node:fs';
 import path from 'node:path';
 
 /** Repo root, from test/e2e. */
 export const repoRoot = path.resolve(__dirname, '..', '..', '..');
 
-/** Scratch directory for the built daemon. Gitignored. */
+/** Scratch directory for what global-setup records. Gitignored. */
 export const buildDir = path.join(repoRoot, 'test', 'e2e', '.playwright');
 
+/** Where `cargo build -p hive-sandbox` puts the daemon. */
 export const binaryPath = path.join(
-  buildDir,
+  repoRoot,
+  'target',
+  'debug',
   process.platform === 'win32' ? 'hive-sandbox.exe' : 'hive-sandbox',
 );
 
@@ -17,32 +19,6 @@ export const buildInfoPath = path.join(buildDir, 'build.json');
 
 export interface BuildInfo {
   binaryPath: string;
-  /** Whatever `hive-sandbox -version` printed. */
+  /** Whatever `hive-sandbox --version` printed, without the binary name. */
   version: string;
-}
-
-/**
- * Environment for spawning `go`. A fresh shell on the Windows box does not have
- * Go on PATH, and a test suite that only works from a prepared terminal is a
- * test suite people stop running.
- */
-export function goEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  if (process.platform !== 'win32') {
-    return env;
-  }
-
-  const goBin = 'C:\\Program Files\\Go\\bin';
-  if (!existsSync(goBin)) {
-    return env;
-  }
-
-  // Windows environment keys are case-insensitive but the object's are not, so
-  // find whichever spelling this process actually has.
-  const key = Object.keys(env).find((k) => k.toLowerCase() === 'path') ?? 'PATH';
-  const current = env[key] ?? '';
-  if (!current.split(';').some((p) => p.toLowerCase() === goBin.toLowerCase())) {
-    env[key] = `${goBin};${current}`;
-  }
-  return env;
 }

@@ -6,11 +6,11 @@ travels through them:
 
 | piece | where | what it owns |
 |---|---|---|
-| schema | `internal/store/migrations/0003_chat.sql` | conversations, messages, the turn ledger, sessions, and `conversation` as a subject kind |
-| data layer | `internal/store/chat.go` | every read and write on the chat tables; the only code that touches them |
-| worker | `internal/chat` | a turn becomes one harness run; the hub that makes a stream live |
-| HTTP | `internal/httpapi/chat.go`, `chatstream.go`, `session.go` | the routes, the stream, the browser's cookie |
-| page | `internal/webui` | the browser client, embedded, served at `/` |
+| schema | `crates/hive-schema/migrations/0003_chat.sql` | conversations, messages, the turn ledger, sessions, and `conversation` as a subject kind |
+| data layer | `crates/hive-store/src/chat.rs` | every read and write on the chat tables; the only code that touches them |
+| worker | `crates/hive-chat` | a turn becomes one harness run; the hub that makes a stream live |
+| HTTP | `crates/hive-httpapi/src/chat.rs`, `chatstream.rs`, `session.rs` | the routes, the stream, the browser's cookie |
+| page | `web/` (Solid.js), served by `crates/hive-webui` | the browser client, built into `web/dist`, embedded, served at `/` |
 
 ## A turn is one run
 
@@ -25,7 +25,7 @@ a crash loses one turn, never a session.
 **One conversation runs one turn at a time.** Two messages posted quickly are
 two turns, and the second is not claimable until the first closes. Without
 that, two workers would resume the same session concurrently and interleave two
-agents in one thread. The rule lives in `ClaimTurn`'s query, and it means a
+agents in one thread. The rule lives in `claim_turn`'s query, and it means a
 lapsed claim blocks its conversation until the reclaimer fails it ... which is
 the at-most-once guard working: the run behind a lapsed claim may still be
 spending money.
@@ -48,7 +48,7 @@ dropped rather than waited for, so a slow browser never sits on the critical
 path of a child process's pipe. The table is the transport; the stream fills a
 detected gap from it.
 
-Run events are **not** mirrored onto the events bus. `AppendEvents` issues one
+Run events are **not** mirrored onto the events bus. `append_events` issues one
 NOTIFY per call, so ten concurrent turns would put thousands of rows inside the
 bus's overlap window and past its late-commit sweep, truncating the one
 mechanism that catches an id assigned before commit, for every consumer. The
@@ -100,36 +100,42 @@ control for the cookie: a cross-site form cannot send that content type, a
 cross-site `fetch()` that does is preflighted, and there is no CORS to approve
 it. `SameSite=Strict` on the cookie is the second layer. `Secure` is on by
 default and comes off only when the deployment says, once, that it serves
-plain HTTP (`-plain-http`, env `HIVE_SANDBOX_PLAIN_HTTP`), which the daemon
+plain HTTP (`--plain-http`, env `HIVE_SANDBOX_PLAIN_HTTP`), which the daemon
 warns about at every boot. Never from the request's scheme or a forwarded
 header: a security property the network can shape is not a property
 (`docs/design/D26-five-open-items.md`, item 5).
 
 ## The page
 
-`internal/webui` is three files with no build step, embedded in the daemon and
-served at `/` and `/ui/*`. The token is pasted once, exchanged for the cookie
-over `POST /session`, and never held by the page again: not in storage, not in
-a URL. The page renders everything with `textContent`, and its
-Content-Security-Policy is `default-src 'none'` with `'self'` for script, style
-and connections, so a message that somehow became markup would still have
-nowhere to go. A test fails if `index.html` grows an inline script or style.
+`web/` is a Solid.js shell built by Vite into `web/dist` (three files: the
+page, `app.js`, `styles.css`), which `crates/hive-webui` embeds into the daemon
+and serves at `/` and `/ui/*`. The token is pasted once, exchanged for the
+cookie over `POST /session`, and never held by the page again: not in storage,
+not in a URL. Solid renders every interpolation as a text node, never markup,
+and the daemon's Content-Security-Policy is `default-src 'none'` with `'self'`
+for script, style and connections, so a message that somehow became markup
+would still have nowhere to go. Tests fail if `index.html` grows an inline
+script or style, or if the bundle starts touching `localStorage`.
+
+`web/dist` is committed because the daemon embeds it at compile time and a
+checkout with no node must still build. The gate rebuilds it when npm is
+present and refuses a diff; CI always rebuilds it.
 
 `test/e2e/specs/chat.spec.ts` drives it in a real browser: sign in, start a
 thread, post, see the message waiting for an agent, reload and still see it,
-sign out. The daemon under that suite runs with `-run-chat=false`, so nothing
+sign out. The daemon under that suite runs with `--run-chat=false`, so nothing
 answers; a spec that wants an answered turn needs a fixture with a harness
 image and is not written yet.
 
 ## Running the worker
 
-The daemon runs the worker when `-run-chat` is on (the default) **and** a pins
-file exists (`-harness-pins`, default `docker/harness/digests.json`, written by
+The daemon runs the worker when `--run-chat` is on (the default) **and** a pins
+file exists (`--harness-pins`, default `docker/harness/digests.json`, written by
 `scripts/harness-build.sh`). No pins file is a warning and the worker is
 disabled: turns queue, and the thread shows "waiting for an agent". A pins file
 that exists and cannot be read is a boot failure. The worker also needs
-`-unix-socket`, because a run is `--network=none` with the socket bind-mounted
-and has no other route to the API (invariant 13), and `-chat-workspaces`, one
+`--unix-socket`, because a run is `--network=none` with the socket bind-mounted
+and has no other route to the API (invariant 13), and `--chat-workspaces`, one
 directory per conversation, the only thing that outlives a turn.
 
 The worker runs the reclaimers too: lapsed turn leases are failed and their
@@ -142,7 +148,7 @@ deadline is marked indeterminate as well. That second one is the reader
 - **A container test that a `claude` run actually resumes a session.** The
   worker's resume path is proven against a fake CLI (the test binary in helper
   mode); the real CLI's `stream-json` envelope is read from documentation.
-  `extractText` fails closed, so the first real failure will be an empty
+  `assistant_text` fails closed, so the first real failure will be an empty
   answer rather than protocol noise, and that test should exist before chat is
   trusted with a real image.
 - An AI actor per runtime, so an agent message is attributed to the agent.

@@ -76,8 +76,9 @@ mime = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 clap = { version = "4", features = ["derive", "env"] }
 humantime = "2"
-rust-embed = { version = "8", features = ["include-exclude"] }
+rust-embed = { version = "8", features = ["include-exclude", "debug-embed"] }
 mime_guess = "2"
+socket2 = "0.6"
 wasmtime = { version = "48", default-features = false, features = ["cranelift", "runtime", "async", "std", "parallel-compilation", "cache", "wat"] }
 wasmtime-wasi = { version = "48", default-features = false, features = ["p1"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }

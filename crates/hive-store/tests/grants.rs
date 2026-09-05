@@ -217,8 +217,7 @@ async fn absence_is_deny_through_the_guard() {
             "",
         )
         .await
-        .err()
-        .expect("authorize allowed a stranger");
+        .expect_err("authorize allowed a stranger");
     assert!(matches!(err, StoreError::Denied), "{err}");
 }
 
@@ -512,8 +511,7 @@ async fn unshare_then_reshare_a_direct_grant() {
     // nothing changes and the caller is told why.
     let err = unshare(w.pool(), &entry, user(bob), alice, false)
         .await
-        .err()
-        .expect("unshare removed a direct grant without being asked to");
+        .expect_err("unshare removed a direct grant without being asked to");
     assert!(
         matches!(err, StoreError::WouldDeleteDirectGrant(_)),
         "refused for the wrong reason: {err}"
@@ -1467,8 +1465,7 @@ async fn org_members_are_human() {
     };
     let err = seat(acme, ava, "admin", alice)
         .await
-        .err()
-        .expect("an AI actor was seated in an org; the override rule is now unenforced");
+        .expect_err("an AI actor was seated in an org; the override rule is now unenforced");
     assert!(
         err.to_string().contains("not a human"),
         "refused for the wrong reason: {err}"

@@ -127,7 +127,7 @@ async fn disk_seal_rejects_a_digest_mismatch() {
         .await
         .unwrap();
     up.write(b"what the client actually sent").await.unwrap();
-    let err = up.seal().await.err().expect("seal");
+    let err = up.seal().await.expect_err("seal");
     let actual = match err {
         BlobError::DigestMismatch { declared, actual } => {
             assert_eq!(declared, lie);
@@ -139,15 +139,13 @@ async fn disk_seal_rejects_a_digest_mismatch() {
     assert!(
         d.stat(lie)
             .await
-            .err()
-            .expect("expected an error")
+            .expect_err("expected an error")
             .is_not_found()
     );
     assert!(
         d.stat(actual)
             .await
-            .err()
-            .expect("expected an error")
+            .expect_err("expected an error")
             .is_not_found()
     );
     assert_no_temp_files(dir.path());
@@ -215,8 +213,7 @@ async fn disk_delete_is_idempotent() {
     assert!(
         d.stat(sealed.hash())
             .await
-            .err()
-            .expect("expected an error")
+            .expect_err("expected an error")
             .is_not_found()
     );
 }
@@ -336,8 +333,7 @@ async fn disk_stat_unknown_hash() {
     assert!(
         d.stat(Hash::of(b"never stored"))
             .await
-            .err()
-            .expect("expected an error")
+            .expect_err("expected an error")
             .is_not_found()
     );
     // The zero hash is never a real digest.

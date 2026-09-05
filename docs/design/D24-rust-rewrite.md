@@ -3,6 +3,10 @@
 **Decided** 2026-09-02, by Nate, relayed between two Pia sessions and recorded
 here because the epic is not reachable from a session.
 
+**Status 2026-09-05:** carried out. The Go tree described below as running
+beside the Rust one is gone; [D31](D31-go-removed.md) records what the removal
+kept and changed. This entry stays as the record of why.
+
 ## The decision
 
 The server side of hive-sandbox (store, bus, wasmhost, blob, manifest,

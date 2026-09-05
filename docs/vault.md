@@ -79,7 +79,7 @@ uniform:
   position
 - egress for a backend that talks to a remote vault goes through the
   allowlisting proxy, so "the 1Password backend" can reach 1Password and
-  nothing else — a property no in-process Go client can offer
+  nothing else — a property no in-process client library can offer
 
 The host contract is small enough to be worth keeping small: resolve a
 reference to a lease, and report what the lease is for. Anything more and the

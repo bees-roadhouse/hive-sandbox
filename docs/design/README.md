@@ -24,3 +24,4 @@ does not.
 | [D28](D28-profile-context.md) | a profile's CLAUDE.md is a generated view, the briefing is live, trust decides what is inline |
 | [D29](D29-accounts-to-profiles.md) | accounts are records with a trust domain, profiles bind to one, domains must match, the four layers named |
 | [D30](D30-voice-on-the-client.md) | voice is an interface; Kokoro renders on the client, the daemon never makes audio, the server stack is the fallback |
+| [D31](D31-go-removed.md) | the Go tree is removed at parity; migrations move, the TinyGo guest is frozen as the ABI fixture, flags become `--long` |

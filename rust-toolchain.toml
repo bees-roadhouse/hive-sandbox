@@ -1,4 +1,4 @@
-# Pinned for the same reason go.mod pins Go: CI and every laptop run one
+# Pinned so CI and every laptop run one
 # version, and a lint that appears in a newer toolchain arrives as a deliberate
 # bump rather than as a red gate on a Tuesday.
 [toolchain]

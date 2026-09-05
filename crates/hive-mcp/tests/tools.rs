@@ -199,7 +199,7 @@ async fn both_paths_consult_the_guard() {
 #[tokio::test]
 async fn revocation_between_list_and_call_bites() {
     let k = key(INSTALL_ONE, "journal.add");
-    let g = guard(&[k.clone()]);
+    let g = guard(std::slice::from_ref(&k));
     let (s, _) = server_with(vec![install_one()], g.clone());
     let listed = s.list_tools(&alice()).await.unwrap();
     assert!(!listed.is_empty(), "nothing listed");

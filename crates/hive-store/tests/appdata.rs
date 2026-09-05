@@ -449,7 +449,7 @@ async fn storage_denies_without_a_grant() {
         ))
         .await;
     assert_eq!(
-        status_of(&get.err().expect("get succeeded for someone with no grant")),
+        status_of(&get.expect_err("get succeeded for someone with no grant")),
         Status::NotFound
     );
     let update = f
@@ -461,7 +461,7 @@ async fn storage_denies_without_a_grant() {
         ))
         .await;
     assert_eq!(
-        status_of(&update.err().expect("update succeeded")),
+        status_of(&update.expect_err("update succeeded")),
         Status::NotFound
     );
     let delete = f
@@ -473,7 +473,7 @@ async fn storage_denies_without_a_grant() {
         ))
         .await;
     assert_eq!(
-        status_of(&delete.err().expect("delete succeeded")),
+        status_of(&delete.expect_err("delete succeeded")),
         Status::NotFound
     );
     let insert = f
@@ -485,7 +485,7 @@ async fn storage_denies_without_a_grant() {
         ))
         .await;
     assert_eq!(
-        status_of(&insert.err().expect("insert succeeded")),
+        status_of(&insert.expect_err("insert succeeded")),
         Status::Denied
     );
 
@@ -554,8 +554,7 @@ async fn grantee_can_read_but_not_delete() {
             serde_json::json!({"collection": c, "id": id}),
         ))
         .await
-        .err()
-        .expect("a grantee deleted somebody else's document");
+        .expect_err("a grantee deleted somebody else's document");
     assert_eq!(status_of(&err), Status::Denied);
     f.data
         .delete(f.req(
@@ -598,11 +597,7 @@ async fn storage_refuses_an_inactive_install() {
         ))
         .await;
     assert_eq!(
-        status_of(
-            &insert
-                .err()
-                .expect("insert served an install nobody promoted")
-        ),
+        status_of(&insert.expect_err("insert served an install nobody promoted")),
         Status::Denied
     );
     let query = f
@@ -614,11 +609,7 @@ async fn storage_refuses_an_inactive_install() {
         ))
         .await;
     assert_eq!(
-        status_of(
-            &query
-                .err()
-                .expect("query served an install nobody promoted")
-        ),
+        status_of(&query.expect_err("query served an install nobody promoted")),
         Status::Denied
     );
     f.cleanup().await;
@@ -759,8 +750,7 @@ async fn a_document_cannot_name_a_blob_its_principal_does_not_hold() {
             serde_json::json!({"collection": c, "doc": {"stolen": bobs_secret}}),
         ))
         .await
-        .err()
-        .expect("a document named somebody else's blob and the host wrote a reference for it");
+        .expect_err("a document named somebody else's blob and the host wrote a reference for it");
     assert_eq!(status_of(&err), Status::NotFound);
 
     // A hash for bytes that exist nowhere must be INDISTINGUISHABLE, down to
@@ -778,8 +768,7 @@ async fn a_document_cannot_name_a_blob_its_principal_does_not_hold() {
             serde_json::json!({"collection": c, "doc": {"guess": absent}}),
         ))
         .await
-        .err()
-        .expect("a document named a blob that does not exist and was accepted");
+        .expect_err("a document named a blob that does not exist and was accepted");
     assert_eq!(status_of(&absent_err), status_of(&err));
     assert_eq!(
         absent_err.to_string(),

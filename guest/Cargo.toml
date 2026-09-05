@@ -1,0 +1,22 @@
+# The SDK a WASM guest links against to talk to hive-sandbox.
+#
+# Its own workspace, not a member of the root one: it only builds for
+# wasm32-wasip1 (the imports below are host functions that exist nowhere else),
+# so `cargo build --workspace` on the host must never try to link it. Same
+# reason the Go SDK was its own module.
+[package]
+name = "hive-guest"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+description = "The hive-sandbox guest SDK: the ABI, the capability verbs, and Handle"
+
+[workspace]
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }

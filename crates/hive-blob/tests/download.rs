@@ -74,8 +74,8 @@ async fn fetch_refuses_a_whole_object_answering_a_ranged_request() {
     let err = d
         .fetch(&url, Range::new(0, 2048))
         .await
-        .err()
-        .expect("expected an error");
+        .map(|_| ())
+        .expect_err("expected an error");
     assert!(matches!(err, BlobError::RangeIgnored(_)), "{err}");
     assert!(
         saw_range.load(Ordering::SeqCst),
@@ -177,8 +177,8 @@ async fn refresh_happens_at_most_once() {
     let err = d
         .fetch(&format!("{url}?attempt=0"), Range::FULL)
         .await
-        .err()
-        .expect("expected an error");
+        .map(|_| ())
+        .expect_err("expected an error");
     assert!(matches!(err, BlobError::UrlRejected(_)), "{err}");
     assert_eq!(
         refreshes.load(Ordering::SeqCst),
@@ -213,8 +213,8 @@ async fn refresh_returning_the_same_url_does_not_retry() {
     let err = d
         .fetch(&url, Range::FULL)
         .await
-        .err()
-        .expect("expected an error");
+        .map(|_| ())
+        .expect_err("expected an error");
     assert!(matches!(err, BlobError::UrlRejected(_)), "{err}");
     assert_eq!(
         attempts.load(Ordering::SeqCst),
@@ -257,8 +257,8 @@ async fn fetch_maps_statuses_onto_seam_errors() {
         let err = Downloader::default()
             .fetch(&url, Range::new(10, 10))
             .await
-            .err()
-            .expect("expected an error");
+            .map(|_| ())
+            .expect_err("expected an error");
         assert!(check(&err), "status {status} gave {err}");
     }
 }
@@ -291,8 +291,7 @@ async fn fetch_all_enforces_its_limit() {
     let err = Downloader::default()
         .fetch_all(&url, Hash::default(), 1024)
         .await
-        .err()
-        .expect("expected an error");
+        .expect_err("expected an error");
     assert!(matches!(err, BlobError::TooLarge { .. }), "{err}");
 }
 
@@ -306,8 +305,8 @@ async fn errors_redact_the_query_string() {
     let err = Downloader::default()
         .fetch(&signed, Range::FULL)
         .await
-        .err()
-        .expect("expected an error")
+        .map(|_| ())
+        .expect_err("expected an error")
         .to_string();
     for secret in ["deadbeefsecret", "AKIAEXAMPLE", "X-Amz-Signature"] {
         assert!(!err.contains(secret), "error leaks {secret:?}: {err}");

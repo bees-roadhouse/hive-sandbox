@@ -514,8 +514,7 @@ mod tests {
         let args = podman_run_args(&s, &[]).unwrap();
         let last_home = values_of(&args, "--env")
             .into_iter()
-            .filter(|e| e.starts_with("HOME="))
-            .last();
+            .rfind(|e| e.starts_with("HOME="));
         assert_eq!(last_home, Some("HOME=/home/harness"));
     }
 

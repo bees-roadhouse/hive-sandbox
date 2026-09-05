@@ -3,14 +3,13 @@
 //! Every test gets a private schema on the shared test database and drops it
 //! on the way out, so there is no shared mutable fixture and no ordering
 //! between tests: run one, run them in parallel, run them in any order. The
-//! Go tree's `internal/testdb` does exactly this, and the two must keep
-//! agreeing because they share one database while both trees live.
+//! Go tree's `internal/testdb` did exactly this, and the shape is kept.
 //!
 //! Without `HIVE_SANDBOX_TEST_DATABASE_URL` a test **skips**, out loud: it
 //! prints a `SKIPPED:` line naming itself and returns. Rust has no native
 //! skip, and a silent early return is the "test that never executes" shape the
-//! Go tree's conventions warn about. The gate script greps for those lines and
-//! refuses to run without the variable at all, exactly as the Go gate does.
+//! conventions warn about. The gate script greps for those lines and refuses
+//! to run without the variable at all.
 
 use std::str::FromStr;
 

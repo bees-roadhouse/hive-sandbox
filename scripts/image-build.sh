@@ -38,13 +38,13 @@ if [ -z "$digest" ]; then
 fi
 
 # The version the binary reports, read back out of the image rather than echoed
-# from the variable above. -ldflags silently does nothing if the symbol path is
-# wrong, and an image that reports "dev" while the lockfile claims a tag is the
+# from the variable above. HIVE_SANDBOX_VERSION reaches the binary only through the build stage. An image that reports
+# "dev" while the lockfile claims a tag is the
 # kind of thing that is discovered during an incident.
-reported=$(podman run --rm "$tag" -version 2>/dev/null | tr -d '\r\n')
+reported=$(podman run --rm "$tag" --version 2>/dev/null | sed "s/^hive-sandbox //" | tr -d "\r\n")
 if [ "$reported" != "$version" ]; then
   echo "the image reports version '$reported' but was built as '$version'" >&2
-  echo "that means -ldflags did not reach main.version; the pin would be a lie." >&2
+  echo "that means HIVE_SANDBOX_VERSION did not reach the build; the pin would be a lie." >&2
   exit 1
 fi
 

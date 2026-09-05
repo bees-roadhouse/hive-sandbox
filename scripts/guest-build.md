@@ -1,103 +1,86 @@
 # The guest build template
 
-Every flag in `build-guests.sh` / `build-guests.ps1` is load-bearing. This is why.
+A guest is a Rust `cdylib` for `wasm32-wasip1`, built by `scripts/build-guests.sh`
+(or `.ps1`) with the profile in the app's `Cargo.toml`. Every setting is
+load-bearing. This is why.
 
+```toml
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
 ```
-tinygo build -target=wasip1 -buildmode=c-shared -scheduler=none -o app.wasm ./
-```
 
-## `-target=wasip1`
+## `wasm32-wasip1`
 
-WASI preview1, and it does not change. wazero has no component-model support
-and the two upstream issues tracking it are not close (D0, Andi finding 6). A
-guest that imports wasip2 or a component-model interface will not load: the host
-rejects unknown import modules at link time in `checkModule`, so this is
-enforced rather than merely documented.
+WASI preview 1, and it does not change. A guest that imports wasip2 or a
+component-model interface will not load: the host rejects unknown import
+modules at link time in `check_module`, so this is enforced rather than merely
+documented. The host also allows only a short list of WASI functions
+(`hive_wasmhost::ALLOWED_WASI`): clocks, randomness, stdout and stderr, the
+process-shape calls a runtime makes at startup. No filesystem, no sockets, no
+`poll_oneoff`. A guest that reaches for `std::fs` or `std::thread::sleep`
+fails at link time rather than at run time.
 
-## `-buildmode=c-shared`
+## `cdylib`, which is a reactor
 
-Produces a **reactor**: the module exports `_initialize` instead of `_start`,
-and the host instantiates it with `WithStartFunctions("_initialize")`. A guest
-that exports `_start` is a command that runs once and exits, which is the wrong
-shape for an app.
+A reactor exports `_initialize` instead of `_start`; the host calls it once
+after instantiation and then individual exports. A crate that exports `_start`
+is a command that runs once and exits, which is the wrong shape for an app, and
+`crates/hive-registry` refuses a module without `_initialize` at install time.
 
-## `-scheduler=none`
+rustc links a `wasm32-wasip1` cdylib with `--no-entry` and no reactor crt, so
+nothing exports `_initialize` on its own. **The SDK exports it**: linking
+`hive-guest` gives the module its `_initialize`, an empty one, because Rust's
+std on wasi initialises lazily and a guest holds no state to set up. A guest
+that does not link the SDK has to export it itself.
 
-**This flag is worth 24x on a call.** Measured on the reference guest:
+Export one function per manifest function, signature `extern "C" fn() -> i32`,
+body wrapped in `hive_guest::handle`.
 
-| call | default scheduler | `-scheduler=none` |
-|---|---|---|
-| `noop` | 80.8 us | 3.3 us |
-| `hello` (JSON in and out) | 110.0 us | 11.3 us |
+## `panic = "abort"`
 
-TinyGo's default scheduler for wasip1 is asyncify-based, and asyncify
-instruments functions with save-and-restore state machinery so a coroutine can
-unwind. Guests never need it: a guest is a pure request-and-response function
-that holds no sockets, no files and no ambient state (invariant 5), so it has
-nothing to suspend.
+A panic becomes a trap. The message still reaches stderr, which the host routes
+into the daemon log with app attribution, before the trap fires. Unwinding
+needs a runtime a guest has no use for, and the host treats a trap and a
+guest-reported error the same way: the call fails, the instance is discarded.
 
-The flag is also an enforcement point. With `-scheduler=none`, a guest that
-starts a goroutine fails to compile. Invariant 5 stops being a convention.
+## `opt-level = "z"`, `lto`, one codegen unit
 
-## No `-opt` flag: TinyGo's `-opt=z` default wins outright
-
-The obvious move is to trade size for speed. Measured, it is not a trade at all:
-`-opt=z` is smallest AND fastest here, so there is nothing to buy.
-
-| `-opt` | module size | `hello` call | 1M-iteration loop | wazero compile |
-|---|---|---|---|---|
-| `z` (default) | 930 KB | 9.8 us | 1.207 ms | 47 ms |
-| `s` | 1033 KB | 14.8 us | 1.204 ms | 53 ms |
-| `1` | 1387 KB | 12.6 us | 1.202 ms | 80 ms |
-| `2` | 1360 KB | 12.4 us | 1.191 ms | 77 ms |
-
-Compute is a wash to within 1.5%, because wazero recompiles the wasm anyway and
-its own optimizer does the work that matters. The higher levels inline more,
-which makes the module bigger, which makes wazero's compile slower and hurts
-short calls. Size and speed point the same way, so leave it alone.
-
-## What is deliberately NOT here
-
-- **`-panic=trap`.** It saves nothing measurable and throws away the panic
-  message. Guest stderr is routed into the daemon log with app attribution, and
-  for AI-written code that message is the whole debugging story.
-- **`-gc=leaking`.** Instances are pooled and reused across calls, so a guest
-  that never frees would grow until it hit its memory ceiling. Only correct for
-  one-shot commands.
+Size first. The module is compiled by wasmtime anyway and its own optimizer
+does the work that matters, so a bigger module buys little speed and costs
+compile time on the first call. The reference guest is about 90 KB with
+serde_json in it, against 930 KB for the TinyGo build it replaced.
 
 ## Inside a guest
 
-- **`encoding/json` works.** TinyGo's `reflect` is famously incomplete, and the
-  standing advice is to avoid reflect-based JSON in guests. On TinyGo 0.41.1 it
-  round-trips structs with string, integer and boolean fields correctly, which
-  the host conformance tests exercise on every run. It is not free: it is most
-  of why the reference guest is 930 KB rather than something much smaller.
-  Verify before trusting it on a nested or interface-typed shape.
-- **Export with `//go:wasmexport`**, one export per manifest function, signature
-  `func() int32`.
-- **`//go:wasmimport` functions cannot be used as values.** That is why the SDK
-  spells out every capability verb instead of routing them through one helper.
-  It is the better shape anyway: the linker drops the import for every verb the
-  app does not call, so a guest links exactly the capabilities it uses.
-- **Check what `Output` returns.** A result over the host's size limit is
+- **serde_json works** and is the expected way to read the input and write the
+  output.
+- **Check what `output` returns.** A result over the host's size limit is
   refused, and a guest that returns success anyway turns it into a silent empty
-  response. `guest.Handle` does this for you.
+  response. `hive_guest::handle` does this for you.
 - **Trust is not yours to set.** Every capability response is a
-  `guest.Response{Trust, Data}`, and the host tracks the invocation's taint
-  independently: read anything untrusted and everything you write afterwards is
-  recorded untrusted, whatever you claim. `guest.InputTrust()` exists so an app
-  can refuse before putting text into instruction position, not so it can
-  argue. Raising trust needs the `sanitize` capability, a grant, and an audit
-  row.
-- **No `time.Sleep`, and it will not compile past the host's link check.**
-  `poll_oneoff` is not on the WASI allowlist because nothing in the host can
-  interrupt it. A guest that needs to wait is a workflow step that needs a
-  timer.
+  `hive_guest::Response { trust, data }`, and the host tracks the invocation's
+  taint independently: read anything untrusted and everything you write
+  afterwards is recorded untrusted, whatever you claim. `input_trust_level`
+  exists so an app can refuse before putting text into instruction position,
+  not so it can argue. Raising trust needs the `sanitize` capability, a grant,
+  and an audit row.
+- **Allocation failure is a guest failure.** `memory.grow` returning -1 is an
+  allocation error inside the guest; use `try_reserve` where running out is a
+  real possibility so it is reported rather than aborted on.
+- **`unsafe` is allowed here and only here.** The SDK calls the host's imports,
+  which are `extern "C"`; the host workspace forbids `unsafe` entirely, and the
+  guest crates are separate workspaces for exactly that reason.
 
-## Toolchain
+## The frozen TinyGo fixture
 
-TinyGo shells out to binaryen's `wasm-opt`; the TinyGo release archive does not
-include it. Both must be on PATH.
-
-- TinyGo 0.41.1
-- binaryen 132
+`crates/hive-wasmhost/testdata/hello-tinygo.wasm` is the last TinyGo build of
+the reference guest, kept as an ABI conformance fixture (D31). It is never
+rebuilt; the host suite runs a handful of tests against it so a change that only
+works for guests built the way we build them is caught.

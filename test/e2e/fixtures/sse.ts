@@ -14,7 +14,7 @@ const OPEN_COUNTER = '__hiveSSEOpenCount';
 /**
  * SSE testing seam.
  *
- * This is why Playwright is the runner here rather than plain Go HTTP tests: a
+ * This is why Playwright is the runner here rather than plain Rust HTTP tests: a
  * browser's EventSource implements the parts of SSE that are easy to get wrong
  * and impossible to test with a hand-rolled reader ... event framing, `retry:`,
  * automatic reconnect, and resuming with `Last-Event-ID`. We drive the real

@@ -1788,11 +1788,13 @@ dependencies = [
  "http-body-util",
  "parking_lot",
  "rand 0.9.5",
+ "reqwest",
  "serde_json",
  "sqlx",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tower",
  "tracing",
  "uuid",
@@ -1802,6 +1804,7 @@ dependencies = [
 name = "hive-chat"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "hive-harness",
  "hive-identity",
@@ -1811,9 +1814,11 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "sqlx",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -1823,6 +1828,7 @@ name = "hive-egress"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "bytes",
  "futures",
  "hickory-resolver",
@@ -1833,6 +1839,7 @@ dependencies = [
  "reqwest",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -1860,7 +1867,6 @@ name = "hive-httpapi"
 version = "0.1.0"
 dependencies = [
  "axum",
- "bytes",
  "chrono",
  "futures",
  "hive-blob",
@@ -1873,9 +1879,7 @@ dependencies = [
  "hive-store",
  "hive-testdb",
  "hive-trust",
- "hive-webui",
  "http 1.5.0",
- "http-body-util",
  "mime",
  "reqwest",
  "serde",
@@ -1883,8 +1887,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.20",
  "tokio",
- "tower",
- "tower-http",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -1953,6 +1956,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -1986,10 +1990,12 @@ dependencies = [
  "humantime",
  "reqwest",
  "serde_json",
+ "socket2 0.6.5",
  "sqlx",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -2094,7 +2100,10 @@ dependencies = [
  "axum",
  "http 1.5.0",
  "mime_guess",
+ "reqwest",
  "rust-embed",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -4329,7 +4338,6 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
  "url",
 ]
 

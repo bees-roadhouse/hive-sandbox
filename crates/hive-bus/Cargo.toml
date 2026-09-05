@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 tokio.workspace = true
 tokio-stream.workspace = true
+tokio-util.workspace = true
 sqlx.workspace = true
 uuid.workspace = true
 chrono.workspace = true
@@ -32,4 +33,5 @@ hive-sse = { path = "../hive-sse" }
 tower.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
+reqwest.workspace = true
 hive-testdb = { path = "../hive-testdb" }

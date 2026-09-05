@@ -8,7 +8,7 @@
 #
 # This is deliberately NOT docker-compose.dev.yml with a daemon bolted on. That
 # file is the database a test suite talks to; it publishes 55432 and exists so
-# `go test` works. Sharing one file would mean a test run and a live stack
+# `cargo test` works. Sharing one file would mean a test run and a live stack
 # fighting over the same container name, which is how you get "the tests
 # passed" against a database the daemon had migrated out from under them.
 name: hive-sandbox

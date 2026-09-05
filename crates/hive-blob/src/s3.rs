@@ -515,7 +515,8 @@ mod tests {
 
     #[test]
     fn config_validation() {
-        let cases: Vec<(&str, Box<dyn Fn(&mut S3Config)>)> = vec![
+        type Mutation = Box<dyn Fn(&mut S3Config)>;
+        let cases: Vec<(&str, Mutation)> = vec![
             ("no endpoint", Box::new(|c| c.endpoint = "  ".into())),
             ("no bucket", Box::new(|c| c.bucket.clear())),
             ("no key id", Box::new(|c| c.access_key_id.clear())),

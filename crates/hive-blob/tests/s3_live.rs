@@ -105,15 +105,14 @@ async fn s3_live_stat_unknown_hash_is_not_found() {
     assert!(
         d.stat(Hash::of(b"never uploaded"))
             .await
-            .err()
-            .expect("expected an error")
+            .expect_err("expected an error")
             .is_not_found()
     );
     assert!(
         d.open(Hash::of(b"never uploaded"), Range::FULL)
             .await
-            .err()
-            .expect("expected an error")
+            .map(|_| ())
+            .expect_err("expected an error")
             .is_not_found()
     );
 }
@@ -156,8 +155,7 @@ async fn s3_live_seal_rejects_a_digest_mismatch() {
         assert!(
             d.stat(h)
                 .await
-                .err()
-                .expect("expected an error")
+                .expect_err("expected an error")
                 .is_not_found(),
             "after a rejected seal, {h} exists"
         );
@@ -192,8 +190,7 @@ async fn s3_live_abort_leaves_nothing() {
     assert!(
         d.stat(Hash::of(content))
             .await
-            .err()
-            .expect("expected an error")
+            .expect_err("expected an error")
             .is_not_found(),
         "an aborted upload left an object"
     );
@@ -369,8 +366,7 @@ async fn s3_live_deliver_rejects_an_unsatisfiable_range() {
             ttl: Duration::ZERO,
         })
         .await
-        .err()
-        .expect("expected an error");
+        .expect_err("expected an error");
     assert!(matches!(err, BlobError::RangeNotSatisfiable(_)), "{err}");
     d.delete(sealed.hash()).await.unwrap();
 }

@@ -14,8 +14,8 @@ INSTALLING: producing a build is unprivileged and the loop may do it all day,
 while making a build live is a distinct act requiring a human principal. Nate is
 the install authority.
 
-So `internal/harness` has no path from a finished run to a running app, and
-`Result` carries no install field. The gap between "registered build" and "live
+So `crates/hive-harness` has no path from a finished run to a running app, and
+`RunResult` carries no install field. The gap between "registered build" and "live
 install" is a normal resting state, not an error. Adding a promotion path here is
 a design change, not a feature.
 
@@ -43,7 +43,7 @@ from the vault as environment, and home is a tmpfs so nothing survives the run.
 ### The pin, and its current limit
 
 `docker/harness/digests.json` records the digest and CLI version per runtime, and
-`ImagePins.Apply` is the only intended way to fill `RunSpec.ImageDigest`. A run
+`ImagePins::apply` is the only intended way to fill `RunSpec::image_digest`. A run
 pins a digest; nothing runs a floating tag.
 
 The lockfile is **gitignored**, because a locally built image has a
@@ -59,8 +59,7 @@ around here.
 ## Isolation defaults
 
 Every one of these is a deny a `RunSpec` cannot widen, asserted in
-`TestPodmanRunArgsIsolatesByDefault` rather than only observed by running a
-container.
+`isolates_by_default` rather than only observed by running a container.
 
 | Flag | Why |
 | --- | --- |
@@ -78,11 +77,11 @@ container.
 
 | Mode | What it does |
 | --- | --- |
-| `NetworkNone` | no interfaces. The default and the zero value. |
-| `NetworkDaemon` | still no interfaces; the daemon's API arrives as a bind-mounted unix socket. |
-| `NetworkProxied` | a per-run internal Podman network shared with an allowlisting egress proxy, with the proxy variables injected. See [`egress.md`](egress.md). |
+| `NetworkMode::None` | no interfaces. The default. |
+| `NetworkMode::Daemon` | still no interfaces; the daemon's API arrives as a bind-mounted unix socket. |
+| `NetworkMode::Proxied` | a per-run internal Podman network shared with an allowlisting egress proxy, with the proxy variables injected. See [`egress.md`](egress.md). |
 
-`NetworkDaemon` uses a socket rather than a bridge because of a measured
+`Daemon` uses a socket rather than a bridge because of a measured
 constraint, not a preference. On rootless Podman 6.0.2, a `--internal` network
 gets an on-link route and **no gateway**, and `--add-host=host-gateway` resolves
 to an address with no route to it:
@@ -97,53 +96,55 @@ ip: RTNETLINK answers: Network unreachable
 So "no network except the daemon's own API" is not reachable with a bridge. A
 unix socket is, and it has less attack surface anyway.
 
-`NetworkProxied` **fails closed**: a spec that asks for it with an empty
-`EgressAllow` is an error rather than a quiet fall back to open egress. The proxy
+`Proxied` **fails closed**: a spec that asks for it with an empty
+`egress_allow` is an error rather than a quiet fall back to open egress. The proxy
 is built ... see [`egress.md`](egress.md) for the allowlist syntax, the two
 controls it applies, and why the proxy needs explicit DNS servers.
 
 ## Using it
 
-```go
-pins, err := harness.LoadPins(harness.DefaultPinsPath)
+```rust
+let pins = ImagePins::load(DEFAULT_PINS_PATH)?;
 
-spec := harness.RunSpec{
-    RunID:        runID,
-    Runtime:      harness.RuntimeClaude,
-    WorkspaceDir: workspace,
-    Limits:       harness.DefaultLimits(),
-    Deadline:     30 * time.Minute,
-    Args:         []string{"-p", prompt, "--output-format", "stream-json"},
-    Env:          map[string]string{"ANTHROPIC_API_KEY": key}, // from the vault
-}
-if err := pins.Apply(&spec); err != nil { return err }
+let mut spec = RunSpec {
+    run_id,
+    runtime: Some(Runtime::Claude),
+    workspace_dir: workspace,
+    limits: Limits::default_limits(),
+    deadline: Duration::from_secs(30 * 60),
+    args: vec!["-p".into(), prompt, "--output-format".into(), "stream-json".into()],
+    env: BTreeMap::from([("ANTHROPIC_API_KEY".into(), key)]), // from the vault
+    ..Default::default()
+};
+pins.apply(&mut spec)?;
 
-sup := &harness.Supervisor{Launcher: &harness.PodmanLauncher{}, Store: store}
-res, err := sup.Run(ctx, spec, func(ctx context.Context, ev harness.Event) error {
-    return bus.Publish(ctx, ev) // D5.3: Nate watches the build live over SSE
-})
+let sup = Supervisor::new(Arc::new(PodmanLauncher::default())).with_store(store);
+let (result, err) = sup
+    .run(spec, Some(Arc::new(|ev| Box::pin(publish(ev)))), cancel.cancelled())
+    .await;
 ```
 
-`Result.State` is one of `succeeded`, `failed`, `deadline_exceeded`, `cancelled`
-or `indeterminate`. `indeterminate` exists for invariant 10: an `agent_run`
+`RunResult::state` is one of `succeeded`, `failed`, `deadline_exceeded`,
+`cancelled` or `indeterminate`. `indeterminate` exists for invariant 10: an `agent_run`
 recovered from a lease reclaim lands there rather than re-firing, because agent
 runs spend money and are at-most-once.
 
 ## The seam for the run record
 
-`RunStore` is what `internal/store` will implement. `MemoryStore` satisfies it
-today, so the wiring is finished and swapping in Postgres is a constructor call
-rather than a refactor.
+`RunStore` is the seam; `hive_store::AgentRunStore` implements it over Postgres
+and `MemoryStore` implements it for tests, so the wiring is one constructor
+call either way.
 
-```go
-type RunStore interface {
-    CreateRun(ctx context.Context, rec RunRecord) error
-    AppendEvent(ctx context.Context, runID string, ev Event) error
-    FinishRun(ctx context.Context, runID string, res Result) error
+```rust
+#[async_trait]
+pub trait RunStore: Send + Sync {
+    async fn create_run(&self, rec: RunRecord) -> Result<(), StoreError>;
+    async fn append_event(&self, run_id: &str, ev: Event) -> Result<(), StoreError>;
+    async fn finish_run(&self, run_id: &str, res: RunResult) -> Result<(), StoreError>;
 }
 ```
 
-`AppendEvent` is on the critical path for a child process's pipe. A slow store
+`append_event` is on the critical path for a child process's pipe. A slow store
 slows the agent; a blocking one hangs it.
 
 ## Why the tests look like that
@@ -154,26 +155,34 @@ noticing a container that died underneath it. So `Launcher` is a seam and the
 tests re-execute the test binary as the child, which means those paths run for
 real instead of being mocked past.
 
-Four failures the tests exist to catch:
+Five failures the tests exist to catch:
 
 - **Pipe deadlock.** A child writing past the 64 KiB kernel buffer on *both*
   streams blocks forever unless they are drained concurrently. If
-  `TestRunDrainsBothStreamsPastThePipeBuffer` hangs rather than fails, that is
-  the bug.
+  `run_drains_both_streams_past_the_pipe_buffer` hangs rather than fails, that
+  is the bug.
 - **A callback that fails stopping the drain.** Delivery stops; reading must not.
   A subscriber going away is no reason to wedge the agent.
-- **`bufio.Scanner` on agent output.** It gives up with `ErrTooLong` past its
-  buffer, which stops the drain. Lines are truncated and flagged instead, and
-  the reader resynchronises on the next newline.
-- **Waiting on a grandchild.** `cmd.StdoutPipe` closes its pipes inside `Wait`,
-  so draining-before-Wait deadlocks when a grandchild inherited the write end.
-  The supervisor owns both ends via `os.Pipe`, waits for the process first, then
-  forces the readers.
+- **A line reader that gives up.** A reader that refuses a line past its buffer
+  stops the drain. Lines are truncated and flagged instead, and the reader
+  resynchronises on the next newline.
+- **Waiting on a grandchild.** A grandchild that inherited the write end keeps
+  the pipe open after the child exits. The supervisor waits for the process,
+  gives the readers a grace period, then aborts them; a reader stuck on the
+  pipe has delivered everything that arrived, so the run is whole.
+- **A callback that parks.** The same grace period, a different verdict: a
+  reader parked downstream in the caller's callback or the store has NOT
+  delivered what came after it, so the run is failed rather than reported as a
+  success nobody received. The drainer counts who is inside delivery at the
+  grace to tell the two apart. The port found the Rust tree conflating them
+  (D31), and the ported test failed before the fix landed.
 
-That last test is Linux-only and skips on Windows: closing an anonymous pipe
-does not unblock a pending read there.
+The tests are a helper binary: with `HARNESS_TEST_HELPER` set, the test
+executable plays the agent CLI (prints a transcript, hangs, floods both pipes,
+spawns a grandchild); without it, it runs the tests. Real pipes, real
+processes, no container.
 
-`TestPodmanRunsThePinnedImage` runs the real image through the real supervisor
+`podman_runs_the_pinned_image` runs the real image through the real supervisor
 and asserts the container reports the pinned CLI version. It skips when podman
 or the image is absent, so the gate still runs on a machine that has never built
 a harness.

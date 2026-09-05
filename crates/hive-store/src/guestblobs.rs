@@ -32,22 +32,12 @@ pub struct GuestBlobs {
     max_append: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(default)]
 struct ReadRequest {
     blob: String,
     offset: i64,
     length: i64,
-}
-
-impl Default for ReadRequest {
-    fn default() -> Self {
-        ReadRequest {
-            blob: String::new(),
-            offset: 0,
-            length: 0,
-        }
-    }
 }
 
 #[derive(Serialize)]

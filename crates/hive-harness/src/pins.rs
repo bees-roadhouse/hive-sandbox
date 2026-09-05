@@ -73,9 +73,7 @@ impl ImagePins {
     /// only intended way to populate `image_digest`, so a caller cannot
     /// casually run something unpinned.
     pub fn apply(&self, spec: &mut RunSpec) -> Result<(), PinError> {
-        let runtime = spec
-            .runtime
-            .ok_or_else(|| PinError::NoRuntime(Runtime::Claude))?;
+        let runtime = spec.runtime.ok_or(PinError::NoRuntime(Runtime::Claude))?;
         let pin = self
             .runtimes
             .get(&runtime)

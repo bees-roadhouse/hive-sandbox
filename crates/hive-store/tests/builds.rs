@@ -705,8 +705,7 @@ async fn derived_index_name_is_refused_rather_than_truncated() {
     let mut tx = w.store.begin().await.unwrap();
     let err = apply_schema_plan(&mut tx, &plan)
         .await
-        .err()
-        .expect("a truncating name was accepted");
+        .expect_err("a truncating name was accepted");
     assert!(matches!(err, StoreError::UnsafeIdentifier(_)), "{err}");
     tx.rollback().await.unwrap();
 }
@@ -826,8 +825,7 @@ async fn vector_index_is_refused_rather_than_skipped() {
     let mut tx = w.store.begin().await.unwrap();
     let err = apply_schema_plan(&mut tx, &plan)
         .await
-        .err()
-        .expect("a vector index was silently accepted");
+        .expect_err("a vector index was silently accepted");
     assert!(matches!(err, StoreError::NotImplemented(_)), "{err}");
     assert!(
         err.to_string().contains("vector"),
@@ -905,8 +903,7 @@ async fn index_expression_cannot_be_escaped() {
     let mut tx = w.store.begin().await.unwrap();
     let err = apply_schema_plan(&mut tx, &plan)
         .await
-        .err()
-        .expect("an escaping path was accepted");
+        .expect_err("an escaping path was accepted");
     assert!(matches!(err, StoreError::UnsafeIdentifier(_)), "{err}");
     tx.rollback().await.unwrap();
 }

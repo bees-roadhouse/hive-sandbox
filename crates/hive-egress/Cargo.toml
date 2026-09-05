@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 tokio.workspace = true
+tokio-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
@@ -24,3 +25,4 @@ futures.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true
+axum.workspace = true

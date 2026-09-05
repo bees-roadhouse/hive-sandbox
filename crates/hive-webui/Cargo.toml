@@ -14,3 +14,8 @@ axum.workspace = true
 http.workspace = true
 mime_guess.workspace = true
 rust-embed.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+reqwest.workspace = true
+tokio-util.workspace = true

@@ -17,3 +17,6 @@ sha2.workspace = true
 hex.workspace = true
 hive-manifest = { path = "../hive-manifest" }
 hive-wasmhost = { path = "../hive-wasmhost" }
+
+[dev-dependencies]
+tokio.workspace = true

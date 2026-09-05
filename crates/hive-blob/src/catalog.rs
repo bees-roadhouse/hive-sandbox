@@ -364,7 +364,7 @@ impl Catalog {
             )));
         }
 
-        let r = insert_ref(&mut **tx, h, spec, spec.trust).await?;
+        let r = insert_ref(tx, h, spec, spec.trust).await?;
         Ok((
             Descriptor {
                 hash: h,
@@ -415,8 +415,8 @@ impl Catalog {
         if h.is_zero() {
             return Err(BlobError::MalformedHash("zero hash".into()));
         }
-        require_referenceable(&mut **tx, h).await?;
-        insert_ref(&mut **tx, h, spec, spec.trust).await
+        require_referenceable(tx, h).await?;
+        insert_ref(tx, h, spec, spec.trust).await
     }
 
     /// References bytes the caller already holds, under a new producer.
@@ -449,9 +449,9 @@ impl Catalog {
             ));
         }
         let (_, held) = resolve_with(&mut **tx, cred, h).await?;
-        require_referenceable(&mut **tx, h).await?;
+        require_referenceable(tx, h).await?;
         // Weakest of what they asked for and what they already have.
-        insert_ref(&mut **tx, h, spec, Level::weaker(spec.trust, held)).await
+        insert_ref(tx, h, spec, Level::weaker(spec.trust, held)).await
     }
 
     /// Answers "may this caller read these bytes, and how far may they be

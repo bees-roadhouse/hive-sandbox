@@ -309,6 +309,7 @@ impl Supervisor {
             let d = drainer.clone();
             async move { d.consume(stderr, EventStream::Stderr).await }
         });
+        let (out_task, err_task) = (Shared::new(out_task), Shared::new(err_task));
 
         // The run's own wall clock (D12.6). Enforced here rather than trusted
         // to the CLI, which has every incentive to keep going.
@@ -340,13 +341,34 @@ impl Supervisor {
         // crate exists to reclaim. A reader parked in the caller's callback
         // stays parked; that is a real cost and a smaller one than an
         // unkillable agent run.
+        //
+        // Two different stalls look the same from here and mean different
+        // things. A reader parked in `read` on a pipe a grandchild still holds
+        // has delivered everything that arrived; closing the pipe (which is
+        // what aborting the task does) frees it and the run is whole. A reader
+        // parked DOWNSTREAM, in the caller's callback or the store, has not:
+        // the events after it were never delivered, and the run must not be
+        // reported as a success nobody received. The Go tree told them apart
+        // by closing the read ends and waiting a second grace for the drain to
+        // finish; here the drainer counts who is inside delivery.
         let drained = async {
-            let _ = out_task.await;
-            let _ = err_task.await;
+            out_task.wait().await;
+            err_task.wait().await;
         };
-        let drain_stuck = tokio::time::timeout(self.cfg.drain_grace * 2, drained)
-            .await
-            .is_err();
+        let drain_stuck = match tokio::time::timeout(self.cfg.drain_grace, drained).await {
+            Ok(()) => false,
+            Err(_) => {
+                let downstream = drainer.delivering() > 0;
+                out_task.abort();
+                err_task.abort();
+                let _ = tokio::time::timeout(self.cfg.drain_grace, async {
+                    out_task.wait().await;
+                    err_task.wait().await;
+                })
+                .await;
+                downstream
+            }
+        };
 
         result.ended_at = Utc::now();
         result.event_count = drainer.count();
@@ -417,6 +439,55 @@ impl Supervisor {
     }
 }
 
+/// A join handle that can be awaited more than once and aborted from beside
+/// the await, which `JoinHandle` alone cannot be.
+struct Shared {
+    handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    done: tokio::sync::Notify,
+    finished: std::sync::atomic::AtomicBool,
+}
+
+impl Shared {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Shared {
+        Shared {
+            handle: Mutex::new(Some(handle)),
+            done: tokio::sync::Notify::new(),
+            finished: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn abort(&self) {
+        if let Some(h) = self.handle.lock().as_ref() {
+            h.abort();
+        }
+    }
+
+    /// Resolves when the task has finished, however it finished.
+    async fn wait(&self) {
+        if self.finished.load(Ordering::SeqCst) {
+            return;
+        }
+        let taken = self.handle.lock().take();
+        match taken {
+            Some(h) => {
+                let _ = h.await;
+                self.finished.store(true, Ordering::SeqCst);
+                self.done.notify_waiters();
+            }
+            None => {
+                // Somebody else holds the handle; wait for their notification.
+                // Checked again after registering so a finish between the
+                // load above and here is not missed.
+                let notified = self.done.notified();
+                if self.finished.load(Ordering::SeqCst) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+    }
+}
+
 /// Maps how the process ended onto the vocabulary the rest of the platform
 /// reasons about.
 ///
@@ -463,6 +534,10 @@ struct Drainer {
     deliver: AsyncMutex<()>,
     seq: AtomicI32,
     state: Mutex<DrainState>,
+    /// How many reader tasks are inside delivery right now: waiting for the
+    /// lock, in the store, or in the caller's callback. Read at the drain
+    /// grace to tell a reader stuck on a pipe from one parked downstream.
+    delivering: AtomicI32,
 }
 
 #[derive(Default)]
@@ -487,7 +562,12 @@ impl Drainer {
             deliver: AsyncMutex::new(()),
             seq: AtomicI32::new(0),
             state: Mutex::new(DrainState::default()),
+            delivering: AtomicI32::new(0),
         }
+    }
+
+    fn delivering(&self) -> i32 {
+        self.delivering.load(Ordering::SeqCst)
     }
 
     async fn consume<R: tokio::io::AsyncRead + Unpin>(&self, r: R, stream: EventStream) {
@@ -546,6 +626,16 @@ impl Drainer {
     }
 
     async fn emit(&self, stream: EventStream, line: String, truncated: bool) {
+        // Counted in and out even when the future is dropped mid-delivery,
+        // which is exactly what an abort at the drain grace does.
+        struct Delivering<'a>(&'a AtomicI32);
+        impl Drop for Delivering<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        self.delivering.fetch_add(1, Ordering::SeqCst);
+        let _counted = Delivering(&self.delivering);
         // Ordering first, so seq and delivery agree.
         let _guard = self.deliver.lock().await;
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;

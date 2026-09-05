@@ -25,3 +25,7 @@ hive-trust = { path = "../hive-trust" }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[test]]
+name = "supervisor"
+harness = false

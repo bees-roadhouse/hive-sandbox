@@ -1,5 +1,5 @@
-# Go toolchain telemetry dropped at the repo root when a container runs go
-# with the checkout as its working directory. Never source code.
+# Toolchain state dropped at the repo root when a container runs with the
+# checkout as its working directory. Never source code.
 .config/
 .cache/
 /bin/
@@ -7,11 +7,11 @@
 *.exe
 *.wasm
 
-# ...except the built first-party guests, which are checked in so `go test ./...`
-# works without a wasm toolchain. CI rebuilds them from source in the `guests`
-# job and runs the same tests against the fresh bytes, which is what keeps the
-# committed artifact honest.
-!internal/wasmhost/testdata/*.wasm
+# ...except the built first-party guests, which are checked in so `cargo test`
+# works without the wasm target installed. CI rebuilds them from source in the
+# `guests` job and runs the same tests against the fresh bytes, which is what
+# keeps the committed artifact honest.
+!crates/hive-wasmhost/testdata/*.wasm
 
 # local dev state
 .env
@@ -19,16 +19,18 @@
 /tmp/
 /testdata/local/
 
-# Cargo's build output for the Rust tree.
+# Cargo's build output for the Rust tree, and for the guest workspaces.
 /target/
+/guest/target/
+/apps/*/target/
 
-# gate-container.sh's build and module caches, mounted into the container from
-# here so they survive between runs. Never source code.
-.gocache/
+# The browser client's build is committed (web/dist, embedded by
+# crates/hive-webui); its dependencies are not.
+/web/node_modules/
 
-# Build outputs of scripts/build-desktop.sh.
-/desktop/bin/
-/desktop/dist/
+# gate-container.sh's cargo caches, mounted into the container from here so
+# they survive between runs. Never source code.
+.cargo-cache/
 
 # node, for the Playwright-driven integration tests only
 node_modules/

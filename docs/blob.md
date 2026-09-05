@@ -148,15 +148,15 @@ question about refs.
 **`Publish` takes a `pgx.Tx`, not a `DB`.** "No blob exists without a ref" is
 only true if the row and the reference cannot be written separately, and a
 signature accepting a pool would let a caller separate them by accident. The
-type is the enforcement, and `TestNoLiveBlobWithoutARef` proves the rollback.
+type is the enforcement, and `no_live_blob_without_a_ref` proves the rollback.
 
 **`Resolve` looks through the caller's own references and never at the global
-hash space.** A caller holding a hash it has no reference to gets `ErrNotFound`
+hash space.** A caller holding a hash it has no reference to gets `NotFound`
 — the same error as a hash that was never stored. That is what makes absence
 beat denial: no oracle, no timing difference, no policy to get wrong. It is also
 the property that lets the physical key stay owner-free.
 
-**Trust rides the reference** (`internal/trust`), not the bytes. An upload and a
+**Trust rides the reference** (`crates/hive-trust`), not the bytes. An upload and a
 fetched page with identical bytes are one `blobs` row and two references that
 honestly disagree, and re-referencing can only move trust downward — otherwise
 global dedup would launder web content into trusted.
@@ -164,8 +164,8 @@ global dedup would launder web content into trusted.
 **Whatever produced a blob writes its ref, host-internal producers included.**
 `SourceKind` lists every one: modules, guest source, transcripts, spools,
 screenshots, step outputs, harness diffs. A sweeper that does not know about a
-producer deletes that producer's output, so the schema CHECK and the Go type are
-two halves of one rule.
+producer deletes that producer's output, so the schema CHECK and the Rust enum
+are two halves of one rule.
 
 ### Collection
 

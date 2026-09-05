@@ -289,8 +289,7 @@ async fn conversations_list_goes_through_the_predicate() {
     let err = chat
         .conversation(&other, second.id)
         .await
-        .err()
-        .expect("grantee read an ungranted thread");
+        .expect_err("grantee read an ungranted thread");
     assert!(denied(&err), "{err}");
 }
 
@@ -322,15 +321,13 @@ async fn archived_conversation_reads_as_denied() {
         &chat
             .conversation(&owner, conv.id)
             .await
-            .err()
-            .expect("archived read")
+            .expect_err("archived read")
     ));
     assert!(denied(
         &chat
             .conversation(&owner, Uuid::new_v4())
             .await
-            .err()
-            .expect("unknown id")
+            .expect_err("unknown id")
     ));
 }
 
@@ -446,8 +443,7 @@ async fn open_turns_track_the_claim() {
     let err = chat
         .open_turns(&cred(other_id, PrincipalKind::User, other_id), conv.id)
         .await
-        .err()
-        .expect("stranger read open turns");
+        .expect_err("stranger read open turns");
     assert!(denied(&err));
 }
 
@@ -599,7 +595,6 @@ async fn turn_events_replay_across_turns() {
             0,
         )
         .await
-        .err()
-        .expect("stranger replayed");
+        .expect_err("stranger replayed");
     assert!(denied(&err));
 }

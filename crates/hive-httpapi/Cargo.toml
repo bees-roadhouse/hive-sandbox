@@ -10,21 +10,19 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
 axum.workspace = true
 http.workspace = true
-tower.workspace = true
-tower-http.workspace = true
-tokio.workspace = true
-sqlx.workspace = true
-uuid.workspace = true
-chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+sqlx.workspace = true
 mime.workspace = true
 futures.workspace = true
-bytes.workspace = true
 hive-identity = { path = "../hive-identity" }
 hive-trust = { path = "../hive-trust" }
 hive-store = { path = "../hive-store" }
@@ -34,10 +32,7 @@ hive-chat = { path = "../hive-chat" }
 hive-harness = { path = "../hive-harness" }
 hive-httpauth = { path = "../hive-httpauth" }
 hive-sse = { path = "../hive-sse" }
-hive-webui = { path = "../hive-webui" }
 
 [dev-dependencies]
-http-body-util.workspace = true
-tower.workspace = true
 reqwest.workspace = true
 hive-testdb = { path = "../hive-testdb" }

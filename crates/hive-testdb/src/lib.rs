@@ -60,8 +60,15 @@ impl TestDb {
         // search_path as a startup parameter, so every pooled connection has
         // it from its first statement. No quoting needed: schema_name emits
         // only [a-z0-9_], and the option value cannot carry spaces.
+        // application_name is the schema, so the drop below can find every
+        // session this test opened without trusting the pool to have closed
+        // them. It cannot be trusted to: a `PoolConnection` is returned by a
+        // task spawned on the test's runtime, and a test that drops its
+        // fixture without another await leaves that task unpolled, holding an
+        // open transaction whose locks a DROP SCHEMA then waits on forever.
         let options = PgConnectOptions::from_str(&url)
             .unwrap_or_else(|e| panic!("parse {URL_ENV}: {e}"))
+            .application_name(&schema)
             .options([("search_path", format!("{schema},{EXTENSION_SCHEMA}"))]);
         let pool = PgPoolOptions::new()
             .max_connections(4)
@@ -89,31 +96,50 @@ impl Drop for TestDb {
     /// panics still gets here, so a failing test leaves no litter behind; a
     /// test killed from outside does, exactly as in the Go tree, and the
     /// leftover reads as `t_<name>_<hex>` in `pg_namespace`.
+    ///
+    /// The pool is deliberately NOT awaited closed first. Its connections are
+    /// terminated server-side by application_name instead, because a
+    /// connection whose return-to-pool task never ran would make `close()`
+    /// wait forever and would hold the locks the drop needs (see `new`).
     fn drop(&mut self) {
         let url = self.url.clone();
         let schema = self.schema.clone();
-        let pool = self.pool.clone();
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("runtime for schema drop");
             rt.block_on(async move {
-                // Close the test's own connections first, so the drop below
-                // never waits on one of them.
-                pool.close().await;
-                match PgConnection::connect(&url).await {
-                    Ok(mut conn) => {
-                        if let Err(e) =
-                            sqlx::query(&format!("drop schema {} cascade", quote_ident(&schema)))
-                                .execute(&mut conn)
-                                .await
-                        {
-                            eprintln!("drop schema {schema}: {e}");
-                        }
+                let mut conn = match PgConnection::connect(&url).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("reconnect to drop schema {schema}: {e}");
+                        return;
                     }
-                    Err(e) => eprintln!("reconnect to drop schema {schema}: {e}"),
+                };
+                if let Err(e) = sqlx::query(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+                      WHERE application_name = $1 AND pid <> pg_backend_pid()",
+                )
+                .bind(&schema)
+                .execute(&mut conn)
+                .await
+                {
+                    eprintln!("terminate sessions of {schema}: {e}");
                 }
+                // Bounded, so a lock the terminate did not clear reads as an
+                // error naming the schema rather than a test that never ends.
+                let _ = sqlx::query("SET lock_timeout = '15s'")
+                    .execute(&mut conn)
+                    .await;
+                if let Err(e) =
+                    sqlx::query(&format!("drop schema {} cascade", quote_ident(&schema)))
+                        .execute(&mut conn)
+                        .await
+                {
+                    eprintln!("drop schema {schema}: {e}");
+                }
+                let _ = conn.close().await;
             });
         });
         let _ = handle.join();

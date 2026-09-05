@@ -1,10 +1,33 @@
-# The Rust daemon, beside the Go tree it replaces (docs/design/D24-rust-rewrite.md).
+# The hive-sandbox daemon, in Rust (docs/design/D24-rust-rewrite.md).
 #
-# At the repo root because that is where the workspace ends up; the Go module
-# ignores it and the Cargo workspace ignores the Go module. The two are compared
-# against the same database and the same guests, never merged.
+# One workspace at the repo root. The guest SDK under guest/ and the apps under
+# apps/*/ are their own workspaces, excluded here for the same reason the Go
+# tree kept them in separate modules: they only build for wasm32-wasip1, and
+# `cargo build --workspace` on the host target must never try to link them.
 [workspace]
-members = ["crates/hive-store", "crates/hive-testdb"]
+members = [
+    "crates/hive-identity",
+    "crates/hive-trust",
+    "crates/hive-testdb",
+    "crates/hive-schema",
+    "crates/hive-store",
+    "crates/hive-blob",
+    "crates/hive-manifest",
+    "crates/hive-wasmhost",
+    "crates/hive-registry",
+    "crates/hive-mcp",
+    "crates/hive-sse",
+    "crates/hive-httpauth",
+    "crates/hive-bus",
+    "crates/hive-harness",
+    "crates/hive-egress",
+    "crates/hive-chat",
+    "crates/hive-webui",
+    "crates/hive-httpapi",
+    "crates/hive-repodocs",
+    "crates/hive-sandbox",
+]
+exclude = ["guest", "apps/hello"]
 resolver = "2"
 
 [workspace.package]
@@ -14,18 +37,53 @@ rust-version = "1.98"
 publish = false
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net", "fs", "signal"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 # Runtime queries, never the compile-time macros: the gate builds on machines
 # with no database in reach. rustls for the reason the Go host had no CGo.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "macros"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# raw_value so a document, an event body and a stream-json line travel as the
+# bytes they arrived as. NOT preserve_order: the surface hash relies on sorted
+# keys, exactly as the Go tree relied on encoding/json sorting them.
+serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
+anyhow = "1"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
+bytes = "1"
+futures = "0.3"
+async-trait = "0.1"
+async-stream = "0.3"
+regex = "1"
+rand = "0.9"
+parking_lot = "0.12"
+tempfile = "3"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "client", "client-legacy", "http1"] }
+axum = { version = "0.8", features = ["macros", "json", "query", "http1", "tokio"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "set-header"] }
+mime = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+clap = { version = "4", features = ["derive", "env"] }
+humantime = "2"
+rust-embed = { version = "8", features = ["include-exclude"] }
+mime_guess = "2"
+wasmtime = { version = "48", default-features = false, features = ["cranelift", "runtime", "async", "std", "parallel-compilation", "cache", "wat"] }
+wasmtime-wasi = { version = "48", default-features = false, features = ["p1"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-credential-types = "1"
+hickory-resolver = { version = "0.25", default-features = false, features = ["tokio"] }
 
 [workspace.lints.rust]
 # The Go host had no CGo anywhere. This is that rule in the new language.

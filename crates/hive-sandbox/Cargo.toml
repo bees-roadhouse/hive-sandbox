@@ -1,0 +1,45 @@
+[package]
+name = "hive-sandbox"
+description = "The platform daemon: one process serves every role"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio.workspace = true
+axum.workspace = true
+http.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+humantime.workspace = true
+futures.workspace = true
+hive-identity = { path = "../hive-identity" }
+hive-trust = { path = "../hive-trust" }
+hive-store = { path = "../hive-store" }
+hive-blob = { path = "../hive-blob" }
+hive-bus = { path = "../hive-bus" }
+hive-chat = { path = "../hive-chat" }
+hive-harness = { path = "../hive-harness" }
+hive-egress = { path = "../hive-egress" }
+hive-httpapi = { path = "../hive-httpapi" }
+hive-wasmhost = { path = "../hive-wasmhost" }
+hive-webui = { path = "../hive-webui" }
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest.workspace = true
+hive-testdb = { path = "../hive-testdb" }
+
+[[bin]]
+name = "hive-sandbox"
+path = "src/main.rs"

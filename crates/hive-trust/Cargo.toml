@@ -1,0 +1,13 @@
+[package]
+name = "hive-trust"
+description = "Provenance carried across every layer that touches content: trusted or untrusted, and the one direction it moves"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true

@@ -575,7 +575,7 @@ async fn migrate_is_idempotent_and_records_checksums() {
             .expect("read schema_migrations");
     assert_eq!(rows.len(), 3);
     for (version, _, checksum) in &rows {
-        let m = hive_store::migrate::MIGRATIONS
+        let m = hive_store::MIGRATIONS
             .iter()
             .find(|m| m.version == version)
             .expect("known version");

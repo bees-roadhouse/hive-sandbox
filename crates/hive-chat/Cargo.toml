@@ -1,0 +1,28 @@
+[package]
+name = "hive-chat"
+description = "A message becomes one hosted agent run: the turn worker, its heartbeat, the reclaimers, and the in-process hub"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+hive-identity = { path = "../hive-identity" }
+hive-trust = { path = "../hive-trust" }
+hive-store = { path = "../hive-store" }
+hive-harness = { path = "../hive-harness" }
+
+[dev-dependencies]
+tempfile.workspace = true
+hive-testdb = { path = "../hive-testdb" }

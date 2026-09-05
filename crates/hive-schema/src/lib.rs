@@ -85,6 +85,11 @@ pub enum MigrateError {
 /// Applies every embedded migration that has not been applied yet and returns
 /// the versions it applied. Safe to call concurrently from any number of
 /// processes.
+///
+/// Await it on the calling task rather than spawning it. rustc cannot prove
+/// this future `Send` (rust-lang/rust#100013, the higher-ranked reborrows in
+/// sqlx's `Executor` impls), and the daemon migrates at boot before it spawns
+/// anything, so nothing needs it to be.
 pub async fn migrate(pool: &PgPool) -> Result<Vec<String>, MigrateError> {
     // The advisory lock is session-scoped, so it has to live on one
     // connection for the whole run rather than on whatever the pool hands

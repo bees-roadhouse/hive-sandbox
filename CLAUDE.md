@@ -209,9 +209,9 @@ guidance, never fewer.
 ## Layout
 
 ```
-Cargo.toml             the workspace: crates/*, unsafe forbidden at the workspace, toolchain
-                       pinned in rust-toolchain.toml. guest/ and apps/* are excluded: they
-                       only build for wasm32-wasip1
+Cargo.toml             the host workspace: crates/*, unsafe forbidden at the workspace, toolchain
+                       pinned in rust-toolchain.toml. guest/ and apps/* are excluded: they are
+                       the guest workspace and only build for wasm32-wasip1
 crates/hive-sandbox/   the daemon binary. Roles are flags, one process serves all of them (D7):
                        --serve-api, --run-workflows, --run-chat, --run-egress-proxy. Every role
                        defaults on except the proxy, so a single-role image turns the others off
@@ -249,8 +249,10 @@ crates/hive-trust/     provenance carried across every layer (invariants 3 and 1
 crates/hive-testdb/    schema-per-test Postgres for the integration tests
 crates/hive-repodocs/  no code. The gate's assertions about this repo's own documentation
 web/                   the browser client: Solid.js + Vite, built into web/dist (committed)
-guest/                 the SDK a WASM guest links against (own workspace, wasm32-wasip1 only)
-apps/                  first-party guest apps. apps/hello is the reference one
+guest/                 the SDK a WASM guest links against, and the root of the guest workspace
+                       (wasm32-wasip1 only; the release profile every guest builds with is here)
+apps/                  first-party guest apps, members of the guest workspace. apps/hello is
+                       the reference one
 docs/                  per-topic docs (development.md installs the toolchain from nothing);
                        docs/design/ holds the decision snapshots, D24 onward
 test/e2e/              Playwright end-to-end tests that drive a real daemon over HTTP
@@ -271,8 +273,14 @@ and has tests.
   `axum` 0.8; `wasmtime`, WASI preview 1 only; `tokio`. The reason behind
   each pick is in D24 and outlives the pick.
 - **`unsafe` is allowed in `guest/` and `apps/*` and nowhere else.** The SDK
-  calls the host's imports, which are `extern "C"`. That is why the guest crates
-  are separate workspaces rather than members with an allow attribute.
+  calls the host's imports, which are `extern "C"`. That is why the guests are
+  their own workspace rather than members with an allow attribute. ONE
+  workspace for the SDK and every app, rooted at `guest/`: cargo hashes a path
+  dependency's location into every symbol name unless it sits inside the
+  workspace root, and a symbol name that depends on where the checkout lives
+  makes the committed `.wasm` differ between machines (CI caught a one-byte
+  drift that reordered the type section). `scripts/build-guests.sh` also sets
+  `RUSTFLAGS` exactly rather than inheriting them, for the same reason.
 - Guests target **WASI preview1 only**. Never import wasip2 or component-model.
   The host enforces this at link time in `check_module`, and allows only the
   WASI functions in `ALLOWED_WASI`, so it is not a convention you can drift

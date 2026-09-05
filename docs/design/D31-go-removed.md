@@ -107,10 +107,17 @@ Porting tests before behaviour is supposed to find things, and it did:
 
 Three things the local gate cannot see, each fixed against the failing job:
 
-- **The committed guest was not reproducible.** rustc embeds the cargo
-  registry path in panic locations, so the `guests` job's rebuild differed
-  from the bytes built here. `build-guests.sh` now remaps the registry and the
-  checkout to fixed names (`--remap-path-prefix`), and the rebuild matches.
+- **The committed guest was not reproducible**, for three stacked reasons,
+  each found by the `guests` job after the previous one was fixed. rustc
+  embeds the cargo registry path in panic locations (`build-guests.sh` remaps
+  the registry and the checkout to fixed names). A `1.98` toolchain pin floats
+  across patch releases and 1.98.0 and 1.98.1 compile different bytes (the pin
+  is `1.98.1` now, on both sides). And cargo mixes a path dependency's absolute
+  location and the ambient `RUSTFLAGS` into every symbol hash, so the SDK at
+  `../../guest` from the app's own workspace, and a CI runner exporting
+  `-D warnings`, each reordered the type section by one byte: the SDK and the
+  apps are one workspace rooted at `guest/` now, and the build script sets
+  `RUSTFLAGS` exactly. The job prints where the bytes differ when they do.
 - **The S3 driver could not write to Garage.** The AWS SDK's default since
   early 2025 sends every PUT as an aws-chunked body with a CRC trailer, which
   Garage refuses as "Invalid payload signature". The driver now asks for

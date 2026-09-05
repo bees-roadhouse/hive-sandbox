@@ -19,7 +19,7 @@
 /tmp/
 /testdata/local/
 
-# Cargo's build output for the Rust tree, and for the guest workspaces.
+# Cargo's build output for the host workspace and the guest workspace.
 /target/
 /guest/target/
 /apps/*/target/

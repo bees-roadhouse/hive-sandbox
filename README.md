@@ -101,8 +101,9 @@ never sends it back, and the daemon warns about it at every boot.
 
 A guest is a WASI preview1 reactor: a Rust `cdylib` for `wasm32-wasip1` that
 exports one `extern "C" fn() -> i32` per manifest function and moves JSON
-through the `hive_abi` host module. The SDK is `guest/`, the reference app is
-`apps/hello/`, and the contract is documented in `crates/hive-wasmhost`.
+through the `hive_abi` host module. The SDK is `guest/`, which is also the
+root of the guest workspace; the reference app is `apps/hello/`; the contract
+is documented in `crates/hive-wasmhost`.
 
 Built modules are checked in under `crates/hive-wasmhost/testdata/`, so the
 test suite runs without the wasm target installed. Rebuild after changing a

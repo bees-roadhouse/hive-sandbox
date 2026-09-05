@@ -27,12 +27,16 @@ fi
 mkdir -p "$OUT"
 
 # The committed .wasm has to be byte-identical wherever it is built, or the CI
-# job that rebuilds it and diffs the result can never be green. rustc embeds
-# source paths (panic locations name the file), so the two places a path
-# differs between machines are remapped to fixed names: the cargo registry and
-# this checkout. The toolchain hash under /rustc/ is already fixed by the pin.
+# job that rebuilds it and diffs the result can never be green. Three things
+# make it so: the exact toolchain patch in rust-toolchain.toml; one guest
+# workspace, so no symbol name carries this checkout's path; and RUSTFLAGS set
+# HERE rather than inherited, because cargo mixes the flags into every symbol
+# hash and a CI runner that exports `-D warnings` would build different names.
+# The flags remap the two paths rustc embeds (panic locations name the file)
+# to fixed names: the cargo registry and this checkout.
 registry="${CARGO_HOME:-$HOME/.cargo}/registry/src"
-export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${registry}=/cargo/registry/src --remap-path-prefix=$(pwd)=/hive-sandbox"
+export RUSTFLAGS="--remap-path-prefix=${registry}=/cargo/registry/src --remap-path-prefix=$(pwd)=/hive-sandbox"
+unset CARGO_ENCODED_RUSTFLAGS
 
 apps=("$@")
 if [ ${#apps[@]} -eq 0 ]; then
@@ -42,10 +46,10 @@ if [ ${#apps[@]} -eq 0 ]; then
 fi
 
 for name in "${apps[@]}"; do
-  dir="apps/$name"
-  [ -f "$dir/Cargo.toml" ] || { echo "no such app: $dir" >&2; exit 1; }
+  [ -f "apps/$name/Cargo.toml" ] || { echo "no such app: apps/$name" >&2; exit 1; }
   echo "==> $name"
-  (cd "$dir" && cargo build --release --target "$TARGET" --quiet)
-  cp "$dir/target/$TARGET/release/$name.wasm" "$OUT/$name.wasm"
+  # From the guest workspace root, so the build lands in guest/target.
+  (cd guest && cargo build --release --target "$TARGET" -p "$name" --quiet)
+  cp "guest/target/$TARGET/release/$name.wasm" "$OUT/$name.wasm"
   ls -l "$OUT/$name.wasm"
 done

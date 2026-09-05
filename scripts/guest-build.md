@@ -1,7 +1,8 @@
 # The guest build template
 
-A guest is a Rust `cdylib` for `wasm32-wasip1`, built by `scripts/build-guests.sh`
-(or `.ps1`) with the profile in the app's `Cargo.toml`. Every setting is
+A guest is a Rust `cdylib` for `wasm32-wasip1`, a member of the guest workspace
+rooted at `guest/Cargo.toml`, built by `scripts/build-guests.sh` (or `.ps1`)
+with the release profile that workspace root carries. Every setting is
 load-bearing. This is why.
 
 ```toml
@@ -76,7 +77,20 @@ serde_json in it, against 930 KB for the TinyGo build it replaced.
   real possibility so it is reported rather than aborted on.
 - **`unsafe` is allowed here and only here.** The SDK calls the host's imports,
   which are `extern "C"`; the host workspace forbids `unsafe` entirely, and the
-  guest crates are separate workspaces for exactly that reason.
+  guests are their own workspace for exactly that reason.
+
+## Reproducible bytes
+
+The committed `.wasm` is rebuilt by CI and any difference is a red job, so the
+build has to produce identical bytes on every machine. Three things make it
+so, and each was found by CI when it was missing: the exact toolchain patch in
+`rust-toolchain.toml` (1.98.0 and 1.98.1 differ); one guest workspace, because
+cargo hashes a path dependency's absolute location into every symbol name
+unless it sits inside the workspace root; and `RUSTFLAGS` set by the build
+script rather than inherited, because cargo mixes the flags into the same
+hash and a runner that exports `-D warnings` builds different names. The
+flags remap the registry and the checkout so panic locations carry no
+machine-specific path.
 
 ## The frozen TinyGo fixture
 

@@ -17,21 +17,21 @@ if (-not ((rustup target list --installed) -contains $Target)) {
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
 # Byte-identical builds wherever they run: see build-guests.sh for why the
-# registry and the checkout are remapped to fixed names.
+# flags are set here rather than inherited and the two paths remapped.
 $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
 $registry = Join-Path $cargoHome "registry/src"
-$env:RUSTFLAGS = "$($env:RUSTFLAGS) --remap-path-prefix=$registry=/cargo/registry/src --remap-path-prefix=$(Get-Location)=/hive-sandbox".Trim()
+$env:RUSTFLAGS = "--remap-path-prefix=$registry=/cargo/registry/src --remap-path-prefix=$(Get-Location)=/hive-sandbox"
+Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue
 
 $apps = $args
 if (-not $apps) {
     $apps = Get-ChildItem apps -Directory | Where-Object { Test-Path (Join-Path $_.FullName "Cargo.toml") } | ForEach-Object { $_.Name }
 }
 foreach ($name in $apps) {
-    $dir = "apps/$name"
     Write-Host "==> $name"
-    Push-Location $dir
-    try { cargo build --release --target $Target --quiet; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
+    Push-Location guest
+    try { cargo build --release --target $Target -p $name --quiet; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
     finally { Pop-Location }
-    Copy-Item "$dir/target/$Target/release/$name.wasm" "$Out/$name.wasm" -Force
+    Copy-Item "guest/target/$Target/release/$name.wasm" "$Out/$name.wasm" -Force
     Get-Item "$Out/$name.wasm" | Format-Table Name, Length
 }

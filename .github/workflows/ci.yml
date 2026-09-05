@@ -36,10 +36,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # rust-toolchain.toml pins the version; the action installs that one.
+      # rust-toolchain.toml pins the exact version; the action installs that one
+      # (the guests job needs the exact patch, or the committed .wasm differs).
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.98"
+          toolchain: "1.98.1"
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
@@ -93,7 +94,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.98"
+          toolchain: "1.98.1"
 
       - uses: Swatinem/rust-cache@v2
 
@@ -153,7 +154,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.98"
+          toolchain: "1.98.1"
           targets: wasm32-wasip1
           components: clippy, rustfmt
 
@@ -167,11 +168,21 @@ jobs:
       - name: rebuild guests from source
         run: ./scripts/build-guests.sh
 
+      # On a mismatch the step says WHERE the bytes differ, not only that they
+      # do: a one-byte drift between two toolchain patch levels is invisible in
+      # a diff --stat and obvious in a strings diff.
       - name: the committed guest matches its source
         run: |
           if ! git diff --quiet -- crates/hive-wasmhost/testdata; then
             echo "crates/hive-wasmhost/testdata is out of date with apps/; commit the rebuilt files:"
             git --no-pager diff --stat -- crates/hive-wasmhost/testdata
+            for f in $(git diff --name-only -- crates/hive-wasmhost/testdata); do
+              git show "HEAD:$f" > /tmp/committed.wasm
+              echo "== $f: first differing bytes (offset, committed, rebuilt)"
+              cmp -l /tmp/committed.wasm "$f" | head -20 || true
+              echo "== $f: strings that differ (< committed, > rebuilt)"
+              diff <(strings -n 6 /tmp/committed.wasm) <(strings -n 6 "$f") | head -40 || true
+            done
             exit 1
           fi
 
@@ -198,7 +209,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.98"
+          toolchain: "1.98.1"
 
       - uses: Swatinem/rust-cache@v2
 
@@ -260,7 +271,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.98"
+          toolchain: "1.98.1"
 
       - uses: Swatinem/rust-cache@v2
 

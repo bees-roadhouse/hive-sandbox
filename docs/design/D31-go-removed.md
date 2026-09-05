@@ -103,6 +103,28 @@ Porting tests before behaviour is supposed to find things, and it did:
   puts a clean exit first) is unit-tested instead, per the convention about
   arranging conditions.
 
+## What CI found on the first run
+
+Three things the local gate cannot see, each fixed against the failing job:
+
+- **The committed guest was not reproducible.** rustc embeds the cargo
+  registry path in panic locations, so the `guests` job's rebuild differed
+  from the bytes built here. `build-guests.sh` now remaps the registry and the
+  checkout to fixed names (`--remap-path-prefix`), and the rebuild matches.
+- **The S3 driver could not write to Garage.** The AWS SDK's default since
+  early 2025 sends every PUT as an aws-chunked body with a CRC trailer, which
+  Garage refuses as "Invalid payload signature". The driver now asks for
+  checksums only where an operation requires one; the driver hashes the bytes
+  itself and seals on the content address. Reproduced locally against
+  `scripts/garage-up.sh` (whose config mount also needed `:z` on an SELinux
+  host) and fixed there first; all fifteen live tests pass.
+- **The harness never saw the proxy come up.** It waits for the proxy's own
+  log to say `role=egress-proxy`; tracing renders a string field quoted, so
+  the Rust daemon wrote `role="egress-proxy"` and the harness waited out the
+  timeout. The daemon now logs the role unquoted and the harness accepts
+  either spelling. `podman_runs_the_pinned_image` passed on that same run,
+  which is the first time the Rust supervisor ran the real harness image.
+
 ## Left open
 
 - Re-measuring the wasmhost under wasmtime: instance pool sizing, compile

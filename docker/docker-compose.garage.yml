@@ -25,7 +25,10 @@ services:
       # real on this machine.
       - "127.0.0.1:53900:3900"
     volumes:
-      - ./garage/garage.toml:/etc/garage.toml:ro
+      # :z relabels for SELinux, as the stack compose does; without it rootless
+      # Podman on an enforcing host gives the container "Permission denied" on
+      # its own config and Garage exits before it listens.
+      - ./garage/garage.toml:/etc/garage.toml:ro,z
       - meta:/var/lib/garage/meta
       - data:/var/lib/garage/data
     healthcheck:

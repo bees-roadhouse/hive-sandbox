@@ -20,6 +20,14 @@ const PROXY_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// probe into.
 const PROXY_LISTENING_MARKER: &str = "role=egress-proxy";
 
+/// Whether the proxy's log says it is listening. Both spellings, because a
+/// tracing subscriber renders a string field quoted (`role="egress-proxy"`)
+/// unless the writer asks for Display, and a marker that depends on which the
+/// daemon happened to use is a readiness check that silently times out.
+fn proxy_is_listening(log: &str) -> bool {
+    log.contains(PROXY_LISTENING_MARKER) || log.contains("role=\"egress-proxy\"")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EgressLauncherError {
     #[error(
@@ -143,7 +151,7 @@ impl PodmanLauncher {
             {
                 let text = String::from_utf8_lossy(&o.stdout).to_string()
                     + &String::from_utf8_lossy(&o.stderr);
-                if text.contains(PROXY_LISTENING_MARKER) {
+                if proxy_is_listening(&text) {
                     return Ok(());
                 }
             }

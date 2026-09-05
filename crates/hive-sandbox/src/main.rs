@@ -169,6 +169,11 @@ async fn run() -> anyhow::Result<()> {
                 .add_directive(tracing::Level::INFO.into()),
         )
         .with_target(false)
+        // Colour only on a terminal. In a container the log is read by a
+        // program (the harness greps the proxy's log for its readiness line),
+        // and escape codes between `role`, `=` and the value would make that
+        // line unmatchable while looking fine to a person.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
     // The supervisor injects the allowlist as one variable rather than N
@@ -286,7 +291,10 @@ async fn run() -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .with_context(|| format!("egress-proxy: listen on {addr}"))?;
-        tracing::info!(role = "egress-proxy", addr = %addr, "listening");
+        // Display, not Debug: the harness reads `role=egress-proxy` off this
+        // container's log as its readiness signal, and a quoted field is not
+        // that line.
+        tracing::info!(role = %"egress-proxy", addr = %addr, "listening");
         let c = cancel.clone();
         tasks.push(tokio::spawn(async move { proxy.serve(listener, c).await }));
         listeners += 1;
@@ -314,7 +322,7 @@ async fn run() -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .with_context(|| format!("api: listen on {addr}"))?;
-        tracing::info!(role = "api", addr = %addr, "listening");
+        tracing::info!(role = %"api", addr = %addr, "listening");
         {
             let app = app.clone();
             let c = cancel.clone();
@@ -341,7 +349,7 @@ async fn run() -> anyhow::Result<()> {
         if let Some(path) = args.unix_socket.as_deref().filter(|p| !p.is_empty()) {
             let mut sock = unix_listener(path).await?;
             let listener = sock.take().expect("fresh socket");
-            tracing::info!(role = "api-unix", addr = %path, "listening");
+            tracing::info!(role = %"api-unix", addr = %path, "listening");
             let c = cancel.clone();
             let tx = err_tx.clone();
             tasks.push(tokio::spawn(async move {

@@ -16,6 +16,12 @@ if (-not ((rustup target list --installed) -contains $Target)) {
 }
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
+# Byte-identical builds wherever they run: see build-guests.sh for why the
+# registry and the checkout are remapped to fixed names.
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
+$registry = Join-Path $cargoHome "registry/src"
+$env:RUSTFLAGS = "$($env:RUSTFLAGS) --remap-path-prefix=$registry=/cargo/registry/src --remap-path-prefix=$(Get-Location)=/hive-sandbox".Trim()
+
 $apps = $args
 if (-not $apps) {
     $apps = Get-ChildItem apps -Directory | Where-Object { Test-Path (Join-Path $_.FullName "Cargo.toml") } | ForEach-Object { $_.Name }

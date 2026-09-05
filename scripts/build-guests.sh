@@ -26,6 +26,14 @@ fi
 
 mkdir -p "$OUT"
 
+# The committed .wasm has to be byte-identical wherever it is built, or the CI
+# job that rebuilds it and diffs the result can never be green. rustc embeds
+# source paths (panic locations name the file), so the two places a path
+# differs between machines are remapped to fixed names: the cargo registry and
+# this checkout. The toolchain hash under /rustc/ is already fixed by the pin.
+registry="${CARGO_HOME:-$HOME/.cargo}/registry/src"
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${registry}=/cargo/registry/src --remap-path-prefix=$(pwd)=/hive-sandbox"
+
 apps=("$@")
 if [ ${#apps[@]} -eq 0 ]; then
   for dir in apps/*/; do

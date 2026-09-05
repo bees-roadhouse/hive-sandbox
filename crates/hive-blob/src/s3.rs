@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::config::{
+    Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
+};
 use aws_sdk_s3::presigning::PresigningConfig;
 use tokio::io::AsyncWriteExt;
 
@@ -89,6 +91,14 @@ impl S3Driver {
             // addressing would turn the bucket into a DNS label nobody has
             // published.
             .force_path_style(true)
+            // The SDK's default since early 2025 is to send every PUT as an
+            // aws-chunked body with a CRC trailer and to demand a checksum
+            // back. Garage answers "Invalid payload signature" to the first
+            // and the second is a validation nothing here relies on: the
+            // driver hashes the bytes itself and seals on the content
+            // address. Checksums only where the operation requires one.
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
             .build();
         Ok(S3Driver {
             cfg,

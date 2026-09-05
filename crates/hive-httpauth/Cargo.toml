@@ -1,0 +1,21 @@
+[package]
+name = "hive-httpauth"
+description = "Request-to-credential resolution and THE one 401 shape, shared by SSE and REST"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+axum.workspace = true
+http.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+hive-identity = { path = "../hive-identity" }
+hive-store = { path = "../hive-store" }

@@ -1,0 +1,31 @@
+[package]
+name = "hive-harness"
+description = "Hosted agent runs (claude / codex / opencode) under rootless Podman"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+regex.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+hive-identity = { path = "../hive-identity" }
+hive-trust = { path = "../hive-trust" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[test]]
+name = "supervisor"
+harness = false

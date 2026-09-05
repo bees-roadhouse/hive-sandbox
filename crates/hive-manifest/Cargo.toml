@@ -1,0 +1,22 @@
+[package]
+name = "hive-manifest"
+description = "The app declaration and everything derived from it. Pure: it parses, validates and derives, and opens no connections"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+hex.workspace = true

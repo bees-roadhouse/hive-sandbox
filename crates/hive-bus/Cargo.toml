@@ -1,0 +1,37 @@
+[package]
+name = "hive-bus"
+description = "The events table as transport, NOTIFY as wakeup bell, SSE fan-out"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+axum.workspace = true
+http.workspace = true
+rand.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+hive-identity = { path = "../hive-identity" }
+hive-store = { path = "../hive-store" }
+hive-httpauth = { path = "../hive-httpauth" }
+hive-sse = { path = "../hive-sse" }
+
+[dev-dependencies]
+tower.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+reqwest.workspace = true
+hive-testdb = { path = "../hive-testdb" }

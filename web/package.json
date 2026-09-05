@@ -1,0 +1,20 @@
+{
+  "name": "hive-web",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The hive-sandbox browser client: a Solid.js shell over the daemon's HTTP surface, built into web/dist and embedded in the daemon.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "solid-js": "1.9.15"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vite": "8.2.2",
+    "vite-plugin-solid": "2.11.14"
+  }
+}

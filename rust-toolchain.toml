@@ -1,0 +1,8 @@
+# Pinned so CI and every laptop run one
+# version, and a lint that appears in a newer toolchain arrives as a deliberate
+# bump rather than as a red gate on a Tuesday. The PATCH is pinned too: the
+# committed guest .wasm must be byte-identical wherever it is rebuilt, and 1.98.0
+# and 1.98.1 compile the same source to different bytes (CI caught it).
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]

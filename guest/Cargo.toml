@@ -1,0 +1,42 @@
+# The SDK a WASM guest links against to talk to hive-sandbox, and the root of
+# the GUEST workspace: every app under apps/*/ is a member here.
+#
+# Not part of the host workspace: guests only build for wasm32-wasip1 (the
+# imports below are host functions that exist nowhere else), so
+# `cargo build --workspace` at the repo root must never try to link them, and
+# they need `unsafe` for the extern imports where the host forbids it.
+#
+# ONE workspace for the SDK and the apps rather than one each, because cargo
+# hashes a path dependency's location into every symbol name unless the path
+# is inside the workspace root ... and a symbol name that depends on where the
+# checkout lives makes the committed .wasm differ between machines. CI caught
+# the one-byte drift that reordered the type section.
+[package]
+name = "hive-guest"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+description = "The hive-sandbox guest SDK: the ABI, the capability verbs, and Handle"
+
+[workspace]
+members = ["../apps/hello"]
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+
+# Every setting here is load-bearing and applies to every guest in this
+# workspace; scripts/guest-build.md says why.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+# A panic is a trap, and the message still reaches stderr (the daemon log)
+# before the unwind would have started. Unwinding needs a runtime the guest
+# has no use for.
+panic = "abort"
+strip = true

@@ -20,7 +20,7 @@ proxy. Both are created before the agent starts and removed when it ends.
 
 The harness has **no default route**. That is what makes this enforcement rather
 than configuration: an agent that ignores `HTTP_PROXY` does not escape, it
-fails. `TestEgressProxyEnforcesTheAllowlist` asserts exactly that, by trying to
+fails. `egress_proxy_enforces_the_allowlist` asserts exactly that, by trying to
 reach a bare IP with `--noproxy '*'` and requiring it to fail.
 
 The proxy sits on the internal network *and* an uplink, so it is the only thing
@@ -28,17 +28,18 @@ in the run that can reach anything, and it reaches only what the run allowlisted
 
 ## Using it
 
-```go
-spec := harness.RunSpec{
-    RunID:       runID,
-    Runtime:     harness.RuntimeClaude,
-    Network:     harness.NetworkProxied,
-    EgressAllow: []string{"api.anthropic.com", "*.githubusercontent.com", "registry.npmjs.org:443"},
+```rust
+let spec = RunSpec {
+    run_id,
+    runtime: Some(Runtime::Claude),
+    network: NetworkMode::Proxied,
+    egress_allow: vec!["api.anthropic.com".into(), "*.githubusercontent.com".into(), "registry.npmjs.org:443".into()],
     // ... workspace, limits, deadline
-}
+    ..Default::default()
+};
 
-pin, err := harness.LoadEgressPin(harness.DefaultEgressPinPath)
-launcher := &harness.PodmanLauncher{EgressImage: pin.Ref()}
+let pin = EgressPin::load(DEFAULT_EGRESS_PIN_PATH)?;
+let launcher = PodmanLauncher { egress_image: pin.reference(), ..Default::default() };
 ```
 
 Build the image first:
@@ -51,7 +52,7 @@ Build the image first:
 ./scripts/egress-build.sh
 ```
 
-It is the same `hive-sandbox` binary running its `-run-egress-proxy` role, on a
+It is the same `hive-sandbox` binary running its `--run-egress-proxy` role, on a
 distroless base with no shell. One codebase, one place the allowlist logic
 lives.
 
@@ -101,13 +102,13 @@ own opt-in** ... writing `192.168.1.50` in an allowlist and having it silently
 never match was the other half of the same bug, and an entry that looks
 effective while doing nothing is the worst kind of configuration.
 
-`EgressAllowPrivate` on the spec still widens the whole list, for a deployment
+`egress_allow_private` on the spec still widens the whole list, for a deployment
 that genuinely wants that. It is now the exception rather than the mechanism.
 
-One consequence worth knowing: the proxy builds a transport **per request**
-bound to the matching rule, with keep-alives off. A shared pool would let a
-later request under a stricter rule reuse a connection opened under a looser
-one, which is the address check being skipped by the connection pool.
+One consequence worth knowing: the proxy dials **per request**, bound to the
+matching rule, and pools nothing. A shared pool would let a later request under
+a stricter rule reuse a connection opened under a looser one, which is the
+address check being skipped by the connection pool (invariant 14).
 
 ## 403 versus 502
 
@@ -115,17 +116,17 @@ A policy denial is **403**. An allowed host that could not be reached is **502**
 
 They were briefly the same status, and it cost real time: a DNS failure inside
 the proxy looked exactly like a correctly enforced allowlist. The refusing path
-returns `*egress.DeniedError` so the two cannot be conflated again, and
-`TestProxyDistinguishesDenialFromUnreachable` holds the line.
+returns `Denied` so the two cannot be conflated again, and
+`proxy_distinguishes_denial_from_unreachable` holds the line.
 
 Both carry `X-Hive-Sandbox-Deny` with the reason, and every decision is logged
 with the run id, so a run's own logs say why rather than only showing a status.
 
 ## The DNS thing
 
-The proxy resolves through servers it is told about (`-egress-dns`, from
-`harness.DefaultEgressDNS`), **in its own code**, bypassing `resolv.conf`
-entirely.
+The proxy resolves through servers it is told about (`--egress-dns`, from
+`hive_harness::DEFAULT_EGRESS_DNS`), **in its own code**, bypassing
+`resolv.conf` entirely.
 
 It has to. A container attached to an `--internal` network gets its
 `resolv.conf` pointed at that network's `aardvark-dns`, and aardvark on an
@@ -138,13 +139,13 @@ ERROR egress upstream failed host=example.com
 ```
 
 **Podman's `--dns` flag does not fix this**, which was the first thing tried.
-Aardvark still goes first in `resolv.conf`, it answers NXDOMAIN, and Go's
+Aardvark still goes first in `resolv.conf`, it answers NXDOMAIN, and a
 resolver treats NXDOMAIN as authoritative and never falls through to the next
 server. A libc-based client in the same container appears to work, which makes
 the failure look intermittent when it is not.
 
-So the proxy builds its own `net.Resolver` with `PreferGo: true` and a `Dial`
-that goes straight to the configured servers. That also turns "which DNS does
+So the proxy builds its own resolver (hickory) pointed straight at the
+configured servers. That also turns "which DNS does
 this platform's egress use" into a decision rather than whatever the container
 runtime happened to write.
 

@@ -8,7 +8,7 @@ test('GET /healthz returns 200 and the version the binary was built with', async
 
   const body = (await res.json()) as { status?: string; version?: string };
   expect(body.status).toBe('ok');
-  // daemon.version comes from `hive-sandbox -version` on the same binary, so
+  // daemon.version comes from `hive-sandbox --version` on the same binary, so
   // this catches the handler reporting something other than what it is.
   expect(body.version).toBe(daemon.version);
   expect(body.version).not.toBe('');
@@ -20,7 +20,7 @@ test('the daemon 404s a path it does not serve', async ({ request, daemon }) => 
 });
 
 test('/healthz rejects a non-GET method', async ({ request, daemon }) => {
-  // The route is registered as `GET /healthz`, so ServeMux answers 405 here.
+  // The route is registered for GET only, so the router answers 405 here.
   const res = await request.post(`${daemon.url}/healthz`);
   expect(res.status()).toBe(405);
 });

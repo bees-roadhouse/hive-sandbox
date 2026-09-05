@@ -4,48 +4,34 @@ From nothing to a passing test suite. Assumes you have none of this installed.
 
 ## Install
 
-| What                | Why                                          | Windows                                    | Linux / macOS                          |
-| ------------------- | -------------------------------------------- | ------------------------------------------ | -------------------------------------- |
-| **Go 1.26.7**       | the daemon                                   | `winget install GoLang.Go`                 | https://go.dev/dl/                     |
-| **Podman 5+**       | local Postgres (Docker works too)            | `winget install RedHat.Podman-Desktop`     | `brew install podman` / your package manager |
-| **Node 20+**        | the Playwright suite                         | `winget install OpenJS.NodeJS.LTS`         | `brew install node` / nvm              |
-| **golangci-lint**   | the gate's lint step                         | `go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest` | same |
+| What                | Why                                          | Linux / macOS                          | Windows                                    |
+| ------------------- | -------------------------------------------- | -------------------------------------- | ------------------------------------------ |
+| **Rust** via rustup | the daemon; `rust-toolchain.toml` pins 1.98 with clippy and rustfmt, rustup installs it on first `cargo` | https://rustup.rs | `winget install Rustlang.Rustup` |
+| **`wasm32-wasip1`** | building guests (`rustup target add wasm32-wasip1`); not needed to run the tests, the built guests are checked in | same | same |
+| **Podman 5+**       | local Postgres (Docker works too); the harness and egress tiers | `brew install podman` / your package manager | `winget install RedHat.Podman-Desktop` |
+| **Node 20+**        | the browser client's build and the Playwright suite | `brew install node` / nvm | `winget install OpenJS.NodeJS.LTS` |
 
-Two PATH notes on Windows, both of which have already bitten someone:
-
-- `go` is not on PATH in a fresh shell. Prepend `C:\Program Files\Go\bin`.
-- `golangci-lint` installs to `$(go env GOPATH)\bin`, usually
-  `C:\Users\<you>\go\bin`. Prepend that too.
-
-```powershell
-$env:Path = "C:\Program Files\Go\bin;$(& 'C:\Program Files\Go\bin\go.exe' env GOPATH)\bin;$env:Path"
-```
-
-Make it permanent from an ordinary shell:
-
-```powershell
-[Environment]::SetEnvironmentVariable(
-  'Path',
-  "C:\Program Files\Go\bin;$(go env GOPATH)\bin;" + [Environment]::GetEnvironmentVariable('Path','User'),
-  'User')
-```
+One PATH note that has already bitten someone: rustup installs to
+`~/.cargo/bin`, and a shell opened before the install does not have it. The
+scripts prepend it when they find it; a terminal that cannot see `cargo` needs
+`export PATH="$HOME/.cargo/bin:$PATH"` or a new shell.
 
 ## Clone
 
-```powershell
+```bash
 git clone https://github.com/bees-roadhouse/hive-sandbox
 cd hive-sandbox
-go mod download
+cargo fetch
 ```
 
 ## Bring up Postgres
 
-```powershell
-.\scripts\db-up.ps1
-```
-
 ```bash
 ./scripts/db-up.sh
+```
+
+```powershell
+.\scripts\db-up.ps1
 ```
 
 Starts `pgvector/pgvector:pg17` on **127.0.0.1:55432**, waits until it can
@@ -54,53 +40,63 @@ server accepts connections and then restarts), creates `hive_sandbox_test` if it
 is missing, and prints both connection strings. Run it as often as you like ...
 it is idempotent.
 
-Port 55432 is deliberate. This box already runs `hive-postgres` on 5432 and
-`hive-latest-pg` on 55433; colliding with either would be a confusing way to
-lose data.
+Port 55432 is deliberate. The maintainer's box runs other Postgres containers
+on 5432, 55433 and 55434 (`nectar-p3-pg` took 55432 for a while, which is how
+a session ended up with its own database on 55434); colliding with any of them
+would be a confusing way to lose data. If 55432 is taken on your machine, the
+compose file and `db-up` name the port in one place each.
 
 Export the URL so integration tests use it:
-
-```powershell
-$env:HIVE_SANDBOX_TEST_DATABASE_URL = .\scripts\db-up.ps1 -Quiet
-```
 
 ```bash
 export HIVE_SANDBOX_TEST_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
 ```
 
+```powershell
+$env:HIVE_SANDBOX_TEST_DATABASE_URL = .\scripts\db-up.ps1 -Quiet
+```
+
 **Without that variable set, integration tests skip themselves rather than
-fail.** `go test ./...` is green on a machine with no database on purpose ... the
-gate has to run anywhere.
+fail**, and each one prints `SKIPPED: <name> <why>` so the gate can name it.
+`cargo test --workspace` is green on a machine with no database on purpose ...
+the unit tests have to run anywhere ... and that is exactly why the gate
+refuses to run without the variable.
 
 ## Run the gate
 
-```powershell
-.\scripts\gate.ps1
-```
-
 ```bash
-./scripts/gate.sh
+./scripts/gate-rust.sh
 ```
 
-Build, vet, `golangci-lint`, `gofmt -l`, `go test -race`. `gofmt` runs after
-lint because lint autofix can reformat. It prints `GATE GREEN` or
-`GATE RED: <steps>`.
+Rebuilds `web/dist` when npm is present and refuses a diff, then
+`cargo fmt --check`, `cargo clippy -D warnings`, `cargo build --all-targets`,
+`cargo test --workspace`, then a named list of every test that printed
+`SKIPPED:`. It prints `GATE GREEN` or `GATE RED: <steps>`.
 
 Read the output, not an exit code. A piped `| tail` or a chained `&&` reports
 the status of the last thing in the pipe, which is how a red gate gets pushed.
+
+No toolchain? `./scripts/gate-container.sh` builds a Podman image with Rust,
+clippy, rustfmt, the wasm target and node, and runs the same script inside it.
+Anything after `--` runs there in place of the gate:
+
+```bash
+./scripts/gate-container.sh -- cargo test -p hive-store --test grants
+```
 
 Nothing becomes a red PR. Run this before you push.
 
 ## Write an integration test
 
-`internal/testdb` hands each test a `pgxpool.Pool` bound to its own empty
-schema, dropped when the test ends. No shared fixture, safe under `-race` and
-`t.Parallel()`.
+`crates/hive-testdb` hands each test a `PgPool` bound to its own empty schema,
+dropped when the test ends. No shared fixture and no ordering between tests.
 
-```go
-func TestThing(t *testing.T) {
-    t.Parallel()
-    pool := testdb.Pool(t) // skips when HIVE_SANDBOX_TEST_DATABASE_URL is unset
+```rust
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thing() {
+    // Prints SKIPPED: and returns when HIVE_SANDBOX_TEST_DATABASE_URL is unset.
+    let Some(db) = TestDb::new("thing").await else { return };
+    hive_store::migrate(db.pool()).await.unwrap();
     ...
 }
 ```
@@ -114,10 +110,39 @@ one test to reach another through.
 provisioning rather than migration one, because it is the only step needing
 rights the migration role does not have.
 
-A corollary worth knowing before you write a store test: **the database is
-shared across tests, only the schema is private.** Anything database-scoped ...
-`DROP SCHEMA public`, `CREATE EXTENSION`, a role change ... is not isolated and
-will follow every test that runs after it, in any package.
+Two things worth knowing before you write a store test:
+
+- **The database is shared across tests, only the schema is private.** Anything
+  database-scoped ... `DROP SCHEMA public`, `CREATE EXTENSION`, a role change
+  ... is not isolated and will follow every test that runs after it.
+- **A test that ends without awaiting can strand a connection.** sqlx returns a
+  pooled connection on a spawned task; a test that returns synchronously right
+  after a query leaves that task unpolled with a transaction open, and the next
+  `DROP SCHEMA` waits on it forever. `TestDb` terminates its own sessions
+  before dropping the schema, so this shows up as a slow teardown rather than a
+  hang, but the fix is still to await what you started.
+- **Await store and migration futures on the calling task.** Some sqlx-heavy
+  futures cannot be proven `Send` (rust-lang/rust#100013), so `tokio::spawn`
+  refuses them with "implementation of `Send` is not general enough". Run them
+  where they are, or `join_all` them; the crates that hit this document it on
+  the function.
+
+`crates/hive-store/tests/invariants.rs` is the reference: the invariant tests
+were written against the migrations alone, before any Rust behaviour existed,
+which is the tests-first rule of D24 in practice.
+
+## Build the browser client
+
+```bash
+cd web
+npm install
+npm run typecheck
+npm run build        # writes web/dist, which is committed
+```
+
+`crates/hive-webui` embeds `web/dist` at compile time, so a checkout with no
+node still builds the daemon. Commit the rebuilt `web/dist` with any change to
+`web/src`; the gate and CI refuse a diff.
 
 ## Run the e2e tests
 
@@ -128,14 +153,14 @@ npm run browsers    # one-time chromium download, ~115 MB
 npm test
 ```
 
-The suite builds the daemon, starts it on an ephemeral port per worker, and
-shuts it down after. Nothing to start by hand and no fixed port to collide with.
+The suite builds the daemon (`cargo build -p hive-sandbox`), starts it on an
+ephemeral port per worker, and shuts it down after. Nothing to start by hand and
+no fixed port to collide with. `HIVE_SANDBOX_E2E_BINARY` points it at a binary
+built elsewhere.
 
-It **does** need Postgres, as of `/events` ... export
-`HIVE_SANDBOX_TEST_DATABASE_URL` exactly as for the Go tests. Every worker
-creates its own schema on that database and drops it afterwards, and the daemon
-migrates into it. There is no database-free spec: the log-attaching fixture is
-`auto: true` and depends on the daemon, so every test in the suite gets one.
+It **does** need Postgres ... export `HIVE_SANDBOX_TEST_DATABASE_URL` exactly as
+for the Rust tests. Every worker creates its own schema on that database and
+drops it afterwards, and the daemon migrates into it.
 
 Debugging:
 
@@ -148,14 +173,21 @@ npm run typecheck                     # tsc --noEmit
 
 `test/e2e/README.md` covers the fixtures and how to write an SSE spec.
 
+## Build the guests
+
+```bash
+rustup target add wasm32-wasip1
+./scripts/build-guests.sh
+```
+
+Writes `crates/hive-wasmhost/testdata/<app>.wasm` for each app under `apps/`.
+The built files are committed; CI rebuilds them and refuses a diff. The
+profile every guest builds with is explained in `scripts/guest-build.md`.
+
 ## Build the agent harness images
 
-Optional. Only needed to run an agent, or to exercise the harness integration
-test ... everything else skips without them.
-
-```powershell
-.\scripts\harness-build.ps1
-```
+Optional. Only needed to run an agent, or to exercise the harness container
+tests ... everything else skips without them, by name.
 
 ```bash
 ./scripts/harness-build.sh
@@ -167,45 +199,17 @@ defaults, the network modes and the run-record seam.
 
 A run that needs the internet also needs the egress proxy image:
 
-```powershell
-.\scripts\egress-build.ps1
-```
-
 ```bash
 ./scripts/egress-build.sh
 ```
 
-See [`egress.md`](egress.md) for the allowlist syntax and what the proxy
-enforces.
-
-## Tear down
-
-```powershell
-.\scripts\db-down.ps1            # stop, keep the data
-.\scripts\db-down.ps1 -Purge     # stop and delete the volume
-```
+## Build the daemon image
 
 ```bash
-./scripts/db-down.sh
-./scripts/db-down.sh --purge
+./scripts/image-build.sh
 ```
 
-## CI
-
-Two jobs in `.github/workflows/ci.yml`:
-
-- **gate** ... the same steps as `scripts/gate.ps1`, against a Postgres service
-  container, with `HIVE_SANDBOX_TEST_DATABASE_URL` set so integration tests
-  actually run there.
-- **e2e** ... Playwright, also against a Postgres service container since the
-  daemon serves `/events` off the database. Separate from `gate` on purpose: it
-  downloads a browser, and a lint failure should not wait behind 115 MB.
-
-`golangci-lint` is built from source with the runner's own Go. A prebuilt binary
-compiled against an older Go refuses to load a config targeting a newer one.
-
-## Where the design lives
-
-Not in this repo. Decision log and plans are in the Traycer epic; `CLAUDE.md`
-has the path and the invariants that are load-bearing. Read those before writing
-anything past the harness.
+A Rust builder stage over the whole workspace, a `distroless/cc` runtime with
+no shell. The script reads the version back out of the image and refuses a
+mismatch, because a pin that names a version the binary does not report is a
+lie that gets discovered during an incident.

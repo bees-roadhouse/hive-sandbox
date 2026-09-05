@@ -3,7 +3,7 @@ import { collectSSE, expect, openSameOriginPage, resetSSEOpenCount, test, waitFo
 /**
  * /events against a real browser EventSource.
  *
- * This is why Playwright is the runner rather than a Go HTTP test: the parts of
+ * This is why Playwright is the runner rather than a Rust HTTP test: the parts of
  * SSE that are easy to get wrong live in the client. Automatic reconnect,
  * `Last-Event-ID` on the retry, and what an `id:` field with no `data:` does to
  * the resume point are all browser behaviour, and reimplementing them in a test
@@ -161,7 +161,7 @@ test('the id a browser is holding is a safe place to resume from', async ({
   // has no per-connection close and should not grow one to be testable.
   //
   // What it does assert is the half that is mine rather than the browser's, and
-  // the half a Go test cannot reach: the id the browser is HOLDING is a safe
+  // the half a server-side test cannot reach: the id the browser is HOLDING is a safe
   // resume point. `id:` is written only for events old enough that nothing can
   // still commit behind them, so a client that resumes from what it holds may
   // see duplicates and must never see a gap.

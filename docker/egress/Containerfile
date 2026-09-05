@@ -1,43 +1,31 @@
 # The allowlisting egress proxy a harness run reaches the internet through
 # (D12.6, D23).
 #
-# It is the same hive-sandbox binary running its -run-egress-proxy role, so
+# It is the same hive-sandbox binary running its --run-egress-proxy role, so
 # there is one codebase and one place the allowlist logic lives. The proxy sits
 # on a per-run internal Podman network: the harness has no route out except
 # through it, and it answers one question per request.
 #
-# Built by scripts/egress-build.ps1 (or .sh) from the repo root, because the
-# build stage needs the whole module.
+# Built by scripts/egress-build.sh from the repo root, because the build stage
+# needs the whole workspace.
 
-FROM docker.io/library/golang:1.26-bookworm AS build
+FROM docker.io/library/rust:1.98-bookworm AS build
 
 WORKDIR /src
-
-# Module files first so a source-only change does not redownload the module
-# cache.
-COPY go.mod go.sum ./
-RUN go mod download
-
 COPY . .
 
 ARG VERSION=dev
-# CGO_ENABLED=0 for a static binary that runs on a distroless base, and because
-# the host is CGo-free on purpose. Setting it explicitly rather than relying on
-# the absence of a C toolchain, which is the kind of thing that changes when a
-# base image does.
-RUN CGO_ENABLED=0 GOOS=linux go build \
-    -trimpath \
-    -ldflags "-s -w -X main.version=${VERSION}" \
-    -o /out/hive-sandbox ./cmd/hive-sandbox
+ENV HIVE_SANDBOX_VERSION=${VERSION}
+RUN cargo build --release -p hive-sandbox \
+    && cp target/release/hive-sandbox /out-hive-sandbox
 
 # --- runtime -----------------------------------------------------------------
-# Distroless static: no shell, no package manager, nothing to pivot to if the
-# proxy is ever compromised. It needs ca-certificates for nothing itself ... it
-# tunnels TLS rather than terminating it ... but the base carries them for the
-# plain-HTTP forward path's own dials.
-FROM gcr.io/distroless/static-debian12:nonroot AS proxy
+# Distroless cc: no shell, no package manager, nothing to pivot to if the proxy
+# is ever compromised. It tunnels TLS rather than terminating it, and the
+# plain-HTTP forward path's own dials need no certificate store.
+FROM gcr.io/distroless/cc-debian12:nonroot AS proxy
 
-COPY --from=build /out/hive-sandbox /usr/local/bin/hive-sandbox
+COPY --from=build /out-hive-sandbox /usr/local/bin/hive-sandbox
 
 # nonroot in the distroless base.
 USER 65532:65532
@@ -52,7 +40,8 @@ LABEL org.beesroadhouse.hive-sandbox.component=egress-proxy
 # The allowlist arrives at run time as HIVE_SANDBOX_EGRESS_ALLOW. There is no
 # default, and no allowlist means deny everything.
 ENTRYPOINT ["/usr/local/bin/hive-sandbox", \
-            "-serve-api=false", \
-            "-run-workflows=false", \
-            "-run-egress-proxy", \
-            "-egress-addr=:3128"]
+            "--serve-api=false", \
+            "--run-workflows=false", \
+            "--run-chat=false", \
+            "--run-egress-proxy", \
+            "--egress-addr=:3128"]

@@ -13,6 +13,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The born-green gate: the same script a laptop runs, against the same shape
+  # of Postgres. scripts/gate-rust.sh refuses without a database, names every
+  # test that skipped, and rebuilds web/dist to refuse a stale committed build.
   gate:
     runs-on: ubuntu-latest
     services:
@@ -29,16 +32,24 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      # Integration tests skip themselves when this is unset, so unit tests
-      # still run anywhere.
       HIVE_SANDBOX_TEST_DATABASE_URL: postgres://hive:hive@localhost:5432/hive_sandbox_test
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      # rust-toolchain.toml pins the exact version; the action installs that one
+      # (the guests job needs the exact patch, or the committed .wasm differs).
+      - uses: dtolnay/rust-toolchain@master
         with:
-          go-version-file: go.mod
-          cache: true
+          toolchain: "1.98.1"
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
 
       # Mirrors what scripts/db-up.sh does locally. Extensions live in their own
       # schema so `public` stays empty and a test's private schema is the only
@@ -51,41 +62,14 @@ jobs:
             -c "CREATE SCHEMA IF NOT EXISTS extensions" \
             -c "CREATE EXTENSION IF NOT EXISTS vector SCHEMA extensions"
 
-      - name: build
-        run: go build ./...
-
-      - name: vet
-        run: go vet ./...
-
-      # Built from source with the runner's Go rather than downloading a
-      # prebuilt binary: a golangci-lint compiled with an older Go refuses to
-      # load a config targeting a newer one, which is exactly what broke the
-      # first CI run here.
-      - name: lint
-        run: |
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
-          "$(go env GOPATH)/bin/golangci-lint" run
-
-      # After lint, because lint autofix can reformat.
-      - name: gofmt
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "unformatted files:"
-            echo "$unformatted"
-            exit 1
-          fi
-
-      - name: test
-        run: go test -race ./...
+      - name: gate
+        run: ./scripts/gate-rust.sh
 
   # Separate from `gate` on purpose: this job downloads a ~115 MB browser, and a
-  # lint failure should not wait behind it. It needs no database ... the e2e
-  # suite drives the daemon's HTTP and SSE surface, not Postgres.
+  # lint failure should not wait behind it. The daemon serves /events off
+  # Postgres, so the browser specs need one.
   e2e:
     runs-on: ubuntu-latest
-    # The daemon serves /events off Postgres, so the browser specs need one.
-    # This job deliberately had no database until the daemon needed one.
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -101,20 +85,18 @@ jobs:
           --health-retries 10
     env:
       # Each Playwright worker creates its own schema on this database and
-      # drops it afterwards, so workers cannot see each other's events. That
-      # matters here more than in the Go tests: these specs assert on what a
-      # stream did NOT deliver, and a stray event would look like a filter bug.
+      # drops it afterwards, so workers cannot see each other's events. These
+      # specs assert on what a stream did NOT deliver, and a stray event would
+      # look like a filter bug.
       HIVE_SANDBOX_TEST_DATABASE_URL: postgres://hive:hive@localhost:5432/hive_sandbox_test
-    defaults:
-      run:
-        working-directory: test/e2e
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@master
         with:
-          go-version-file: go.mod
-          cache: true
+          toolchain: "1.98.1"
+
+      - uses: Swatinem/rust-cache@v2
 
       - uses: actions/setup-node@v4
         with:
@@ -122,17 +104,35 @@ jobs:
           cache: npm
           cache-dependency-path: test/e2e/package-lock.json
 
+      - name: provision extensions schema
+        env:
+          PGPASSWORD: hive
+        run: |
+          psql -h localhost -U hive -d hive_sandbox_test -v ON_ERROR_STOP=1 \
+            -c "CREATE SCHEMA IF NOT EXISTS extensions" \
+            -c "CREATE EXTENSION IF NOT EXISTS vector SCHEMA extensions"
+
+      # Built here rather than in globalSetup so the cargo cache above covers
+      # it and a compile error reads as a build failure, not a Playwright one.
+      - name: build the daemon
+        run: cargo build -p hive-sandbox
+
       - name: install
+        working-directory: test/e2e
         run: npm ci
 
       - name: typecheck
+        working-directory: test/e2e
         run: npm run typecheck
 
       - name: install chromium
+        working-directory: test/e2e
         run: npx playwright install --with-deps chromium
 
-      # globalSetup builds the daemon, so `go` has to be on PATH here.
       - name: e2e
+        working-directory: test/e2e
+        env:
+          HIVE_SANDBOX_E2E_BINARY: ${{ github.workspace }}/target/debug/hive-sandbox
         run: npx playwright test
 
       - if: ${{ failure() }}
@@ -142,86 +142,79 @@ jobs:
           path: test/e2e/playwright-report/
           retention-days: 7
 
-  # The conformance canary. Two things it catches that `gate` cannot.
-  #
-  # First, the guest source and the committed .wasm drifting apart: the gate
-  # tests run against the checked-in artifact, so a change to apps/hello that
-  # nobody rebuilt would pass. This job rebuilds from source with the pinned
-  # toolchain and runs the same tests against the fresh bytes.
-  #
-  # Second, compiler-versus-interpreter divergence. That is a recurring wazero
-  # issue class, and every TestConformance* case runs under both engines, so a
-  # divergence surfaces here rather than in production. The gate covers that too;
-  # this job covers it against a guest built minutes ago.
+  # The guest source and the committed .wasm drifting apart is what this job
+  # catches: the gate tests run against the checked-in artifact, so a change to
+  # apps/hello that nobody rebuilt would pass. This rebuilds from source with
+  # the pinned toolchain, refuses a diff, and runs the host suite against the
+  # fresh bytes.
   guests:
     runs-on: ubuntu-latest
-    env:
-      TINYGO_VERSION: "0.41.1"
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@master
         with:
-          go-version-file: go.mod
-          cache: true
+          toolchain: "1.98.1"
+          targets: wasm32-wasip1
+          components: clippy, rustfmt
 
-      # tinygo shells out to binaryen's wasm-opt and does not ship it.
-      - name: install tinygo and binaryen
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y binaryen
-          curl -fsSL -o /tmp/tinygo.deb \
-            "https://github.com/tinygo-org/tinygo/releases/download/v${TINYGO_VERSION}/tinygo_${TINYGO_VERSION}_amd64.deb"
-          sudo dpkg -i /tmp/tinygo.deb
-          tinygo version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            guest
 
       - name: rebuild guests from source
         run: ./scripts/build-guests.sh
 
-      - name: guest sources are gofmt clean
+      # On a mismatch the step says WHERE the bytes differ, not only that they
+      # do: a one-byte drift between two toolchain patch levels is invisible in
+      # a diff --stat and obvious in a strings diff.
+      - name: the committed guest matches its source
         run: |
-          unformatted=$(gofmt -l guest apps)
-          if [ -n "$unformatted" ]; then
-            echo "unformatted files:"
-            echo "$unformatted"
+          if ! git diff --quiet -- crates/hive-wasmhost/testdata; then
+            echo "crates/hive-wasmhost/testdata is out of date with apps/; commit the rebuilt files:"
+            git --no-pager diff --stat -- crates/hive-wasmhost/testdata
+            for f in $(git diff --name-only -- crates/hive-wasmhost/testdata); do
+              git show "HEAD:$f" > /tmp/committed.wasm
+              echo "== $f: first differing bytes (offset, committed, rebuilt)"
+              cmp -l /tmp/committed.wasm "$f" | head -20 || true
+              echo "== $f: strings that differ (< committed, > rebuilt)"
+              diff <(strings -n 6 /tmp/committed.wasm) <(strings -n 6 "$f") | head -40 || true
+            done
             exit 1
           fi
 
-      - name: conformance under both engines
-        run: go test -race -run 'TestConformance|TestHostFunctionHonorsContext|TestTermination|TestUndeclaredCapability' -v ./internal/wasmhost/
+      - name: guest crates are fmt and clippy clean
+        working-directory: guest
+        run: cargo fmt --all --check && cargo clippy --workspace --target wasm32-wasip1 -- -D warnings
 
-      - name: full host suite against the fresh guest
-        run: go test -race ./internal/wasmhost/
+      - name: host suite against the fresh guest
+        run: cargo test -p hive-wasmhost -p hive-registry
 
   # The egress claim ... a harness has no route out and an agent that ignores
   # HTTP_PROXY fails rather than escapes ... is proven by exactly one test, and
-  # until now that test ran nowhere. Five skip conditions, none of them met by
-  # any job: nothing built the images and the pin files are gitignored on
-  # purpose, because a locally built image has a machine-local digest.
-  #
-  # So this job builds them and pins them in-job, where the digest is real for
-  # this run, and sets HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS so a precondition
-  # that is not met FAILS rather than skips. A skip is right on a laptop that
-  # never built a harness; it is wrong in the one environment that promised to.
-  #
-  # Its own job because it builds container images, and a lint failure should
-  # not wait behind that.
+  # it runs only where the images exist. This job builds them and pins them
+  # in-job, where the digest is real for this run, and sets
+  # HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS so a precondition that is not met
+  # FAILS rather than skips. A skip is right on a laptop that never built a
+  # harness; it is wrong in the one environment that promised to.
   containers:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@master
         with:
-          go-version-file: go.mod
-          cache: true
+          toolchain: "1.98.1"
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: podman version
         run: podman version
 
       # Only the claude runtime: the egress test drives one image, and building
-      # three would triple the job for nothing. The build script takes a subset
-      # and relocks whatever exists.
+      # three would triple the job for nothing.
       - name: build the harness image
         run: ./scripts/harness-build.sh claude
 
@@ -236,10 +229,7 @@ jobs:
       - name: container tests, where a skip is a failure
         env:
           HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS: "1"
-        run: |
-          go test -race -count=1 -timeout 15m \
-            -run 'TestEgressProxy|TestPodmanRunsThePinnedImage' \
-            -v ./internal/harness/
+        run: cargo test -p hive-harness --test supervisor -- podman_runs_the_pinned_image egress_proxy_enforces_the_allowlist
 
       - name: nothing outlived the run
         if: ${{ always() }}
@@ -249,33 +239,46 @@ jobs:
           echo "networks:"
           podman network ls --format '{{.Name}}' | grep hive-sandbox || echo "  (none)"
 
-  # The S3 driver against a backend that can actually presign.
-  #
-  # The disk driver cannot redirect at all, so until Garage existed here,
-  # Caps.Presign, PlanDelivery's redirect arm and every claim about signed URLs
-  # were untested by construction ... and a fake that presigns would have agreed
-  # with whatever the driver did. Three of these assertions are about server
-  # behaviour and nothing but a server can answer them: that a Range against a
-  # signed URL is honoured (SigV4 query presigning signs `host`, not `Range`),
-  # that an expired signature comes back 400 rather than the 403 an AWS-shaped
-  # guess predicts, and that a redirect target actually serves the bytes.
-  #
-  # It runs scripts/garage-up.sh rather than a service container, so the script
-  # developers depend on is itself under test. REQUIRE_CONTAINER_TESTS makes a
-  # missing precondition a failure, for the reason the `containers` job explains.
+  # The S3 driver against a backend that can actually presign. The disk driver
+  # cannot redirect at all, so without Garage every claim about signed URLs is
+  # untested by construction. It runs scripts/garage-up.sh rather than a
+  # service container, so the script developers depend on is itself under test.
   blobstore:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: hive
+          POSTGRES_PASSWORD: hive
+          POSTGRES_DB: hive_sandbox_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U hive"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
+      HIVE_SANDBOX_TEST_DATABASE_URL: postgres://hive:hive@localhost:5432/hive_sandbox_test
       # ubuntu-latest ships both; pin the one whose compose is known-good here
       # rather than letting the script's provider detection decide per-runner.
       HIVE_SANDBOX_COMPOSE: "docker compose"
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@master
         with:
-          go-version-file: go.mod
-          cache: true
+          toolchain: "1.98.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: provision extensions schema
+        env:
+          PGPASSWORD: hive
+        run: |
+          psql -h localhost -U hive -d hive_sandbox_test -v ON_ERROR_STOP=1 \
+            -c "CREATE SCHEMA IF NOT EXISTS extensions" \
+            -c "CREATE EXTENSION IF NOT EXISTS vector SCHEMA extensions"
 
       # --quiet prints exactly four lines: endpoint, bucket, key id, secret.
       # The key is minted by this Garage seconds ago and dies with the runner.
@@ -301,7 +304,7 @@ jobs:
       - name: S3 driver tests, where a skip is a failure
         env:
           HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS: "1"
-        run: go test -race -count=1 -timeout 10m -run 'TestS3' -v ./internal/blob/
+        run: cargo test -p hive-blob --test s3_live -- --nocapture
 
       - name: garage-up is idempotent
         run: ./scripts/garage-up.sh
@@ -309,53 +312,3 @@ jobs:
       - name: stop garage
         if: ${{ always() }}
         run: ./scripts/garage-down.sh --purge
-
-  # The desktop client is a nested Go module (like guest/), so the gate's
-  # `go test ./...` never sees it, and its windowed binary links WebKit2GTK
-  # through cgo, so the gate image could not build it anyway. This job is the
-  # only place these packages compile and run ... which is exactly why it must
-  # exist. The webview-free rule (nothing under desktop/internal imports a GUI
-  # toolkit) keeps every test here runnable without a display.
-  desktop:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: desktop/go.mod
-          cache: true
-          cache-dependency-path: desktop/go.sum
-
-      # Wails v3 defaults to GTK4/WebKitGTK 6.0; this repo builds the desktop
-      # with `-tags gtk3`, which every runner image ships. If that tag ever
-      # goes away in v3.1, move to libwebkitgtk-6.0-dev and drop the tag.
-      - name: install GTK and WebKit2GTK
-        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config
-
-      - name: build
-        working-directory: desktop
-        run: go build -tags gtk3 ./...
-
-      - name: vet
-        working-directory: desktop
-        run: go vet -tags gtk3 ./...
-
-      - name: lint
-        working-directory: desktop
-        run: |
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
-          golangci-lint run ./internal/... ./ui
-
-      - name: gofmt
-        run: |
-          unformatted=$(gofmt -l desktop)
-          if [ -n "$unformatted" ]; then
-            echo "unformatted files:"
-            echo "$unformatted"
-            exit 1
-          fi
-
-      - name: test
-        working-directory: desktop
-        run: go test -race -count=1 -timeout 120s ./internal/...

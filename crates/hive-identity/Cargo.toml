@@ -1,0 +1,18 @@
+[package]
+name = "hive-identity"
+description = "The credential every layer of the platform passes around, and nothing else"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+uuid.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

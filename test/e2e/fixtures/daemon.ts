@@ -10,7 +10,7 @@ export interface Daemon {
   /** Origin, e.g. http://127.0.0.1:53412 . No trailing slash. */
   url: string;
   port: number;
-  /** What `hive-sandbox -version` printed for this build. */
+  /** What `hive-sandbox --version` printed for this build. */
   version: string;
   /** Bearer token for the bootstrapped root actor. */
   token: string;
@@ -70,7 +70,14 @@ export async function startDaemon(options: DaemonOptions): Promise<RunningDaemon
   // write; every daemon gets its own scratch roots, removed when it stops.
   const scratch = mkdtempSync(path.join(tmpdir(), 'hive-e2e-'));
 
-  const child: ChildProcess = spawn(info.binaryPath, ['-addr', `127.0.0.1:${port}`], {
+  // No chat worker: it needs Podman, a harness image and a unix socket, and a
+  // spec that wants an answered turn should say so with a fixture of its own.
+  // Without this, a machine that has built the harness images would boot a
+  // daemon that refuses for lack of a socket, and one that has not would boot
+  // one that warns, and the two would look different for no reason.
+  // --plain-http because this daemon IS a plain-HTTP deployment: without it
+  // the session cookie is Secure and the browser would never send it back.
+  const child: ChildProcess = spawn(info.binaryPath, ['--addr', `127.0.0.1:${port}`, '--run-chat=false', '--plain-http'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,

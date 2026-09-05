@@ -10,10 +10,18 @@ npm test
 
 `docs/development.md` has the from-nothing version.
 
+No Rust toolchain on the machine? Build the daemon in the gate container and
+hand it to the suite; nothing else changes.
+
+```bash
+./scripts/gate-container.sh -- cargo build -p hive-sandbox
+HIVE_SANDBOX_E2E_BINARY="$PWD/.cargo-cache/target/debug/hive-sandbox" npm test
+```
+
 ## What the harness gives you
 
-`globalSetup` builds the daemon once into `.playwright/` and records the output
-of `hive-sandbox -version`. Each worker then gets:
+`globalSetup` builds the daemon once (`cargo build -p hive-sandbox`) and records
+the output of `hive-sandbox --version` in `.playwright/`. Each worker then gets:
 
 | fixture    | scope  | what it is                                              |
 | ---------- | ------ | ------------------------------------------------------- |
@@ -27,7 +35,7 @@ attached to its report.
 
 Postgres **is** wired in here, as of `/events`. The daemon serves its event
 stream off the database, so the browser specs need one; set
-`HIVE_SANDBOX_TEST_DATABASE_URL` the same way the Go tests do.
+`HIVE_SANDBOX_TEST_DATABASE_URL` the same way the Rust tests do.
 
 Each worker gets its own schema, created before the daemon starts and dropped
 when the worker ends, and the daemon migrates into it. That isolation is not
@@ -41,7 +49,7 @@ daemon can talk to itself and nothing more.
 
 ## Writing an SSE spec
 
-This is the reason Playwright is the runner rather than plain Go HTTP tests. A
+This is the reason Playwright is the runner rather than plain Rust HTTP tests. A
 browser's `EventSource` already implements event framing, `retry:`, automatic
 reconnect and resume-with-`Last-Event-ID`. Reimplementing that in a test is how
 you end up testing your reimplementation.

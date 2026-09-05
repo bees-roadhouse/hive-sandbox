@@ -1,0 +1,18 @@
+[package]
+name = "hive-sse"
+description = "The Server-Sent Events frame writer, shared by /events and the chat stream"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+axum.workspace = true
+bytes.workspace = true
+http.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+thiserror.workspace = true

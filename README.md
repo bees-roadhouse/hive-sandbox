@@ -1,9 +1,12 @@
 # hive-sandbox
 
-An app-of-apps platform for a family. A Go daemon hosts WASM guest apps on
-wazero behind a JSON ABI; apps store and relate data through host-mediated
-surfaces; workflows and AI agent runs compose them. Claude Code appears twice:
-as a **builder** that writes new apps into the running system, and as a **brain**
+An app-of-apps platform for a family. A daemon hosts WASM guest apps behind a
+JSON ABI; apps store and relate data through host-mediated surfaces; workflows
+and AI agent runs compose them. The daemon is Rust on wasmtime
+([D24](docs/design/D24-rust-rewrite.md); the Go tree it replaced was removed at
+parity, [D31](docs/design/D31-go-removed.md)), the browser client is Solid.js,
+and the guest SDK is Rust for `wasm32-wasip1`. Claude Code appears twice: as a
+**builder** that writes new apps into the running system, and as a **brain**
 apps and workflows can call.
 
 It replaces [`bees-roadhouse/hive`](https://github.com/bees-roadhouse/hive).
@@ -14,18 +17,24 @@ Phase 0, and honest about the gap. What exists:
 
 | | |
 |---|---|
-| `internal/store` | migrations, the grant predicate, install authority |
-| `internal/wasmhost` | guest apps on wazero behind the JSON ABI, with trust structural in the ABI |
-| `internal/blob` | the driver seam — disk and S3-compatible (Garage) drivers — and the reference layer |
-| `internal/bus` | the events table as transport, NOTIFY as wakeup, SSE fan-out |
-| `internal/mcp` | the tools tier: what `tools/list` shows is what `tools/call` accepts |
-| `internal/manifest` | the app declaration and everything derivable from it; pure, no I/O |
-| `internal/registry` | manifest + module + Postgres = an installed app |
-| `internal/harness` | hosted agent runs under Podman, persisted in Postgres |
-| `internal/egress` | the allowlisting proxy a run reaches the internet through |
-| `internal/httpapi` | liveness, readiness, events, enrollment, and blob reads |
+| `crates/hive-schema` | the forward-only migrations, with the advisory lock and the checksum |
+| `crates/hive-store` | the data layer, the grant predicate, install authority, credentials, chat, the guest-facing storage |
+| `crates/hive-wasmhost` | guest apps on wasmtime behind the JSON ABI, with trust structural in the ABI |
+| `crates/hive-blob` | the driver seam — disk and S3-compatible (Garage) drivers — and the reference layer |
+| `crates/hive-bus` | the events table as transport, NOTIFY as wakeup, SSE fan-out |
+| `crates/hive-mcp` | the tools tier: what `tools/list` shows is what `tools/call` accepts |
+| `crates/hive-manifest` | the app declaration and everything derivable from it; pure, no I/O |
+| `crates/hive-registry` | manifest + module + Postgres = an installed app |
+| `crates/hive-harness` | hosted agent runs under Podman, persisted in Postgres |
+| `crates/hive-egress` | the allowlisting proxy a run reaches the internet through |
+| `crates/hive-httpapi` | liveness, readiness, events, enrollment, blob reads, session and chat |
+| `crates/hive-chat` | a message becomes one hosted agent run; the worker, its heartbeat and the reclaimers |
+| `crates/hive-webui` | the browser client, embedded and served at `/` |
+| `crates/hive-sandbox` | the daemon: every role in one process, on a port and a unix socket |
+| `web/` | the Solid.js client, built into `web/dist` |
+| `guest/`, `apps/hello` | the guest SDK and the reference guest |
 
-**The daemon now composes.** It opens the store, migrates, bootstraps an empty
+**The daemon composes.** It opens the store, migrates, bootstraps an empty
 database, keeps the event partitions ahead of the clock, runs the LISTEN/NOTIFY
 bus, instantiates the wasm host with real Storage, Blob and Events, and serves
 its API on a port **and a unix socket** — the socket because a harness container
@@ -44,13 +53,16 @@ curl localhost:7979/readyz
 the bus, and refuses until the bus has tailed once — serving before that
 publishes a replica whose stream resumes from a watermark it never established.
 
-What is still ahead: the workflow runner, app installs, the MCP tools tier over
-HTTP, chat over the harness, and the journal app.
+Chat is built end to end: `docs/chat.md` covers the turn worker, the stream,
+and the browser client at `/`. What is still ahead: the workflow runner, app
+installs over the API, the MCP tools tier over HTTP, a container test that a
+real `claude` run resumes its session, and the journal app.
 [Issue #29](https://github.com/bees-roadhouse/hive-sandbox/issues/29)
 tracks the lot.
 
-The design is complete through decision D23. `CLAUDE.md` says where it lives and
-carries the fourteen invariants that are load-bearing ... **each one came out of
+The design is complete through decision D23 in the epic; D24 onward are
+snapshotted in [`docs/design/`](docs/design/README.md). `CLAUDE.md` says where
+the rest lives and carries the fourteen invariants that are load-bearing ... **each one came out of
 a defect a review reproduced**, so breaking one is a bug even when the tests
 pass.
 
@@ -72,81 +84,62 @@ pass.
 ## Running it
 
 ```bash
-go run ./cmd/hive-sandbox            # api + workflows by default, listens on :7979
-go run ./cmd/hive-sandbox -version
+export HIVE_SANDBOX_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
+cargo run -p hive-sandbox -- --plain-http     # api + workflows by default, listens on :7979
+cargo run -p hive-sandbox -- --version
 curl localhost:7979/healthz
 ```
 
-One process serves every role (D7). `-serve-api`, `-run-workflows` and
-`-run-egress-proxy` (an allowlisting forward proxy, HTTP and CONNECT, on
-:3128) can each be
-turned off or split across processes without a code change.
+One process serves every role (D7). `--serve-api`, `--run-workflows`,
+`--run-chat` and `--run-egress-proxy` (an allowlisting forward proxy, HTTP and
+CONNECT, on :3128) can each be turned off (`--run-chat=false`) or split across
+processes without a code change. `--plain-http` is for a deployment with no TLS
+in front: without it the session cookie is `Secure` and a browser on plain HTTP
+never sends it back, and the daemon warns about it at every boot.
 
 ## Guest apps
 
-A guest is a WASI preview1 reactor that exports one `func() int32` per manifest
-function and moves JSON through the `hive_abi` host module. The SDK is `guest/`,
-the reference app is `apps/hello/`, and the contract is documented in
-`internal/wasmhost/doc.go`.
+A guest is a WASI preview1 reactor: a Rust `cdylib` for `wasm32-wasip1` that
+exports one `extern "C" fn() -> i32` per manifest function and moves JSON
+through the `hive_abi` host module. The SDK is `guest/`, which is also the
+root of the guest workspace; the reference app is `apps/hello/`; the contract
+is documented in `crates/hive-wasmhost`.
 
-Built modules are checked in under `internal/wasmhost/testdata/`, so the test
-suite runs without a wasm toolchain. Rebuild after changing a guest:
-
-```powershell
-.\scripts\build-guests.ps1
-```
+Built modules are checked in under `crates/hive-wasmhost/testdata/`, so the
+test suite runs without the wasm target installed. Rebuild after changing a
+guest:
 
 ```bash
-./scripts/build-guests.sh          # needs tinygo 0.41.1 and binaryen's wasm-opt
+./scripts/build-guests.sh          # needs `rustup target add wasm32-wasip1`
 ```
 
-Every flag in those scripts is load-bearing and `scripts/guest-build.md` says
-why. The short version: `-scheduler=none` is worth 24x per call, and WASI
-preview1 is forever, because wazero has no component-model support and the host
-rejects wasip2 imports at link time.
+Every setting in a guest's release profile is load-bearing and
+`scripts/guest-build.md` says why. `hello-tinygo.wasm` beside the built guest
+is the frozen TinyGo build from the Go era, kept as the ABI conformance
+fixture and never rebuilt.
+
+## Browser client
+
+`web/` is Solid.js on Vite. `npm run build` there writes `web/dist`, which is
+committed because `crates/hive-webui` embeds it at compile time. The gate
+rebuilds it when npm is present and refuses a diff, so a change to `web/src`
+that nobody rebuilt cannot ship stale bytes.
+
+```bash
+cd web && npm install && npm run build
+```
 
 ## Development
 
-```powershell
-.\scripts\db-up.ps1      # Postgres on 127.0.0.1:55432, prints the connection string
-.\scripts\gate.ps1       # build, vet, lint, gofmt, test -race
-.\scripts\db-down.ps1    # -Purge also deletes the volume
-
-.\scripts\garage-up.ps1  # S3 on 127.0.0.1:53900, for the blob driver tests
-.\scripts\garage-down.ps1
-```
-
 ```bash
-./scripts/db-up.sh
-./scripts/gate.sh
-./scripts/db-down.sh
+./scripts/db-up.sh           # Postgres on 127.0.0.1:55432, prints the connection string
+./scripts/gate-rust.sh       # web build + diff, fmt, clippy, build, test, named skips
+./scripts/db-down.sh         # --purge also deletes the volume
 
-./scripts/garage-up.sh
+./scripts/garage-up.sh       # S3 on 127.0.0.1:53900, for the blob driver tests
 ./scripts/garage-down.sh
 
-# No Go toolchain on the machine? The same gate runs in a container;
-# Podman is all the host needs.
-./scripts/gate-container.sh
+./scripts/gate-container.sh  # the same gate, inside a Podman-built toolchain image
 ```
 
-End-to-end tests live in `test/e2e` and drive a real daemon over HTTP:
-
-```bash
-cd test/e2e && npm install && npm run browsers && npm test
-```
-
-Integration tests skip themselves when `HIVE_SANDBOX_TEST_DATABASE_URL` is
-unset, and the S3 driver tests do the same for the four `HIVE_SANDBOX_TEST_S3_*`
-variables `garage-up` prints. **The gate refuses to run without the database
-variable** rather than reporting green over a suite that never executed.
-In CI those skips are failures — the jobs that promise a backend set
-`HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS=1`, because a test that never executes
-proves nothing.
-
-wazero numbers that shape the runtime config, and how they were measured, are in
-[`docs/wasmhost-benchmarks.md`](docs/wasmhost-benchmarks.md).
-
-Nothing becomes a red PR. Run the gate locally first and read its output rather
-than a piped exit code. Full setup is in
-[`docs/development.md`](docs/development.md); conventions and the load-bearing
-invariants are in `CLAUDE.md`.
+`docs/development.md` goes from nothing to a passing test suite.

@@ -7,7 +7,7 @@ import { Client } from 'pg';
  *
  * Every worker gets its own schema on the shared test database and the daemon
  * migrates into it, so workers cannot see each other's events. That matters
- * more here than in the Go tests: an SSE spec asserts on what a stream did NOT
+ * more here than in the Rust tests: an SSE spec asserts on what a stream did NOT
  * deliver, and a stray event from another worker would look like a filtering
  * bug.
  */

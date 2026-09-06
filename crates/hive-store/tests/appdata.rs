@@ -186,6 +186,110 @@ impl AppFixture {
         n > 0
     }
 
+    /// A request made AS another install, so a test can be the mail app rather
+    /// than the app the fixture built.
+    fn req_from(
+        &self,
+        install: Uuid,
+        c: &Credential,
+        level: Level,
+        body: serde_json::Value,
+    ) -> Request {
+        Request {
+            caller: Caller::new(*c, install),
+            app: String::new(),
+            body: serde_json::to_vec(&body).unwrap(),
+            trust: level,
+            tainted_by: String::new(),
+        }
+    }
+
+    /// A second active install, for any owner, declaring one collection, built
+    /// through the same registry path as the first so the two cannot drift.
+    async fn second_app(
+        &self,
+        slug: &str,
+        collection: &str,
+        actor: Uuid,
+        owner: Owner,
+    ) -> (Uuid, hive_manifest::SchemaPlan) {
+        let m = Manifest {
+            kind: Some(Kind::App),
+            name: slug.into(),
+            version: 1,
+            storage: Storage {
+                collections: vec![Collection {
+                    name: collection.into(),
+                    ..Default::default()
+                }],
+            },
+            functions: vec![hive_manifest::Function {
+                name: "noop".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        m.validate().expect("manifest");
+        let plan = m
+            .schema_plan(owner.kind.as_str(), &owner.id.to_string())
+            .expect("schema plan");
+        let raw = serde_json::to_value(&m).unwrap();
+        let build_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
+                                     author_actor, owner_kind, owner_id, visibility, trust, status)
+             VALUES ($1, 'app', 'host', $2, $3, $4, $5, $6, 'private', 'builtin', 'registered')
+             RETURNING id",
+        )
+        .bind(slug)
+        .bind(&raw)
+        .bind(common::next_hash())
+        .bind(actor)
+        .bind(owner.kind.as_str())
+        .bind(owner.id)
+        .fetch_one(self.w.pool())
+        .await
+        .expect("register build");
+        let by = cred(actor, owner.kind, owner.id);
+        let mut conn = self.w.conn().await;
+        let install = stage_install(
+            &mut conn,
+            &InstallSpec {
+                build_id,
+                slug: slug.into(),
+                owner,
+            },
+            &by,
+        )
+        .await
+        .expect("stage install");
+        activate_install(&mut conn, install, &by)
+            .await
+            .expect("activate install");
+        drop(conn);
+        let mut tx = self.w.store.begin().await.unwrap();
+        hive_store::apply_schema_plan(&mut tx, &plan)
+            .await
+            .expect("apply schema plan");
+        tx.commit().await.unwrap();
+        (install, plan)
+    }
+
+    async fn drop_plan(&self, plan: &hive_manifest::SchemaPlan) {
+        let mut tx = self.w.store.begin().await.unwrap();
+        hive_store::drop_schema_plan(&mut tx, plan).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    /// Which install a document's entity row belongs to. The point of several
+    /// tests below is WHERE a write landed, not whether it succeeded.
+    async fn install_of(&self, doc: Uuid) -> Uuid {
+        sqlx::query_scalar("SELECT install_id FROM entities WHERE id = $1")
+            .bind(doc)
+            .fetch_one(self.w.pool())
+            .await
+            .unwrap()
+    }
+
     fn req(&self, c: &Credential, level: Level, body: serde_json::Value) -> Request {
         Request {
             caller: Caller::new(*c, self.install),
@@ -983,4 +1087,230 @@ async fn a_linked_reference_inherits_the_writes_taint() {
 #[allow(dead_code)]
 fn _owner(o: Owner) -> Owner {
     o
+}
+
+// --- qualified collection names (#86, D33) ----------------------------------
+
+/// A qualified name pointing back at your own install is the bare name. It
+/// must not need a grant to yourself, and the document must land in the same
+/// place either way.
+#[tokio::test]
+async fn a_qualified_name_for_your_own_app_is_the_bare_name() {
+    let Some((f, alice)) = AppFixture::install("qualified_own_app", "journal", "entries").await
+    else {
+        return;
+    };
+    let c = cred(alice, PrincipalKind::User, alice);
+
+    let bare = f
+        .insert(&c, Level::Trusted, serde_json::json!({"x": 1}))
+        .await;
+    let res = f
+        .data
+        .insert(f.req(
+            &c,
+            Level::Trusted,
+            serde_json::json!({"collection": "journal/entries", "doc": {"x": 2}}),
+        ))
+        .await
+        .expect("qualified insert into own app");
+    let out: serde_json::Value = serde_json::from_slice(&res.data).unwrap();
+    let qualified: Uuid = out["id"].as_str().unwrap().parse().unwrap();
+
+    assert_eq!(
+        f.install_of(bare).await,
+        f.install_of(qualified).await,
+        "`journal/entries` and `entries` landed in different installs"
+    );
+    f.cleanup().await;
+}
+
+/// The door, shut. Alice owns both apps, which is exactly the case the owner
+/// branch used to wave through (D33).
+#[tokio::test]
+async fn an_app_cannot_reach_another_apps_collection_without_a_grant() {
+    let Some((f, alice)) = AppFixture::install("qualified_no_grant", "journal", "entries").await
+    else {
+        return;
+    };
+    let c = cred(alice, PrincipalKind::User, alice);
+    let (mail, mail_plan) = f.second_app("mail", "messages", alice, user(alice)).await;
+
+    let err = f
+        .data
+        .insert(f.req_from(
+            mail,
+            &c,
+            Level::Trusted,
+            serde_json::json!({"collection": "journal/entries", "doc": {"x": 1}}),
+        ))
+        .await
+        .expect_err("mail reached the journal's collection with no grant");
+    assert_eq!(
+        status_of(&err),
+        Status::Denied,
+        "expected a denial on the collection, got {err}"
+    );
+
+    f.drop_plan(&mail_plan).await;
+    f.cleanup().await;
+}
+
+/// The door, open. Without this the test above passes for a bad reason: a
+/// resolver that refused every qualified name would satisfy it and make the
+/// feature unbuildable.
+#[tokio::test]
+async fn an_install_grant_opens_another_apps_collection() {
+    let Some((f, alice)) = AppFixture::install("qualified_with_grant", "journal", "entries").await
+    else {
+        return;
+    };
+    let c = cred(alice, PrincipalKind::User, alice);
+    let (mail, mail_plan) = f.second_app("mail", "messages", alice, user(alice)).await;
+
+    let mut conn = f.w.conn().await;
+    sqlx::query(
+        "INSERT INTO grants (subject_kind, subject_id, subject_name, target_kind,
+                             target_install_id, access, source, granted_by_actor,
+                             granted_by_principal_kind, granted_by_principal_id)
+         VALUES ('collection', $1, 'entries', 'install', $2, 'write', 'direct', $3, 'user', $3)",
+    )
+    .bind(f.install)
+    .bind(mail)
+    .bind(alice)
+    .execute(&mut *conn)
+    .await
+    .expect("write the install grant");
+    drop(conn);
+
+    let res = f
+        .data
+        .insert(f.req_from(
+            mail,
+            &c,
+            Level::Trusted,
+            serde_json::json!({"collection": "journal/entries", "doc": {"from": "mail"}}),
+        ))
+        .await
+        .expect("the granted app could not write");
+    let out: serde_json::Value = serde_json::from_slice(&res.data).unwrap();
+    let id: Uuid = out["id"].as_str().unwrap().parse().unwrap();
+
+    assert_eq!(
+        f.install_of(id).await,
+        f.install,
+        "the row landed somewhere other than the journal it was addressed to"
+    );
+
+    f.drop_plan(&mail_plan).await;
+    f.cleanup().await;
+}
+
+/// **The qualifier names an app, never an owner.**
+///
+/// This is the one that has to be a POSITIVE case. A denial proves nothing
+/// here: if resolution had wrongly picked alice's `journal` by slug alone, bob
+/// would be refused as a stranger, and "refused" would look identical to the
+/// correct answer. Refusals are over-determined (`CLAUDE.md`, *check which
+/// refusal*). So bob is granted access to BOB's journal, and the assertion is
+/// that his write lands there ... which can only happen if `journal/entries`
+/// resolved against the credential's owner rather than the slug.
+#[tokio::test]
+async fn the_qualifier_names_an_app_not_an_owner() {
+    let Some((f, _alice)) =
+        AppFixture::install("qualifier_is_per_owner", "journal", "entries").await
+    else {
+        return;
+    };
+    let bob = f.w.human("bob").await;
+    let bob_c = cred(bob, PrincipalKind::User, bob);
+
+    // Same slug, different owner. This is the collision the fifth instance of
+    // invariant 14 was about, arriving at a different door.
+    let (bobs_journal, bob_journal_plan) = f.second_app("journal", "entries", bob, user(bob)).await;
+    let (bobs_mail, bob_mail_plan) = f.second_app("mail", "messages", bob, user(bob)).await;
+    assert_ne!(bobs_journal, f.install, "the fixture needs two journals");
+
+    let mut conn = f.w.conn().await;
+    sqlx::query(
+        "INSERT INTO grants (subject_kind, subject_id, subject_name, target_kind,
+                             target_install_id, access, source, granted_by_actor,
+                             granted_by_principal_kind, granted_by_principal_id)
+         VALUES ('collection', $1, 'entries', 'install', $2, 'write', 'direct', $3, 'user', $3)",
+    )
+    .bind(bobs_journal)
+    .bind(bobs_mail)
+    .bind(bob)
+    .execute(&mut *conn)
+    .await
+    .expect("grant bob's mail access to bob's journal");
+    drop(conn);
+
+    let res = f
+        .data
+        .insert(f.req_from(
+            bobs_mail,
+            &bob_c,
+            Level::Trusted,
+            serde_json::json!({"collection": "journal/entries", "doc": {"whose": "bob"}}),
+        ))
+        .await
+        .expect("bob's mail could not write to bob's journal");
+    let out: serde_json::Value = serde_json::from_slice(&res.data).unwrap();
+    let id: Uuid = out["id"].as_str().unwrap().parse().unwrap();
+
+    assert_eq!(
+        f.install_of(id).await,
+        bobs_journal,
+        "`journal/entries` resolved to the wrong owner's journal"
+    );
+
+    // And alice's journal never saw it.
+    let in_alices: i64 = sqlx::query_scalar("SELECT count(*) FROM entities WHERE install_id = $1")
+        .bind(f.install)
+        .fetch_one(f.w.pool())
+        .await
+        .unwrap();
+    assert_eq!(in_alices, 0, "bob's write reached alice's journal");
+
+    f.drop_plan(&bob_mail_plan).await;
+    f.drop_plan(&bob_journal_plan).await;
+    f.cleanup().await;
+}
+
+/// Syntax. Each of these is refused before anything is resolved, and the point
+/// of listing them is that a qualifier reaches a schema lookup: `..`, an empty
+/// side and a second separator all have to be answers rather than surprises.
+#[tokio::test]
+async fn a_malformed_qualified_name_is_refused() {
+    let Some((f, alice)) = AppFixture::install("qualified_syntax", "journal", "entries").await
+    else {
+        return;
+    };
+    let c = cred(alice, PrincipalKind::User, alice);
+    for name in [
+        "a/b/c",
+        "/entries",
+        "journal/",
+        "JOURNAL/entries",
+        "journal/Entries",
+        "../entries",
+        "journal/entries; drop table entities",
+    ] {
+        let err = f
+            .data
+            .insert(f.req(
+                &c,
+                Level::Trusted,
+                serde_json::json!({"collection": name, "doc": {"x": 1}}),
+            ))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("collection {name:?} was accepted"));
+        assert!(
+            matches!(status_of(&err), Status::Invalid | Status::NotFound),
+            "collection {name:?} returned {err}"
+        );
+    }
+    f.cleanup().await;
 }

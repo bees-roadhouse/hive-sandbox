@@ -30,7 +30,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use hive_blob::{Catalog, Hash, RefSpec, SourceKind};
-use hive_identity::{Owner, PrincipalKind};
+use hive_identity::{Credential, Owner, PrincipalKind};
 use hive_trust::Level;
 use hive_wasmhost::{HostError, Request, Response, Storage};
 use serde::{Deserialize, Serialize};
@@ -171,8 +171,13 @@ fn host_error(e: StoreError, as_not_found: bool) -> HostError {
     }
 }
 
-/// Decodes the body and validates the collection against the manifest.
-fn parse(req: &Request, declared: &HashSet<String>) -> Result<DocRequest> {
+/// Decodes the body and validates the SHAPE of the collection name.
+///
+/// It does not decide whether the collection exists or may be touched. A
+/// qualified name (`core/contacts`, `journal/entries`) names another install's
+/// collection, and both of those questions belong to the target install, which
+/// nothing here has resolved yet.
+fn parse(req: &Request) -> Result<DocRequest> {
     let d: DocRequest = if req.body.is_empty() {
         DocRequest::default()
     } else {
@@ -185,22 +190,73 @@ fn parse(req: &Request, declared: &HashSet<String>) -> Result<DocRequest> {
             "collection is required",
         )));
     }
-    if check_ident(&d.collection).is_err() {
-        return Err(StoreError::Host(HostError::invalid(format!(
-            "collection {:?} is not a valid name",
-            d.collection
-        ))));
-    }
-    // Declared in the manifest, or it does not exist for this app. The host
-    // owns all DDL, so an undeclared collection has no table and asking for one
-    // is a manifest error rather than a missing row.
-    if !declared.contains(&d.collection) {
-        return Err(StoreError::Host(HostError::not_found(format!(
-            "collection {:?} is not declared by this app",
-            d.collection
-        ))));
-    }
+    QualifiedName::parse(&d.collection)?;
     Ok(d)
+}
+
+/// A collection name as a guest wrote it: `contacts`, or `core/contacts`, or
+/// `journal/entries`.
+///
+/// The qualifier names an app, never an owner. There is deliberately no syntax
+/// for "someone else's journal": the owner is taken from the CREDENTIAL when
+/// this is resolved, so a guest has no way to spell a principal it is not
+/// acting for. Invariant 11 ... the resolver must not accept the fact it is
+/// deciding, and "whose data" is exactly that fact.
+#[derive(Debug, PartialEq, Eq)]
+struct QualifiedName<'a> {
+    /// `None` for the caller's own install.
+    app: Option<&'a str>,
+    collection: &'a str,
+}
+
+/// The reserved qualifier for the per-owner core install that holds the
+/// platform kinds (entries, tasks, lists, contacts, decisions).
+const CORE_APP: &str = "core";
+
+impl<'a> QualifiedName<'a> {
+    fn parse(raw: &'a str) -> Result<QualifiedName<'a>> {
+        let invalid = |what: &str| {
+            StoreError::Host(HostError::invalid(format!(
+                "collection {raw:?} is not a valid name: {what}"
+            )))
+        };
+        let (app, collection) = match raw.split_once('/') {
+            None => (None, raw),
+            // Two separators is not a deeper namespace, it is a typo or a
+            // probe. Refusing is cheaper than deciding what it would mean.
+            Some((_, rest)) if rest.contains('/') => {
+                return Err(invalid("at most one '/'"));
+            }
+            Some(("", _)) => return Err(invalid("empty app qualifier")),
+            Some((app, collection)) => (Some(app), collection),
+        };
+        if let Some(app) = app {
+            // The qualifier reaches DDL as a schema lookup, never as SQL, but
+            // it is held to the same identifier rule as everything else so
+            // there is one answer to "what may a name contain".
+            check_ident(app).map_err(|_| invalid("app qualifier"))?;
+        }
+        check_ident(collection).map_err(|_| invalid("collection"))?;
+        Ok(QualifiedName { app, collection })
+    }
+}
+
+/// Where a verb is actually operating: the install owning the collection, the
+/// bare collection name, and whether that install is the caller's own.
+struct Target {
+    info: InstallInfo,
+    collection: String,
+    /// The caller reached this through some OTHER install, so the collection
+    /// gate applies (D33).
+    ///
+    /// This flag was removed once as "a second copy of the comparison the
+    /// predicate already makes", and the suite put it straight back: it does
+    /// not duplicate that comparison, it decides whether to ASK. Gating every
+    /// read on the collection broke entity sharing outright ... a grantee holds
+    /// a grant on one ROW in someone else's install and has no collection-level
+    /// standing at all, which is the whole D13 sharing model. Within one
+    /// install the entity check governs, as it always has.
+    cross: bool,
 }
 
 impl DocRequest {
@@ -249,6 +305,93 @@ async fn resolve(
     Ok((info, declared))
 }
 
+/// Turns the name a guest wrote into the install that actually owns it.
+///
+/// The whole safety of the qualified form lives in one line of this function:
+/// the owner comes from `cred.owner_of()`, never from the request. A guest can
+/// name an app; it cannot name a principal. So `core/contacts` means "the core
+/// install of whoever this call is acting for", and there is no spelling of
+/// "alice's core" available to bob's app ... not because it is filtered out,
+/// but because the syntax has nowhere to put it (invariant 11).
+///
+/// The install is looked up by `(slug, owner)`, both dimensions, because a slug
+/// alone is not a key: two people can install the same app and the schema is a
+/// property of the install (invariant 14, the fifth instance).
+async fn resolve_target(
+    conn: &mut PgConnection,
+    caller: &InstallInfo,
+    cred: &Credential,
+    raw: &str,
+) -> Result<Target> {
+    let q = QualifiedName::parse(raw)?;
+    let Some(app) = q.app else {
+        return Ok(Target {
+            info: caller.clone(),
+            collection: q.collection.to_string(),
+            cross: false,
+        });
+    };
+
+    let owner = cred.owner_of();
+    let slug = if app == CORE_APP { CORE_APP } else { app };
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM installs
+          WHERE slug = $1 AND owner_kind = $2 AND owner_id = $3 AND state = 'active'",
+    )
+    .bind(slug)
+    .bind(owner.kind.as_str())
+    .bind(owner.id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| StoreError::db("resolve target install", e))?;
+
+    // Not-there and not-yours are one answer. A guest that could tell them
+    // apart could enumerate which apps a principal has installed.
+    let (target_id,) = row.ok_or_else(|| {
+        StoreError::Host(HostError::not_found(format!("no active app {app:?} here")))
+    })?;
+
+    let info = resolve_active_install(&mut *conn, target_id).await?;
+    // A qualified name that resolves back to the caller's own install is not
+    // cross-install ... `journal/entries` written by the journal is the same
+    // thing as `entries`, and must not need a grant to itself.
+    let cross = info.id != caller.id;
+    Ok(Target {
+        info,
+        collection: q.collection.to_string(),
+        cross,
+    })
+}
+
+impl Target {
+    /// The collection has to be one the TARGET declares, not one the caller
+    /// wishes existed. The host owns all DDL, so an undeclared collection has
+    /// no table behind it and asking for one is a manifest error rather than a
+    /// missing row.
+    fn declared(&self) -> Result<()> {
+        if !self.info.collections.iter().any(|c| c == &self.collection) {
+            return Err(StoreError::Host(HostError::not_found(format!(
+                "collection {:?} is not declared by {:?}",
+                self.collection, self.info.slug
+            ))));
+        }
+        Ok(())
+    }
+
+    fn table(&self) -> String {
+        table(&self.info.schema, &self.collection)
+    }
+
+    /// D33's dimension. Not an `Option`, and that is the point rather than an
+    /// oversight: a guest invocation IS an install by definition, so there is
+    /// no guest path on which the acting install is unknown. The
+    /// no-install case has its own method on `Guard`
+    /// (`authorize_collection_as_person`) and never reaches this file.
+    fn acting(caller: &InstallInfo) -> ActingInstall {
+        ActingInstall(caller.id)
+    }
+}
+
 impl AppData {
     /// Wires the data layer over a store and a catalog.
     pub fn new(store: Store, blobs: Arc<Catalog>) -> AppData {
@@ -257,21 +400,24 @@ impl AppData {
 
     async fn insert_inner(&self, req: &Request) -> Result<Response> {
         let mut tx = self.store.begin().await?;
-        let (info, declared) = resolve(&mut tx, req.caller.install_id).await?;
-        let d = parse(req, &declared)?;
+        let (info, _) = resolve(&mut tx, req.caller.install_id).await?;
+        let d = parse(req)?;
+        let target = resolve_target(&mut tx, &info, &req.caller.cred, &d.collection).await?;
+        target.declared()?;
 
         // Writing into a collection is a write on the collection, and the
         // predicate decides it. An app's own principal reads 'owner' here; a
-        // guest acting for anyone else needs a grant.
+        // guest acting for anyone else needs a grant, and a guest reaching
+        // ANOTHER app's collection needs one written to this install (D33).
         let guard = self.store.guard();
         guard
             .authorize_collection(
                 &mut tx,
                 &req.caller.cred,
-                &Subject::collection(info.id, &d.collection),
+                &Subject::collection(target.info.id, &target.collection),
                 // The invocation IS an install, always: this signature has no
                 // way to say otherwise, which is the point.
-                ActingInstall(req.caller.install_id),
+                Target::acting(&info),
                 Access::Write,
                 "storage.insert",
             )
@@ -285,7 +431,7 @@ impl AppData {
             d.r#ref.clone()
         };
         let kind = if d.kind.is_empty() {
-            d.collection.clone()
+            target.collection.clone()
         } else {
             d.kind.clone()
         };
@@ -302,8 +448,12 @@ impl AppData {
              RETURNING id, created_at",
         )
         .bind(&kind)
-        .bind(info.id)
-        .bind(&d.collection)
+        // The entity row belongs to the install whose schema holds the
+        // document, or the UNIQUE (install_id, collection, ref) that keeps refs
+        // distinct would be keyed on the wrong install and read_doc's join
+        // would miss (invariant 14).
+        .bind(target.info.id)
+        .bind(&target.collection)
         .bind(&r#ref)
         .bind(owner.kind.as_str())
         .bind(owner.id)
@@ -318,7 +468,7 @@ impl AppData {
 
         sqlx::query(&format!(
             "INSERT INTO {} (id, doc, trust, tainted_by, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$5)",
-            table(&info.schema, &d.collection)
+            target.table()
         ))
         .bind(id)
         .bind(&doc)
@@ -339,8 +489,8 @@ impl AppData {
         self.emit(
             &mut tx,
             req,
-            &info,
-            &d.collection,
+            &target.info,
+            &target.collection,
             id,
             owner,
             level,
@@ -360,8 +510,35 @@ impl AppData {
 
     async fn get_inner(&self, req: &Request) -> Result<Response> {
         let mut conn = self.store.conn().await?;
-        let (info, declared) = resolve(&mut conn, req.caller.install_id).await?;
-        let d = parse(req, &declared)?;
+        let (info, _) = resolve(&mut conn, req.caller.install_id).await?;
+        let d = parse(req)?;
+        let target = resolve_target(&mut conn, &info, &req.caller.cred, &d.collection).await?;
+        target.declared()?;
+
+        // D33, and ONLY when the collection belongs to another install. It is
+        // not redundant with the entity check that follows and it does not
+        // replace it: an entity subject resolves to the PRINCIPAL who owns the
+        // row, so on its own it cannot tell one of that principal's apps from
+        // another. The collection check asks "may THIS app be in here at all",
+        // the entity check asks "and may this principal have this row".
+        //
+        // Within one install there is no collection question to ask, and asking
+        // it anyway denies every grantee: a person shared one entry with holds
+        // a grant on that ROW and no standing on the collection it lives in.
+        if target.cross {
+            self.store
+                .guard()
+                .authorize_collection(
+                    &mut conn,
+                    &req.caller.cred,
+                    &Subject::collection(target.info.id, &target.collection),
+                    Target::acting(&info),
+                    Access::Read,
+                    "storage.get",
+                )
+                .await
+                .map_err(|e| StoreError::Host(host_error(e, true)))?;
+        }
 
         let id = if !d.id.is_empty() {
             d.doc_id()?
@@ -369,8 +546,8 @@ impl AppData {
             let id: Option<Uuid> = sqlx::query_scalar(
                 "SELECT id FROM entities WHERE install_id = $1 AND collection = $2 AND ref = $3 AND deleted_at IS NULL",
             )
-            .bind(info.id)
-            .bind(&d.collection)
+            .bind(target.info.id)
+            .bind(&target.collection)
             .bind(&d.r#ref)
             .fetch_optional(&mut *conn)
             .await
@@ -396,7 +573,9 @@ impl AppData {
             .await
             .map_err(|e| StoreError::Host(host_error(e, true)))?;
 
-        let row = self.read_doc(&mut conn, &info, &d.collection, id).await?;
+        let row = self
+            .read_doc(&mut conn, &target.info, &target.collection, id)
+            .await?;
         // The response's trust is the ROW's, never the request's. "The caller
         // asked for trusted data, so return Trusted" reads as reasonable and is
         // a laundering machine.
@@ -427,9 +606,29 @@ impl AppData {
 
     async fn update_inner(&self, req: &Request) -> Result<Response> {
         let mut tx = self.store.begin().await?;
-        let (info, declared) = resolve(&mut tx, req.caller.install_id).await?;
-        let d = parse(req, &declared)?;
+        let (info, _) = resolve(&mut tx, req.caller.install_id).await?;
+        let d = parse(req)?;
+        let target = resolve_target(&mut tx, &info, &req.caller.cred, &d.collection).await?;
+        target.declared()?;
         let id = d.doc_id()?;
+
+        // The collection gate first when this is another app's collection, for
+        // the reason given in `get_inner`, and skipped within one install for
+        // the same reason: a write-grantee holds the row, not the collection.
+        if target.cross {
+            self.store
+                .guard()
+                .authorize_collection(
+                    &mut tx,
+                    &req.caller.cred,
+                    &Subject::collection(target.info.id, &target.collection),
+                    Target::acting(&info),
+                    Access::Write,
+                    "storage.update",
+                )
+                .await
+                .map_err(|e| StoreError::Host(host_error(e, true)))?;
+        }
 
         self.store
             .guard()
@@ -460,7 +659,7 @@ impl AppData {
             "UPDATE {} SET doc = $2, trust = $3, tainted_by = coalesce($4, tainted_by), updated_at = now()
               WHERE id = $1
               RETURNING updated_at",
-            table(&info.schema, &d.collection)
+            target.table()
         ))
         .bind(id)
         .bind(&doc)
@@ -488,8 +687,8 @@ impl AppData {
         self.emit(
             &mut tx,
             req,
-            &info,
-            &d.collection,
+            &target.info,
+            &target.collection,
             id,
             owner,
             level,
@@ -510,9 +709,26 @@ impl AppData {
     /// because override grants are read-only by CHECK.
     async fn delete_inner(&self, req: &Request) -> Result<Response> {
         let mut tx = self.store.begin().await?;
-        let (info, declared) = resolve(&mut tx, req.caller.install_id).await?;
-        let d = parse(req, &declared)?;
+        let (info, _) = resolve(&mut tx, req.caller.install_id).await?;
+        let d = parse(req)?;
+        let target = resolve_target(&mut tx, &info, &req.caller.cred, &d.collection).await?;
+        target.declared()?;
         let id = d.doc_id()?;
+
+        if target.cross {
+            self.store
+                .guard()
+                .authorize_collection(
+                    &mut tx,
+                    &req.caller.cred,
+                    &Subject::collection(target.info.id, &target.collection),
+                    Target::acting(&info),
+                    Access::Write,
+                    "storage.delete",
+                )
+                .await
+                .map_err(|e| StoreError::Host(host_error(e, true)))?;
+        }
 
         let reason = self
             .store
@@ -532,14 +748,11 @@ impl AppData {
             ))));
         }
 
-        sqlx::query(&format!(
-            "DELETE FROM {} WHERE id = $1",
-            table(&info.schema, &d.collection)
-        ))
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| StoreError::db("delete document", e))?;
+        sqlx::query(&format!("DELETE FROM {} WHERE id = $1", target.table()))
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::db("delete document", e))?;
         let res = sqlx::query("DELETE FROM entities WHERE id = $1")
             .bind(id)
             .execute(&mut *tx)
@@ -567,8 +780,8 @@ impl AppData {
         self.emit(
             &mut tx,
             req,
-            &info,
-            &d.collection,
+            &target.info,
+            &target.collection,
             id,
             owner,
             Level::Trusted,
@@ -591,8 +804,35 @@ impl AppData {
     /// query to filter on by mistake.
     async fn query_inner(&self, req: &Request) -> Result<Response> {
         let mut conn = self.store.conn().await?;
-        let (info, declared) = resolve(&mut conn, req.caller.install_id).await?;
-        let d = parse(req, &declared)?;
+        let (info, _) = resolve(&mut conn, req.caller.install_id).await?;
+        let d = parse(req)?;
+        let target = resolve_target(&mut conn, &info, &req.caller.cred, &d.collection).await?;
+        target.declared()?;
+
+        // D33, and ONLY when the collection belongs to another install. It is
+        // not redundant with the entity check that follows and it does not
+        // replace it: an entity subject resolves to the PRINCIPAL who owns the
+        // row, so on its own it cannot tell one of that principal's apps from
+        // another. The collection check asks "may THIS app be in here at all",
+        // the entity check asks "and may this principal have this row".
+        //
+        // Within one install there is no collection question to ask, and asking
+        // it anyway denies every grantee: a person shared one entry with holds
+        // a grant on that ROW and no standing on the collection it lives in.
+        if target.cross {
+            self.store
+                .guard()
+                .authorize_collection(
+                    &mut conn,
+                    &req.caller.cred,
+                    &Subject::collection(target.info.id, &target.collection),
+                    Target::acting(&info),
+                    Access::Read,
+                    "storage.query",
+                )
+                .await
+                .map_err(|e| StoreError::Host(host_error(e, true)))?;
+        }
 
         let limit = if d.limit <= 0 || d.limit > 200 {
             50
@@ -622,7 +862,7 @@ impl AppData {
                 AND access_reason('entity', e.id, NULL, $4, $5, $6, 'read', now()) IS NOT NULL
               ORDER BY t.created_at DESC, t.id DESC
               LIMIT $7",
-            table(&info.schema, &d.collection)
+            target.table()
         ))
         .bind(&d.kind)
         .bind(&r#match)
@@ -775,6 +1015,18 @@ impl AppData {
     /// write itself (D14.2: with no second writer, every write produces an
     /// event, so mentions fire by construction).
     #[allow(clippy::too_many_arguments)]
+    /// The event names the install that OWNS the collection, not the one that
+    /// did the writing.
+    ///
+    /// It is a derived name, so invariant 14 applies to it: keyed on the writer
+    /// it would split one collection's stream across every app with a grant,
+    /// and `journal.entries.created` would silently stop covering writes to the
+    /// journal's entries. Nothing would error; a subscriber would just quietly
+    /// stop seeing some of them.
+    ///
+    /// Who did it is not lost by leaving them out of the kind. The event
+    /// carries the credential, which pins author and principal separately
+    /// (invariant 2), and that is where "which app wrote this" belongs.
     async fn emit(
         &self,
         tx: &mut PgConnection,

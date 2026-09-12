@@ -603,6 +603,7 @@ fn prepared_for(name: &str, owner: hive_identity::Owner) -> hive_registry::Insta
                 crud: true,
                 indexes: vec!["btree(created)".into()],
             }],
+            uses: vec![],
         },
         ..Default::default()
     };

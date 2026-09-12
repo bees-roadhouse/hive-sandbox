@@ -216,6 +216,7 @@ impl World {
                     name: "entries".into(),
                     ..Default::default()
                 }],
+                uses: vec![],
             },
             functions: vec![
                 Function {
@@ -265,6 +266,7 @@ impl World {
                     crud: true,
                     ..Default::default()
                 }],
+                uses: vec![],
             },
             ..Default::default()
         };

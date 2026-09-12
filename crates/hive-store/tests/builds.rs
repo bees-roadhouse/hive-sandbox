@@ -28,6 +28,7 @@ fn prepared_for(name: &str, owner: Owner) -> hive_registry::InstallSpec {
                 crud: true,
                 indexes: vec!["btree(created)".into()],
             }],
+            uses: vec![],
         },
         ..Default::default()
     };
@@ -558,7 +559,10 @@ fn plan_for(app: &str, collections: Vec<Collection>) -> SchemaPlan {
         kind: Some(Kind::App),
         name: app.into(),
         version: 1,
-        storage: Storage { collections },
+        storage: Storage {
+            collections,
+            uses: vec![],
+        },
         functions: vec![hive_manifest::Function {
             name: "noop".into(),
             ..Default::default()

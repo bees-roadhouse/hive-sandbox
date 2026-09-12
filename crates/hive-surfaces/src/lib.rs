@@ -563,6 +563,7 @@ mod tests {
                     crud: true,
                     ..Default::default()
                 }],
+                uses: vec![],
             },
             functions: vec![hive_manifest::Function {
                 name: "recent".into(),

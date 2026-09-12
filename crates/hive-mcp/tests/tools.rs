@@ -33,6 +33,7 @@ fn journal_surface() -> Surface {
                 crud: true,
                 indexes: vec![],
             }],
+            uses: vec![],
         },
         functions: vec![Function {
             name: "add_entry".into(),
@@ -316,6 +317,7 @@ async fn hidden_tools_are_neither_listed_nor_callable() {
                 crud: true,
                 indexes: vec![],
             }],
+            uses: vec![],
         },
         tools: vec![ToolDef {
             name: "drafts.delete".into(),

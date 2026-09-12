@@ -28,6 +28,7 @@ fn journal_install() -> Install {
                 name: "entries".into(),
                 ..Default::default()
             }],
+            uses: vec![],
         },
         functions: vec![hive_manifest::Function {
             name: "add_entry".into(),

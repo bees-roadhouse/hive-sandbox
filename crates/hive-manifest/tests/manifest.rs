@@ -24,6 +24,7 @@ fn journalish() -> Manifest {
                     indexes: vec![],
                 },
             ],
+            uses: vec![],
         },
         functions: vec![
             Function {
@@ -826,6 +827,7 @@ fn golden_manifest() -> Manifest {
                     indexes: vec![],
                 },
             ],
+            uses: vec![],
         },
         functions: vec![
             Function {
@@ -979,5 +981,160 @@ fn golden_fixture_reaches_every_branch() {
         drafts_post.r#impl,
         Impl::Guest,
         "the route override branch did not run"
+    );
+}
+
+// --- `uses`: the one place a manifest points outward (#86, D32.3, D33) ------
+
+fn with_uses(app: &str, uses: Vec<hive_manifest::Use>) -> Manifest {
+    Manifest {
+        kind: Some(Kind::App),
+        name: app.into(),
+        version: 1,
+        storage: Storage {
+            collections: vec![Collection {
+                name: "messages".into(),
+                crud: false,
+                indexes: vec![],
+            }],
+            uses,
+        },
+        functions: vec![hive_manifest::Function {
+            name: "noop".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+fn a_use(app: &str, collection: &str, access: hive_manifest::UseAccess) -> hive_manifest::Use {
+    hive_manifest::Use {
+        app: app.into(),
+        collection: collection.into(),
+        access,
+    }
+}
+
+#[test]
+fn a_manifest_may_ask_for_another_apps_collection() {
+    use hive_manifest::UseAccess;
+    let m = with_uses(
+        "mail",
+        vec![
+            a_use("core", "contacts", UseAccess::Read),
+            a_use("journal", "entries", UseAccess::Write),
+        ],
+    );
+    m.validate().expect("a straightforward uses declaration");
+    assert_eq!(m.storage.used_apps(), vec!["core", "journal"]);
+}
+
+/// Access defaults to `read`. A manifest that omits it must not silently ask
+/// for write ... this is a value an AI writes and a human approves, and the
+/// safe reading of silence is the narrow one.
+#[test]
+fn an_omitted_access_is_read() {
+    let m: Manifest = serde_json::from_value(serde_json::json!({
+        "kind": "app",
+        "name": "mail",
+        "version": 1,
+        "storage": {
+            "collections": [{"name": "messages"}],
+            "uses": [{"app": "core", "collection": "contacts"}]
+        },
+        "functions": [{"name": "noop"}]
+    }))
+    .expect("parse");
+    m.validate().expect("valid");
+    assert_eq!(m.storage.uses[0].access, hive_manifest::UseAccess::Read);
+}
+
+/// Declaring a use of your own collection is refused, and the reason is not
+/// tidiness. It resolves to this install, so the grant is never consulted and
+/// the declaration does nothing ... while the promotion surface would show the
+/// activator a permission they are not actually granting. A no-op that reads
+/// as a permission is worse than an error.
+#[test]
+fn an_app_cannot_declare_a_use_of_itself() {
+    use hive_manifest::UseAccess;
+    let m = with_uses("mail", vec![a_use("mail", "messages", UseAccess::Read)]);
+    let errs = m.validate().expect_err("a self-use was accepted");
+    assert!(
+        format!("{errs}").contains("its own collections are declared in"),
+        "wrong refusal: {errs}"
+    );
+}
+
+/// Two entries for one pair is refused rather than resolved. Which one wins
+/// would otherwise depend on iteration order, and the manifest that looks
+/// narrower could be the one that grants write.
+#[test]
+fn a_duplicate_use_is_refused() {
+    use hive_manifest::UseAccess;
+    let m = with_uses(
+        "mail",
+        vec![
+            a_use("journal", "entries", UseAccess::Read),
+            a_use("journal", "entries", UseAccess::Write),
+        ],
+    );
+    let errs = m.validate().expect_err("a duplicate use was accepted");
+    assert!(
+        format!("{errs}").contains("duplicate name"),
+        "wrong refusal: {errs}"
+    );
+}
+
+/// A tool owns no data; reaching into someone else's is the worst of both.
+#[test]
+fn a_tool_declares_no_uses() {
+    use hive_manifest::UseAccess;
+    let mut m = with_uses("shorten", vec![a_use("core", "contacts", UseAccess::Read)]);
+    m.kind = Some(Kind::Tool);
+    m.storage.collections.clear();
+    let errs = m.validate().expect_err("a tool declared uses");
+    assert!(
+        format!("{errs}").contains("declares uses"),
+        "wrong refusal: {errs}"
+    );
+}
+
+/// Names are held to the same rule as every other identifier, and the
+/// assertion names WHICH refusal because a malformed manifest is refusable
+/// several ways at once.
+#[test]
+fn a_malformed_use_names_its_problem() {
+    use hive_manifest::UseAccess;
+    for (app, collection) in [
+        ("Journal", "entries"),
+        ("journal", "Entries"),
+        ("", "entries"),
+        ("journal", ""),
+        ("journal/entries", "x"),
+    ] {
+        let m = with_uses("mail", vec![a_use(app, collection, UseAccess::Read)]);
+        let errs = m
+            .validate()
+            .expect_err(&format!("use {app:?}/{collection:?} was accepted"));
+        // Assert the message, not merely that something was refused: a
+        // malformed manifest is refusable several ways at once, and "it was
+        // refused" would pass if the fixture tripped an unrelated rule.
+        assert!(
+            format!("{errs}").contains("invalid uses declaration"),
+            "use {app:?}/{collection:?} was refused as something else: {errs}"
+        );
+    }
+}
+
+/// An empty `uses` serialises to nothing, so adding the field did not change
+/// any manifest already written. The golden fixture covers the same property
+/// from the other side.
+#[test]
+fn an_empty_uses_is_absent_from_the_json() {
+    let m = with_uses("mail", vec![]);
+    let raw = serde_json::to_value(&m).unwrap();
+    assert!(
+        raw["storage"].get("uses").is_none(),
+        "an empty uses was serialised: {raw}"
     );
 }

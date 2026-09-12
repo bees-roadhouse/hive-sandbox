@@ -47,6 +47,7 @@ impl AppFixture {
                     name: collection.into(),
                     ..Default::default()
                 }],
+                uses: vec![],
             },
             functions: vec![hive_manifest::Function {
                 name: "noop".into(),

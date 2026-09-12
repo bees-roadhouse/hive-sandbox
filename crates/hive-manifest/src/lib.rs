@@ -113,12 +113,85 @@ pub struct Manifest {
 pub struct Storage {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collections: Vec<Collection>,
+
+    /// Collections in OTHER installs this app asks to reach.
+    ///
+    /// This is the one place the manifest points outward, and it is shaped like
+    /// a capability rather than like an access rule: the app states a need, and
+    /// the human who activates the install is the one who grants it (D19). The
+    /// registry derives the collection grants from these and writes them at
+    /// activation; nothing here decides anything at request time.
+    ///
+    /// It does not contradict "a manifest never says who may reach it". That
+    /// rule is about an app declaring who may reach IT. This declares what the
+    /// app wants to reach, which is a request the activator answers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<Use>,
 }
 
 impl Storage {
     pub fn is_empty(&self) -> bool {
-        self.collections.is_empty()
+        self.collections.is_empty() && self.uses.is_empty()
     }
+
+    /// The apps this one asks to reach, deduplicated, in declaration order.
+    ///
+    /// For the promotion surface. Whoever activates an install is the person
+    /// granting these (D19), and "this app wants into your journal" is the
+    /// sentence they need to see ... a list of collections buries it.
+    pub fn used_apps(&self) -> Vec<&str> {
+        let mut seen = HashSet::new();
+        self.uses
+            .iter()
+            .map(|u| u.app.as_str())
+            .filter(|a| seen.insert(*a))
+            .collect()
+    }
+}
+
+/// How far into someone else's collection an app is asking to reach.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UseAccess {
+    #[default]
+    Read,
+    Write,
+}
+
+impl UseAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UseAccess::Read => "read",
+            UseAccess::Write => "write",
+        }
+    }
+}
+
+impl fmt::Display for UseAccess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One collection in ANOTHER install that this app asks to reach (D32 section
+/// 3, mechanism per D33).
+///
+/// `app` names an app, never an owner, and that is the whole of why this is
+/// safe to let an app author write: the install it resolves to is found by
+/// `(slug, owner)` where the owner comes from the credential at call time. A
+/// manifest cannot spell "alice's journal" because there is no field for a
+/// principal and no field is coming ... adding one would let a file the app
+/// author controls name whose data it wants, which is the thing invariant 11
+/// exists to prevent.
+///
+/// `core` is the reserved qualifier for the per-owner install holding the
+/// platform kinds (entries, tasks, lists, contacts, decisions).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Use {
+    pub app: String,
+    pub collection: String,
+    #[serde(default)]
+    pub access: UseAccess,
 }
 
 /// One JSON document store inside the app's schema.
@@ -223,6 +296,8 @@ pub enum ErrorKind {
     Route,
     /// invalid index declaration
     Index,
+    /// invalid `uses` declaration
+    Uses,
 }
 
 impl ErrorKind {
@@ -237,6 +312,7 @@ impl ErrorKind {
             ErrorKind::ReservedName => "manifest: name collides with a generated one",
             ErrorKind::Route => "manifest: invalid route",
             ErrorKind::Index => "manifest: invalid index declaration",
+            ErrorKind::Uses => "manifest: invalid uses declaration",
         }
     }
 }
@@ -347,6 +423,13 @@ impl Manifest {
                     ErrorKind::ToolTier,
                     format!("{:?} declares storage", self.name),
                 );
+            } else if !self.storage.uses.is_empty() {
+                // A tool owning no data and reaching into someone else's is the
+                // worst of both: no schema to provision and a grant to write.
+                err(
+                    ErrorKind::ToolTier,
+                    format!("{:?} declares uses", self.name),
+                );
             } else if !self.routes.is_empty() {
                 err(
                     ErrorKind::ToolTier,
@@ -377,6 +460,51 @@ impl Manifest {
             }
             if !funcs.insert(f.name.as_str()) {
                 err(ErrorKind::Duplicate, format!("function {:?}", f.name));
+            }
+        }
+
+        // `uses` points at another install, so everything here is about the
+        // name being resolvable rather than about the name being safe: a bad
+        // one cannot reach DDL, it simply resolves to nothing. The checks that
+        // matter are the ones a typo would otherwise turn into a silent no-op.
+        let mut uses: HashSet<(&str, &str)> = HashSet::with_capacity(self.storage.uses.len());
+        for u in &self.storage.uses {
+            if !NAME_RE.is_match(&u.app) {
+                err(ErrorKind::Uses, format!("app {:?}", u.app));
+                continue;
+            }
+            if !NAME_RE.is_match(&u.collection) {
+                err(
+                    ErrorKind::Uses,
+                    format!("collection {:?} of app {:?}", u.collection, u.app),
+                );
+                continue;
+            }
+            // Declaring a use of yourself is not an error the host would ever
+            // notice: it resolves to this install, `cross` is false and the
+            // grant is never consulted. So the declaration would sit in the
+            // manifest looking meaningful and doing nothing, and the promotion
+            // surface would show the activator a permission they are not
+            // actually granting. Refuse it here, where it is still a typo.
+            if u.app == self.name {
+                err(
+                    ErrorKind::Uses,
+                    format!(
+                        "{:?} declares a use of its own collection {:?}; its own collections are declared in `collections`",
+                        self.name, u.collection
+                    ),
+                );
+                continue;
+            }
+            if !uses.insert((u.app.as_str(), u.collection.as_str())) {
+                // Two entries for one pair differing only in access is the
+                // dangerous shape, because which one wins would then depend on
+                // iteration order and the weaker-looking manifest could be the
+                // one that grants write.
+                err(
+                    ErrorKind::Duplicate,
+                    format!("use of {:?}/{:?}", u.app, u.collection),
+                );
             }
         }
 

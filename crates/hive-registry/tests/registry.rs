@@ -27,6 +27,7 @@ fn journalish() -> Manifest {
                     ..Default::default()
                 },
             ],
+            uses: vec![],
         },
         functions: vec![
             Function {
@@ -59,6 +60,7 @@ fn crud_only() -> Manifest {
                 crud: true,
                 ..Default::default()
             }],
+            uses: vec![],
         },
         ..Default::default()
     }

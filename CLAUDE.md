@@ -138,6 +138,17 @@ even if the tests pass.
 Nothing becomes a visible PR red. Run the gate locally before pushing; read the
 gate's OUTPUT, never the exit code of a piped command.
 
+**On the shared desktop, "the gate" means the targeted suites for what you
+changed, and CI is the full one.** `gate-rust.sh` builds `--all-targets` across
+the workspace, which is the expensive shape on purpose ... it is how a test
+crate that does not compile gets caught. Running it per change on a machine
+somebody is also using is what takes that machine down, and it has, more than
+once. So: targeted suites locally, the whole gate when the box is free or in
+CI, and the PR says which of the two it ran. That is not a weakening of
+born-green. Born-green is a claim about what you knew before you pushed, and
+"I ran the suites that cover this change and CI ran the rest" is that claim;
+"I ran nothing and hoped" is not. `docs/development.md` has the box rules.
+
 ```bash
 export HIVE_SANDBOX_TEST_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
 ./scripts/gate-rust.sh    # web build + diff, cargo fmt --check, clippy -D warnings, build, test; names every skip

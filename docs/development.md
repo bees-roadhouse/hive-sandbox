@@ -83,7 +83,22 @@ Anything after `--` runs there in place of the gate:
 ./scripts/gate-container.sh -- cargo test -p hive-store --test grants
 ```
 
-Nothing becomes a red PR. Run this before you push.
+Nothing becomes a red PR ... but read the fleet-desktop rules below before you
+reach for the full gate. **On a machine somebody else is using, the full gate
+is CI's job and the targeted suites are yours.** These two sections used to
+disagree: this one said "run this before you push" and the box rules said
+"targeted suites, CI runs the whole gate", and the contradiction was resolved
+by whoever read this one first ... four full workspace gates in an evening
+while the desktop was swapping and its owner was mid-game. The rule:
+
+- **Nobody else on the box, and you have a linker to yourself:** run
+  `./scripts/gate-rust.sh`. It is the best signal available locally.
+- **Anyone else on the box, or you cannot tell:** `CARGO_BUILD_JOBS=2`, run the
+  suites that cover what you changed (`cargo test -p hive-store --test grants`),
+  `cargo clippy -p <crate>` and `cargo fmt --check`, and let CI be the gate.
+- Either way, **say in the PR which one you ran.** A reviewer reading "gate
+  green" and a reviewer reading "targeted suites green, CI is the gate" should
+  not have to guess which they were given.
 
 ## Write an integration test
 
@@ -157,6 +172,14 @@ memory:
   starting and wait if another session is linking, and targeted suites
   (`cargo test -p crate --test file`) rather than `--workspace` loops; CI runs
   the whole gate.
+- **A person uses this machine.** It is Nate's desktop, not a builder. The
+  failure is not slowness: 60 GB of RAM across five agent sessions, a game and
+  a browser overflows into an 8 GB swapfile on the NVMe, and what he sees is
+  his video stuttering on swap-in stalls while the CPU sits at 0.1% pressure.
+  Check before a long build ... `free -g` and `/proc/loadavg`, and if swap is
+  near full, do not start. Stop your own containers when you are not using
+  them; a test database you left up for five hours is 240 MB of somebody else's
+  video.
 - Keep the whole output of a long run in a file and grep it afterwards. A
   `| tail` on the gate threw away the one failure and cost a rerun.
 - `pkill -f` with a pattern that appears in your own command line kills the

@@ -1,8 +1,17 @@
-# hive-sandbox
+# Hive Mind
 
 An app-of-apps platform. A daemon hosts WASM guest apps behind a JSON ABI; apps
 store and relate data through host-mediated surfaces; workflows and AI runs
 compose them. It replaces `bees-roadhouse/hive`.
+
+**The repository is `bees-roadhouse/hive-mind`; the identifiers are still
+`hive-sandbox`** ... the crate and binary `hive-sandbox`, the `hive-*` crate
+names, the `HIVE_SANDBOX_*` environment variables, the podman test database
+`hive-sandbox-pg-rust`. That split is deliberate and D34 says why: a repository
+name is prose and an identifier has blast radius, out through brh-infra's
+stacks, both Containerfiles, the harness pins and every import. If you are here
+because the two disagree, they are meant to. D24 and D31 both left "whether
+`hive-sandbox` stays the crate and binary name" open; D34 closes it as yes.
 
 **The daemon is Rust** (D24, decided 2026-09-02; the Go tree it replaced was
 removed 2026-09-05, D31). A Cargo workspace at `crates/*`, wasmtime for the

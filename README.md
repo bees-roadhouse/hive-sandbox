@@ -1,11 +1,13 @@
-# hive-sandbox
+# Hive Mind
 
 An app-of-apps platform for a family. A daemon hosts WASM guest apps behind a
 JSON ABI; apps store and relate data through host-mediated surfaces; workflows
 and AI agent runs compose them. The daemon is Rust on wasmtime
 ([D24](docs/design/D24-rust-rewrite.md); the Go tree it replaced was removed at
-parity, [D31](docs/design/D31-go-removed.md)), the browser client is Solid.js,
-and the guest SDK is Rust for `wasm32-wasip1`. Claude Code appears twice: as a
+parity, [D31](docs/design/D31-go-removed.md)), the browser client is server-
+rendered by the daemon and swapped by htmx
+([D32](docs/design/D32-online-first-pluggable.md)), and the guest SDK is Rust
+for `wasm32-wasip1`. Claude Code appears twice: as a
 **builder** that writes new apps into the running system, and as a **brain**
 apps and workflows can call.
 
@@ -58,7 +60,7 @@ and the browser client at `/`, which the daemon renders and htmx swaps (D32). Th
 `docs/surfaces.md` covers `POST /mcp` and `/apps/{app}/...`. What is still
 ahead: the workflow runner, app installs over the API, a container test that a
 real `claude` run resumes its session, and the journal app.
-[Issue #29](https://github.com/bees-roadhouse/hive-sandbox/issues/29)
+[Issue #29](https://github.com/bees-roadhouse/hive-mind/issues/29)
 tracks the lot.
 
 The design is complete through decision D23 in the epic; D24 onward are

@@ -19,8 +19,8 @@ scripts prepend it when they find it; a terminal that cannot see `cargo` needs
 ## Clone
 
 ```bash
-git clone https://github.com/bees-roadhouse/hive-sandbox
-cd hive-sandbox
+git clone https://github.com/bees-roadhouse/hive-mind
+cd hive-mind
 cargo fetch
 ```
 

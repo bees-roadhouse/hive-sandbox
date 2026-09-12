@@ -27,3 +27,4 @@ does not.
 | [D31](D31-go-removed.md) | the Go tree is removed at parity; migrations move, the TinyGo guest is frozen as the ABI fixture, flags become `--long` |
 | [D32](D32-online-first-pluggable.md) | online-first with htmx, every resource a host capability, core entities shared by grant, the journal as a guest, TypeScript as the second guest language, a person's own Claude subscription runs their agents |
 | [D33](D33-collection-access-needs-the-asking-install.md) | cross-app collection access is decided on the asking install as well as the principal; grants gain an install target |
+| [D34](D34-hive-mind-rename.md) | the repository is Hive Mind; the crate, binary, env vars and test database stay `hive-sandbox`, because a name's cost is its blast radius |
